@@ -1,5 +1,5 @@
-| Supported Targets | ESP32 | ESP32-C2 | ESP32-C3 | ESP32-C6 | ESP32-H2 | ESP32-S2 | ESP32-S3 | Linux |
-| ----------------- | ----- | -------- | -------- | -------- | -------- | -------- | -------- | ----- |
-# ESP HTTP Client Example
+DID node code. 
+Sensor : 
+  microphone : ICS43434, INMP441, Adafruit 3492, Dfrobot S3 AI Cam 's PDM microphone
+  camera     : OV7725, OV7670, OV2640(with 12Mhz oscilator), Dfrobot S3 AI Cam 's OV3660
 
-See the README.md file in the upper level 'examples' directory for more information about examples.
