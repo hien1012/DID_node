@@ -1,7 +1,14 @@
-menu "Example Configuration"
-    config EXAMPLE_HTTP_ENDPOINT
-        string "Example HTTP Endpoint"
-        default "httpbin.org"
-        help
-            Target endpoint host-name for the example to use.
+menu "Field Data Collection"
+    config FIELD_WIFI_SSID
+        string "Wi-Fi SSID"
+        default ""
+
+    config FIELD_WIFI_PASSWORD
+        string "Wi-Fi password"
+        default ""
+
+    config FIELD_SERVER_BASE_URL
+        string "Server base URL"
+        default "http://140.123.91.132:5000"
+
 endmenu

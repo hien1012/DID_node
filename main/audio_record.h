@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <time.h>
 
 #include "esp_err.h"
 
@@ -15,6 +16,7 @@ typedef struct {
     bool write_error;
     esp_err_t error;
     char file_path[AUDIO_RECORD_PATH_MAX];
+    time_t recorded_at_epoch;
     size_t total_samples;
     size_t file_bytes;
     uint32_t overflow_count;

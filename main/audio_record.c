@@ -3,8 +3,10 @@
 #include <string.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <time.h>
 
 #include "audio_record.h"
+#include "app_config.h"
 #include "storage.h"
 
 #include "freertos/FreeRTOS.h"
@@ -12,7 +14,7 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 
-#include "driver/i2s_std.h"
+//#include "driver/i2s_std.h"
 #include "driver/gpio.h"
 
 #include "esp_check.h"
@@ -20,18 +22,30 @@
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 
+#define I2S_MIC 1
+
+#if I2S_MIC
+#include "driver/i2s_std.h"
+#else
+#include "driver/i2s_pdm.h"
+#endif
+
 // ================= 硬體腳位定義 =================
+#if I2S_MIC
 #define I2S_BCLK_IO     GPIO_NUM_26   // SCK / BCLK
 #define I2S_WS_IO       GPIO_NUM_25   // WS / LRCLK
-#define I2S_DIN_IO      GPIO_NUM_33   // SD
-
+#define I2S_DIN_IO      GPIO_NUM_33   /* SD / DOUT */
+#else
+#define PDM_CLK_IO GPIO_NUM_26
+#define PDM_DIN_IO GPIO_NUM_25
+#endif
 // Debug GPIO（選用）
 #define DBG_REC_PIN     GPIO_NUM_12   // capture task 進行中
 #define DBG_SD_PIN      GPIO_NUM_18   // writer task 正在 fwrite
 
 // ================= 錄音參數 =================
 #define SAMPLE_RATE             16000
-#define RECORD_TIME_SEC         20
+#define RECORD_TIME_SEC         APP_RECORD_DURATION_SEC
 #define WAV_BITS_PER_SAMPLE     16
 #define WAV_CHANNELS            1
 
@@ -54,7 +68,7 @@
 // [+] 開錄前丟棄的 DMA 暖身讀次數（清掉 I2S pipeline 殘留資料）
 #define I2S_FLUSH_READS         4
 
-static const char *TAG = "I2S_REC";
+static const char *TAG = "RECORD";
 
 // ================= 型別定義 =================
 typedef struct __attribute__((packed)) {
@@ -206,6 +220,7 @@ static esp_err_t i2s_init(void)
     };
     ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, NULL, &rx_handle),
                         TAG, "i2s_new_channel failed");
+#if I2S_MIC
 
     i2s_std_config_t std_cfg = {
         .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
@@ -232,6 +247,23 @@ static esp_err_t i2s_init(void)
     ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(rx_handle, &std_cfg),
                         TAG, "i2s_channel_init_std_mode failed");
 
+#else
+    i2s_pdm_rx_config_t pdm_rx_cfg = {
+        .clk_cfg = I2S_PDM_RX_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
+        .slot_cfg = I2S_PDM_RX_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT,
+                                                        I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {
+            .clk = PDM_CLK_IO,
+            .din = PDM_DIN_IO,
+            .invert_flags = {
+                .clk_inv = false,
+            },
+        },
+    };
+
+    ESP_RETURN_ON_ERROR(i2s_channel_init_pdm_rx_mode(rx_handle, &pdm_rx_cfg),
+                        TAG, "i2s_channel_init_std_mode failed");
+#endif
     i2s_event_callbacks_t cbs = {
         .on_recv       = NULL,
         .on_recv_q_ovf = i2s_rx_overflow_callback,
@@ -510,7 +542,9 @@ esp_err_t audio_record_once(audio_record_result_t *result)
     g_record_started_us = esp_timer_get_time();
 
     bool storage_active = false;
-    esp_err_t err = storage_begin_recording(&g_storage_recording);
+    time_t recorded_at_epoch = time(NULL);
+    esp_err_t err = storage_begin_recording(&g_storage_recording,
+                                            recorded_at_epoch);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Cannot reserve recording path: %s", esp_err_to_name(err));
         g_record_error = err;
@@ -575,6 +609,7 @@ finish:
     result->total_samples = g_total_samples_written;
     result->overflow_count = overflow_count;
     result->elapsed_ms = (uint32_t)((esp_timer_get_time() - g_record_started_us) / 1000);
+    result->recorded_at_epoch = recorded_at_epoch;
     const char *result_path = recording_ok ? g_storage_recording.done_path
                                            : g_storage_recording.undone_path;
     snprintf(result->file_path, sizeof(result->file_path), "%s", result_path);
