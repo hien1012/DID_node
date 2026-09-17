@@ -35,7 +35,7 @@ static void wait_for_wifi(void)
     }
 }
 
-static void synchronize_clock(void)
+static void synchronize_clock(void) // 阻塞，等待 sntp clock 訊號
 {
     while (!time_sync_is_valid()) {
         wait_for_wifi();
