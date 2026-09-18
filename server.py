@@ -7,6 +7,7 @@ import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Callable
 
 from flask import Flask, jsonify, request
 
@@ -15,10 +16,10 @@ TAIPEI_TZ = timezone(timedelta(hours=8))
 DATA_ROOT = Path(os.environ.get("FIELD_DATA_ROOT", "D:/"))
 DATABASE_PATH = DATA_ROOT / "field_data.db"
 VALID_ID = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
-MAX_AUDIO_BYTES = 64 * 1024 * 1024
+MAX_UPLOAD_BYTES = 64 * 1024 * 1024
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = MAX_AUDIO_BYTES
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
 
 
 def now_text() -> str:
@@ -51,7 +52,9 @@ def initialize_database() -> None:
                 received_at TEXT NOT NULL,
                 file_path TEXT NOT NULL,
                 file_bytes INTEGER NOT NULL,
-                sha256 TEXT NOT NULL
+                sha256 TEXT NOT NULL,
+                media_type TEXT NOT NULL DEFAULT 'sound',
+                metadata_json TEXT NOT NULL DEFAULT '{}'
             );
             CREATE TABLE IF NOT EXISTS heartbeats (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -65,42 +68,70 @@ def initialize_database() -> None:
             """
         )
 
+        upload_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(uploads)")
+        }
+        if "media_type" not in upload_columns:
+            connection.execute(
+                "ALTER TABLE uploads "
+                "ADD COLUMN media_type TEXT NOT NULL DEFAULT 'sound'"
+            )
+        if "metadata_json" not in upload_columns:
+            connection.execute(
+                "ALTER TABLE uploads "
+                "ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'"
+            )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_uploads_type_device_time "
+            "ON uploads(media_type, device_id, recorded_at)"
+        )
+
 
 def error(message: str, status_code: int):
     return jsonify({"status": "error", "message": message}), status_code
 
 
-@app.get("/time")
-def get_time():
-    return jsonify({"epoch": int(time.time())})
-
-
-@app.post("/upload/audio")
-def upload_audio():
+def parse_common_headers():
     device_id = request.headers.get("X-Device-ID", "")
     capture_id = request.headers.get("X-Capture-ID", "")
-    recorded_text = request.headers.get("X-Recorded-At", "")
-    expected_size_text = request.headers.get("X-File-Size", "")
-
     if not VALID_ID.fullmatch(device_id) or not VALID_ID.fullmatch(capture_id):
-        return error("invalid device_id or capture_id", 400)
-    try:
-        recorded_at = int(recorded_text)
-        expected_size = int(expected_size_text)
-    except ValueError:
-        return error("invalid recording time or file size", 400)
-    if recorded_at < 1_700_000_000 or expected_size <= 44:
-        return error("recording time or file size is out of range", 400)
-    if expected_size > MAX_AUDIO_BYTES:
-        return error("audio file is too large", 413)
+        return None, error("invalid device_id or capture_id", 400)
 
+    try:
+        recorded_at = int(request.headers.get("X-Recorded-At", ""))
+        expected_size = int(request.headers.get("X-File-Size", ""))
+    except ValueError:
+        return None, error("invalid recording time or file size", 400)
+    if recorded_at < 1_700_000_000 or expected_size <= 0:
+        return None, error("recording time or file size is out of range", 400)
+    if expected_size > MAX_UPLOAD_BYTES:
+        return None, error("uploaded file is too large", 413)
+
+    return (device_id, capture_id, recorded_at, expected_size), None
+
+
+def save_upload(
+    *,
+    media_type: str,
+    extension: str,
+    device_id: str,
+    capture_id: str,
+    recorded_at: int,
+    expected_size: int,
+    metadata: dict,
+    validate_body: Callable[[bytes, int], str | None],
+):
     with database() as connection:
         existing = connection.execute(
             "SELECT * FROM uploads WHERE capture_id = ?", (capture_id,)
         ).fetchone()
     if existing is not None:
         existing_path = Path(existing["file_path"])
-        if existing_path.is_file() and existing["file_bytes"] == expected_size:
+        if (
+            existing_path.is_file()
+            and existing["file_bytes"] == expected_size
+            and existing["media_type"] == media_type
+        ):
             return jsonify(
                 {
                     "status": "ok",
@@ -116,18 +147,18 @@ def upload_audio():
     recorded_dt = datetime.fromtimestamp(recorded_at, TAIPEI_TZ)
     target_dir = (
         DATA_ROOT
-        / recorded_dt.strftime("%Y-%m-%d")
-        / "sound"
+        / media_type
         / device_id
+        / recorded_dt.strftime("%Y-%m-%d")
     )
     target_dir.mkdir(parents=True, exist_ok=True)
-    target_path = target_dir / f"{recorded_dt.strftime('%Y%m%d_%H%M%S')}.wav"
+    target_path = target_dir / f"{recorded_dt.strftime('%Y%m%d_%H%M%S')}{extension}"
     target_existed = target_path.exists()
 
     temp_path = None
     received_size = 0
     digest = hashlib.sha256()
-    wav_prefix = bytearray()
+    prefix = bytearray()
     try:
         with tempfile.NamedTemporaryFile(
             mode="wb", dir=target_dir, prefix=".upload-", suffix=".tmp", delete=False
@@ -140,8 +171,8 @@ def upload_audio():
                 received_size += len(chunk)
                 if received_size > expected_size:
                     return error("received more bytes than declared", 400)
-                if len(wav_prefix) < 12:
-                    wav_prefix.extend(chunk[: 12 - len(wav_prefix)])
+                if len(prefix) < 12:
+                    prefix.extend(chunk[: 12 - len(prefix)])
                 digest.update(chunk)
                 output.write(chunk)
             output.flush()
@@ -149,10 +180,12 @@ def upload_audio():
 
         if received_size != expected_size:
             return error(
-                f"size mismatch: expected {expected_size}, received {received_size}", 400
+                f"size mismatch: expected {expected_size}, received {received_size}",
+                400,
             )
-        if wav_prefix[:4] != b"RIFF" or wav_prefix[8:12] != b"WAVE":
-            return error("body is not a WAV file", 400)
+        validation_error = validate_body(bytes(prefix), received_size)
+        if validation_error is not None:
+            return error(validation_error, 400)
 
         received_at = now_text()
         duplicate = False
@@ -167,13 +200,14 @@ def upload_audio():
         else:
             os.replace(temp_path, target_path)
             temp_path = None
+
         with database() as connection:
             connection.execute(
                 """
                 INSERT INTO uploads
                     (capture_id, device_id, recorded_at, received_at,
-                     file_path, file_bytes, sha256)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                     file_path, file_bytes, sha256, media_type, metadata_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     capture_id,
@@ -183,10 +217,13 @@ def upload_audio():
                     str(target_path),
                     received_size,
                     digest.hexdigest(),
+                    media_type,
+                    json.dumps(metadata, ensure_ascii=False, separators=(",", ":")),
                 ),
             )
+
         print(
-            f"[{received_at}] audio saved: device={device_id} "
+            f"[{received_at}] {media_type} saved: device={device_id} "
             f"capture={capture_id} path={target_path} bytes={received_size}"
         )
         return jsonify(
@@ -202,6 +239,82 @@ def upload_audio():
     finally:
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
+
+
+@app.get("/time")
+def get_time():
+    return jsonify({"epoch": int(time.time())})
+
+
+@app.post("/upload/audio")
+def upload_audio():
+    common, response = parse_common_headers()
+    if response is not None:
+        return response
+    device_id, capture_id, recorded_at, expected_size = common
+    if expected_size <= 44:
+        return error("audio file is too small", 400)
+
+    def validate_wav(prefix: bytes, _received_size: int):
+        if prefix[:4] != b"RIFF" or prefix[8:12] != b"WAVE":
+            return "body is not a WAV file"
+        return None
+
+    return save_upload(
+        media_type="sound",
+        extension=".wav",
+        device_id=device_id,
+        capture_id=capture_id,
+        recorded_at=recorded_at,
+        expected_size=expected_size,
+        metadata={"format": "WAV"},
+        validate_body=validate_wav,
+    )
+
+
+@app.post("/upload/video")
+def upload_video():
+    common, response = parse_common_headers()
+    if response is not None:
+        return response
+    device_id, capture_id, recorded_at, expected_size = common
+
+    try:
+        frame_count = int(request.headers.get("X-Frame-Count", ""))
+        width = int(request.headers.get("X-Width", ""))
+        height = int(request.headers.get("X-Height", ""))
+        fps = int(request.headers.get("X-FPS", ""))
+    except ValueError:
+        return error("invalid video metadata", 400)
+    pixel_format = request.headers.get("X-Format", "")
+    if (
+        frame_count <= 0
+        or width <= 0
+        or height <= 0
+        or fps <= 0
+        or pixel_format != "GRAY8"
+    ):
+        return error("unsupported video metadata", 400)
+    if expected_size != width * height * frame_count:
+        return error("RAW size does not match width, height and frame count", 400)
+
+    metadata = {
+        "format": pixel_format,
+        "width": width,
+        "height": height,
+        "fps": fps,
+        "frames": frame_count,
+    }
+    return save_upload(
+        media_type="video",
+        extension=".raw",
+        device_id=device_id,
+        capture_id=capture_id,
+        recorded_at=recorded_at,
+        expected_size=expected_size,
+        metadata=metadata,
+        validate_body=lambda _prefix, _received_size: None,
+    )
 
 
 @app.post("/heartbeat")
@@ -271,13 +384,21 @@ def uploads():
     with database() as connection:
         rows = connection.execute(
             """
-            SELECT capture_id, device_id, recorded_at, received_at,
-                   file_path, file_bytes, sha256
+            SELECT capture_id, device_id, media_type, recorded_at, received_at,
+                   file_path, file_bytes, sha256, metadata_json
             FROM uploads ORDER BY received_at DESC LIMIT ?
             """,
             (limit,),
         ).fetchall()
-    return jsonify([dict(row) for row in rows])
+    return jsonify(
+        [
+            {
+                **{key: row[key] for key in row.keys() if key != "metadata_json"},
+                "metadata": json.loads(row["metadata_json"]),
+            }
+            for row in rows
+        ]
+    )
 
 
 initialize_database()

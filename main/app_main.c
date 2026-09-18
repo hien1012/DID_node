@@ -74,7 +74,7 @@ static void upload_boot_backlog(void)
 void app_main(void)
 {
     ESP_ERROR_CHECK(init_nvs());
-    ESP_ERROR_CHECK(device_identity_init());
+    ESP_ERROR_CHECK(device_identity_init(DEVICE_ID_AUDIO_PREFIX));
     ESP_LOGI(TAG, "Device ID: %s", device_identity_get());
     ESP_ERROR_CHECK(wifi_manager_init());
     time_sync_configure_timezone();

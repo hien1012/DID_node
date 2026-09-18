@@ -1,176 +1,221 @@
-#include <errno.h>
-#include <fcntl.h>
-#include <inttypes.h>
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
+/**
+ * ============================================================================
+ * 專案名稱：ESP32 野外影像採集節點 (Camera Node)
+ * 檔案名稱：cam_app_main.c
+ * 檔案說明：低階影像擷取 (DVP Camera)、零拷貝佇列管線與 SD 卡連續寫入核心實作
+ * ============================================================================
+ * 
+ * 【給客戶與開發團隊的架構摘要說明】
+ * ----------------------------------------------------------------------------
+ * 1. 系統目標：
+ *    在資源受限的 ESP32 晶片上，以極高穩定度達成 640x480 (VGA) 解析度、
+ *    每秒 5 張 (5 FPS) 的無損連續灰階錄影，並即時寫入 FAT32 SD 卡中。
+ * 
+ * 2. 為什麼採用 RAW 格式 (GRAY8)？
+ *    - JPEG 壓縮在 ESP32 上需要耗費大量 CPU 運算時間與記憶體，且每一幀壓縮時間
+ *      浮動極大，容易導致硬體 FIFO 溢位而掉幀。
+ *    - RAW 格式每一幀固定為 640 x 480 = 307,200 位元組 (約 300 KB)，資料大小完全固定，
+ *      便於做精確的記憶體預分配與即時 SD 卡扇區寫入，最後再由伺服器轉為 MP4。
+ * 
+ * 3. 雙核心並行與零拷貝 (Zero-Copy) 管線設計：
+ *    - 核心 1 (Core 1) [高優先權 6]：專注運行 capture_task，負責從相機 DMA 接收影格，
+ *      僅傳遞指標進入 FreeRTOS 佇列，絕對不複製像素資料，確保不遺漏任何硬體訊號。
+ *    - 核心 0 (Core 0) [低優先權 5]：專注運行 writer_task，負責將佇列中的影像寫入 SD 卡。
+ *      寫入完成後才呼叫 esp_camera_fb_return() 將緩衝區釋放回硬體，避免記憶體碎裂。
+ * 
+ * 4. 關鍵記憶體限制與解決方案：
+ *    - ESP32 內部 SRAM 空間不足以存放 VGA 影格，因此影格存放在外部 PSRAM (8 個緩衝區)。
+ *    - 但 ESP32 的 SDMMC DMA 無法直接且高效地存取外部 PSRAM，因此我們在內部 SRAM 
+ *      特別配置了一塊 32KB 的 DMA 暫存區 (s_sd_dma_buffer)，以分段複製的方式高速寫入 SD。
+ * 
+ * 5. 檔案預先配置 (Preallocation)：
+ *    - SD 卡寫入時，若檔案大小動態增長，FAT 檔案系統需要頻繁更新目錄項與配置表，
+ *      這會造成不可預測的幾百毫秒延遲 (SD 延遲峰值)。
+ *    - 我們在錄影開始前，直接透過 lseek + write 將檔案預先撐大到 10 秒所需的完整大小 (15 MB)，
+ *      錄影期間只需順序覆寫扇區，徹底消除了動態配置檔案造成的寫入卡頓。
+ * ============================================================================
+ */
 
-#include "driver/gpio.h"
-#include "driver/sdmmc_host.h"
-#include "esp_camera.h"
-#include "esp_check.h"
-#include "esp_err.h"
-#include "esp_heap_caps.h"
-#include "esp_log.h"
-#include "esp_psram.h"
-#include "esp_timer.h"
-#include "esp_vfs_fat.h"
+/* ============================================================================
+ * 標頭檔引用 (Includes)
+ * ============================================================================ */
+
+/* 標準 C 語言函式庫與 POSIX 系統呼叫 */
+#include <errno.h>        /* 系統錯誤碼定義 (如 EEXIST, EINTR) */
+#include <fcntl.h>        /* 檔案控制選項 (如 O_CREAT, O_WRONLY) */
+#include <inttypes.h>     /* 標準整數型別格式化輸出 (如 PRIu64, PRId64) */
+#include <stdbool.h>      /* 布林型別 (true, false) */
+#include <stddef.h>       /* 標準定義 (size_t, NULL) */
+#include <stdint.h>       /* 固定寬度整數型別 (uint8_t, int64_t 等) */
+#include <stdio.h>        /* 標準輸入輸出 (snprintf, printf) */
+#include <string.h>       /* 字串與記憶體操作 (memcpy, memset, strerror) */
+#include <time.h>         /* UTC 時間戳 */
+#include <unistd.h>       /* POSIX 系統呼叫 (open, close, write, lseek, unlink, ftruncate, fsync) */
+
+/* ESP-IDF 硬體驅動與周邊控制 */
+#include "esp_camera.h"         /* 官方相機驅動介面 (相機初始化、擷取影格) */
+#include "esp_check.h"          /* ESP-IDF 錯誤檢查巨集 (ESP_RETURN_ON_ERROR) */
+#include "esp_err.h"            /* ESP 錯誤碼型別定義 (esp_err_t) */
+#include "esp_heap_caps.h"      /* 記憶體堆積能力分配器 (指定內部 SRAM、DMA、PSRAM) */
+#include "esp_log.h"            /* 系統日誌輸出 (ESP_LOGI, ESP_LOGE 等) */
+#include "esp_timer.h"          /* 高精度硬體微秒計時器 (esp_timer_get_time) */
+#include "sdkconfig.h"          /* 專案編譯組態 (menuconfig 生成的常數) */
+#include "sensor.h"             /* 相機感測器底層暫存器讀寫與結構定義 */
+
+/* 本專案自訂硬體腳位與暫存器定義 */
+#include "camera_pinout.h"      /* 相機硬體腳位定義 (D0-D7, VSYNC, HREF, PCLK, XCLK, I2C 等) */
+#include "camera_registers.h"   /* 各型號感測器專屬暫存器位址定義 */
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
-#include "sdmmc_cmd.h"
-#include "sdkconfig.h"
-#include "sensor.h"
 
-#include "camera_pinout.h"
-#include "camera_registers.h"
+#include "cam_record.h"
+#include "cam_storage.h"
 
-#define IMAGE_WIDTH             640U
-#define IMAGE_HEIGHT            480U
-#define IMAGE_PIXELS            (IMAGE_WIDTH * IMAGE_HEIGHT)
-#define SENSOR_YUV422_BYTES     (IMAGE_PIXELS * 2U)
+/* ============================================================================
+ * 巨集與常數定義 (Macros and Constants)
+ * ============================================================================ */
+
+/* --- 影像規格參數 --- */
+#define IMAGE_WIDTH             CAM_IMAGE_WIDTH             /* 影像寬度：640 像素 (VGA 規格) */
+#define IMAGE_HEIGHT            CAM_IMAGE_HEIGHT            /* 影像高度：480 像素 (VGA 規格) */
+#define IMAGE_PIXELS            CAM_IMAGE_FRAME_BYTES       /* 每一幀灰階像素總數：640*480 = 307,200 位元組 (Bytes) */
+#define SENSOR_YUV422_BYTES     (IMAGE_PIXELS * 2U)         /* 感測器原始輸出為 YUV422，每像素佔 2 位元組 = 614,400 位元組 */
 
 /*
- * Clock-source selection for the interchangeable camera modules.
+ * --- 相機感測器時脈源選擇 (Clock-Source Configuration) ---
  *
- * The OV2640 module used here has its own 12 MHz oscillator connected to
- * XVCLK.  Keep the ESP32 XCLK output disabled for that module; two clock
- * outputs must never drive the same XVCLK net.  Set this to 0 before using
- * OV7670/OV7725 modules that require the ESP32-generated 16 MHz XCLK.
+ * 說明：
+ * 本專案硬體可能搭載不同的相機感測器模組 (如 OV2640、OV7670、OV7725)。
+ * 部分 OV2640 模組自帶 12 MHz 石英震盪器 (Onboard Oscillator) 直連 XVCLK。
+ * 若感測器已有自帶震盪器，ESP32 絕不可再由內部輸出 XCLK，否則兩組時脈訊號會互相打架短路。
+ * 反之，OV7670/OV7725 模組通常需要由 ESP32 的內部定時器產生 16 MHz XCLK 供給它。
  */
-#define USE_OV2640_ONBOARD_XVCLK 0
-#define ESP32_CAMERA_XCLK_HZ     16000000U
-#define OV2640_ONBOARD_XVCLK_HZ  12000000U
-#define OV2640_HAL_XCLK_HINT_HZ  20000000U
+#define USE_OV2640_ONBOARD_XVCLK 0                          /* 0: 由 ESP32 產生 16MHz XCLK; 1: 使用 OV2640 板載 12MHz 時脈 */
+#define ESP32_CAMERA_XCLK_HZ     16000000U                  /* ESP32 輸出的 XCLK 時脈頻率：16 MHz */
+#define OV2640_ONBOARD_XVCLK_HZ  12000000U                  /* OV2640 外部板載震盪器頻率：12 MHz */
+#define OV2640_HAL_XCLK_HINT_HZ  20000000U                  /* 提供給相機底層驅動的時脈提示值 (設定超過 10MHz 會影響 I2S 採樣模式選擇) */
 
 #if USE_OV2640_ONBOARD_XVCLK
-#define CAMERA_CONFIG_XCLK_PIN   (-1)
-/*
- * pin_xclk=-1 means this value does not drive the sensor oscillator.  On
- * classic ESP32, esp32-camera also uses it as the I2S sampling-mode selector:
- * values above 10 MHz select its high-speed unpacker.  The measured DVP PCLK
- * is only 8 MHz, so select the low-speed unpacker while retaining the actual
- * 12 MHz onboard XVCLK in OV2640_XVCLK_HZ and the sensor clock calculation.
- */
+#define CAMERA_CONFIG_XCLK_PIN   (-1)                       /* -1 代表不啟用 ESP32 的 XCLK 輸出腳位，由板載震盪器自行驅動 */
 #define CAMERA_CONFIG_XCLK_HZ    OV2640_HAL_XCLK_HINT_HZ
 #else
-#define CAMERA_CONFIG_XCLK_PIN   CAM_PIN_XCLK
-#define CAMERA_CONFIG_XCLK_HZ    ESP32_CAMERA_XCLK_HZ
+#define CAMERA_CONFIG_XCLK_PIN   CAM_PIN_XCLK               /* 指向 camera_pinout.h 中定義的 XCLK 實體 GPIO 腳位 */
+#define CAMERA_CONFIG_XCLK_HZ    ESP32_CAMERA_XCLK_HZ       /* 設定為 16 MHz */
 #endif
 
-#define CAMERA_WARMUP_FRAMES    10U
-#define CAMERA_FRAME_BUFFERS    8U //更改PSRAM_frame_buffer數量看看是否會發生VSYNC-OVF ==> 仍然失敗
-#define TEST_DURATION_SECONDS   10U
-#define TARGET_FPS               5U
-#define EXPECTED_FRAME_COUNT     (TEST_DURATION_SECONDS * TARGET_FPS)
-#define EXPECTED_FRAME_PERIOD_US (1000000LL / TARGET_FPS)
-#define GAP_THRESHOLD_US         (EXPECTED_FRAME_PERIOD_US * 3LL / 2LL)
-#define FPS_TOLERANCE_MILLI      250U
+/* --- 錄影與影格率驗證參數 --- */
+#define CAMERA_WARMUP_FRAMES    10U                         /* 開機暖機幀數：丟棄前 10 幀，讓感測器自動曝光/白平衡穩定 */
+#define CAMERA_FRAME_BUFFERS    8U                          /* 配置於外部 PSRAM 的影格緩衝區數量 (總計 8 * 300KB ≈ 2.4MB) */
+#define TEST_DURATION_SECONDS   10U                         /* 開機硬體資格測試時間：10 秒 */
+#define TARGET_FPS              CAM_TARGET_FPS              /* 目標影格率：每秒 5 幀 */
+#define EXPECTED_FRAME_COUNT     (TEST_DURATION_SECONDS * TARGET_FPS) /* 10 秒預期應收到的影格數：50 幀 */
+#define EXPECTED_FRAME_PERIOD_US (1000000LL / TARGET_FPS)   /* 每一幀的理想間隔微秒數：1,000,000 / 5 = 200,000 us (200 毫秒) */
+#define GAP_THRESHOLD_US         (EXPECTED_FRAME_PERIOD_US * 3LL / 2LL) /* 掉幀判定門檻：間隔超過 1.5 週期 (300 毫秒) 即視為掉幀事件 */
+#define FPS_TOLERANCE_MILLI      250U                       /* 影格率容許誤差：±0.25 FPS (4.75 ~ 5.25 FPS 視為合格) */
 
-#define SD_MOUNT_POINT                "/sdcard"
-#define SD_MAX_OPEN_FILES             2
-#define SD_FORMAT_ALLOCATION_BYTES    (16U * 1024U)
-#define SD_DMA_BUFFER_PREFERRED_BYTES (32U * 1024U)
-#define SD_DMA_BUFFER_MIN_BYTES       (8U * 1024U)
+/* --- SD 卡寫入緩衝參數 --- */
+#define SD_DMA_BUFFER_PREFERRED_BYTES (32U * 1024U)         /* SD 寫入 DMA 暫存區偏好大小：32 KB (位於內部高速 SRAM) */
+#define SD_DMA_BUFFER_MIN_BYTES       (8U * 1024U)          /* 記憶體不足時的最低容許 DMA 暫存大小：8 KB */
+
 /*
- * Writer holds one framebuffer, camera HAL needs one active buffer and one
- * spare buffer at the next VSYNC.  Queue at most the remaining five pointers.
+ * --- 佇列容量與錄影規格 ---
+ * 總共有 8 個 framebuffer，其中：
+ * - 1 個正在被 writer_task 寫入 SD 卡
+ * - 1 個為相機硬體 DMA 正在接收的活躍緩衝區
+ * - 1 個為下一個 VSYNC 預備的備用緩衝區
+ * 因此佇列最多只能排隊容納 8 - 3 = 5 個已完成的影格指標，避免底層相機硬體無可用緩衝區。
  */
-#define FRAME_QUEUE_CAPACITY          (CAMERA_FRAME_BUFFERS - 3U)
-#define RECORD_DURATION_SECONDS       10U
-#define RECORD_EXPECTED_FRAMES        (RECORD_DURATION_SECONDS * TARGET_FPS)
-#define RECORD_FILE_BYTES             ((uint64_t)RECORD_EXPECTED_FRAMES * IMAGE_PIXELS)
-#define RECORD_MAX_SEQUENCE           10000000U
-#define RECORD_PATH_BYTES             32U
-#define RECORD_QUEUE_WAIT_MS          50U
+#define FRAME_QUEUE_CAPACITY          (CAMERA_FRAME_BUFFERS - 3U) /* 佇列容量：5 */
+#define RECORD_DURATION_SECONDS       CAM_RECORD_DURATION_SEC /* 正式錄影長度：10 秒 */
+#define RECORD_EXPECTED_FRAMES        (RECORD_DURATION_SECONDS * TARGET_FPS) /* 正式錄影預期總幀數：50 幀 */
+#define RECORD_FILE_BYTES             ((uint64_t)RECORD_EXPECTED_FRAMES * IMAGE_PIXELS) /* 預先配置檔案大小：50 * 307200 = 15,360,000 Bytes (約 14.65 MB) */
+#define RECORD_QUEUE_WAIT_MS          50U                   /* 寫入任務等待佇列影格的逾時時間 (毫秒) */
 
-#define CAPTURE_TASK_STACK_BYTES      4096U
-#define WRITER_TASK_STACK_BYTES       4096U
-#define CAPTURE_TASK_PRIORITY         6U
-#define WRITER_TASK_PRIORITY          5U
+/* --- FreeRTOS 任務堆疊與優先權設定 --- */
+#define CAPTURE_TASK_STACK_BYTES      4096U                 /* capture_task 堆疊大小：4 KB */
+#define WRITER_TASK_STACK_BYTES       4096U                 /* writer_task 堆疊大小：4 KB */
+#define CAPTURE_TASK_PRIORITY         6U                    /* capture_task 優先權 (優先權較高，確保硬體影格及時提取) */
+#define WRITER_TASK_PRIORITY          5U                    /* writer_task 優先權 (優先權略低，順應 SD 卡寫入速度) */
 
+/* CPU 核心綁定 (SMP 對稱多核心架構) */
 #if CONFIG_FREERTOS_UNICORE
-#define CAPTURE_TASK_CORE             0
+#define CAPTURE_TASK_CORE             0                     /* 單核心晶片綁定於 Core 0 */
 #define WRITER_TASK_CORE              0
 #else
-#define CAPTURE_TASK_CORE             1
-#define WRITER_TASK_CORE              0
+#define CAPTURE_TASK_CORE             1                     /* 雙核心晶片：Core 1 負責影像接收 (避免被 Wi-Fi/系統中斷干擾) */
+#define WRITER_TASK_CORE              0                     /* Core 0 負責較慢的 SDMMC 檔案寫入 */
 #endif
 
-#define CAPTURE_DONE_BIT              BIT0
-#define WRITER_DONE_BIT               BIT1
+/* 錄影同步事件旗標 (EventGroup Bits) */
+#define CAPTURE_DONE_BIT              BIT0                  /* 旗標：影像擷取任務已完成 */
+#define WRITER_DONE_BIT               BIT1                  /* 旗標：SD 卡寫入任務已完成 */
 
-#define TEST_BUTTON_GPIO         GPIO_NUM_0
-#define BUTTON_POLL_MS          10U
-#define BUTTON_DEBOUNCE_MS      30U
+/* ============================================================================
+ * 感測器專屬暫存器定義與除頻計算 (Sensor Register Maps)
+ * ============================================================================ */
 
-#define OV7725_REG_COM3             0x000CU
-#define OV7725_REG_COM4             0x000DU
-#define OV7725_REG_COM5             0x000EU
-#define OV7725_REG_CLKRC            0x0011U
-#define OMNIVISION_REG_COM8         0x0013U
-#define OV7725_REG_DSP_CTRL3        0x0066U
-#define OV7725_COM3_SWAP_YUV        0x10U
-#define OV7725_COM4_PLL_MASK        0xC0U
-#define OV7725_COM5_AUTO_FPS        0x80U
-#define OV7725_CLKRC_DIV_MASK       0x3FU
-#define OV7725_CLKRC_DIVIDER        3U // Divide by 4 instead of 2: halve prior rate.
-#define OMNIVISION_COM8_AUTO_MASK   0x07U
+/* --- OV7725 暫存器與位元遮罩 --- */
+#define OV7725_REG_COM3             0x000CU                 /* 控制暫存器 3：設定 YUV 輸出順序 */
+#define OV7725_REG_COM4             0x000DU                 /* 控制暫存器 4：PLL 鎖相環控制 */
+#define OV7725_REG_COM5             0x000EU                 /* 控制暫存器 5：自動影格率調節控制 */
+#define OV7725_REG_CLKRC            0x0011U                 /* 內部時脈控制暫存器 (除頻器) */
+#define OMNIVISION_REG_COM8         0x0013U                 /* 自動曝光/增益/白平衡控制暫存器 */
+#define OV7725_REG_DSP_CTRL3        0x0066U                 /* DSP 控制暫存器 3 */
+#define OV7725_COM3_SWAP_YUV        0x10U                   /* COM3 第 4 位元：反轉 YUV 輸出順序 (確保第 0 位元組為 Y 亮度訊號) */
+#define OV7725_COM4_PLL_MASK        0xC0U                   /* COM4 PLL 遮罩 */
+#define OV7725_COM5_AUTO_FPS        0x80U                   /* COM5 第 7 位元：低光源自動降頻開關 (必須關閉以維持固定 5 FPS) */
+#define OV7725_CLKRC_DIV_MASK       0x3FU                   /* CLKRC 除頻遮罩 */
+#define OV7725_CLKRC_DIVIDER        3U                      /* 除頻值：設定除以 4，將原始時脈減半 */
+#define OMNIVISION_COM8_AUTO_MASK   0x07U                   /* COM8 自動功能遮罩 (AGC, AEC, AWB) */
 
-/* OV2640 get_reg/set_reg encode the bank in register address bit 8. */
-#define OV2640_DSP_R_BYPASS         0x0005U
-#define OV2640_DSP_ZMOW             0x005AU
-#define OV2640_DSP_ZMOH             0x005BU
-#define OV2640_DSP_ZMHH             0x005CU
-#define OV2640_SENSOR_CLKRC         0x0111U
-#define OV2640_SENSOR_COM8          0x0113U
-#define OV2640_SENSOR_REG2A         0x012AU
-#define OV2640_SENSOR_FRARL         0x012BU
-#define OV2640_SENSOR_ADDVSL        0x012DU
-#define OV2640_SENSOR_ADDVSH        0x012EU
-#define OV2640_SENSOR_FLL           0x0146U
-#define OV2640_SENSOR_FLH           0x0147U
-#define OV2640_DSP_CTRL0            0x00C2U
-#define OV2640_DSP_CTRL1            0x00C3U
-#define OV2640_DSP_R_DVP_SP         0x00D3U
-#define OV2640_DSP_IMAGE_MODE       0x00DAU
+/* --- OV2640 暫存器與位元遮罩 (第 8 位元編碼 Bank 0 或 Bank 1) --- */
+#define OV2640_DSP_R_BYPASS         0x0005U                 /* DSP 旁路控制暫存器 */
+#define OV2640_DSP_ZMOW             0x005AU                 /* 縮放輸出寬度低位元組 */
+#define OV2640_DSP_ZMOH             0x005BU                 /* 縮放輸出高度低位元組 */
+#define OV2640_DSP_ZMHH             0x005CU                 /* 縮放輸出高階位元組 */
+#define OV2640_SENSOR_CLKRC         0x0111U                 /* 感測器時脈控制暫存器 */
+#define OV2640_SENSOR_COM8          0x0113U                 /* 感測器自動曝光/增益控制 */
+#define OV2640_SENSOR_REG2A         0x012AU                 /* 虛擬行擴展高位暫存器 */
+#define OV2640_SENSOR_FRARL         0x012BU                 /* 虛擬行擴展低位暫存器 */
+#define OV2640_SENSOR_ADDVSL        0x012DU                 /* VSYNC 偏移低位暫存器 */
+#define OV2640_SENSOR_ADDVSH        0x012EU                 /* VSYNC 偏移高位暫存器 */
+#define OV2640_SENSOR_FLL           0x0146U                 /* 影格長度低位元組 */
+#define OV2640_SENSOR_FLH           0x0147U                 /* 影格長度高位元組 */
+#define OV2640_DSP_CTRL0            0x00C2U                 /* DSP 控制暫存器 0 */
+#define OV2640_DSP_CTRL1            0x00C3U                 /* DSP 控制暫存器 1 */
+#define OV2640_DSP_R_DVP_SP         0x00D3U                 /* DVP PCLK 輸出速度除頻控制 */
+#define OV2640_DSP_IMAGE_MODE       0x00DAU                 /* 影像輸出格式暫存器 */
 #define OV2640_R_BYPASS_DSP_MASK    0x01U
 #define OV2640_CTRL0_YUV422_MASK    0x0CU
 #define OV2640_IMAGE_MODE_FMT_MASK  0x5CU
-#define OV2640_VGA_ZMOW_VALUE       0xA0U
-#define OV2640_VGA_ZMOH_VALUE       0x78U
+#define OV2640_VGA_ZMOW_VALUE       0xA0U                   /* VGA 寬度縮放暫存器值 */
+#define OV2640_VGA_ZMOH_VALUE       0x78U                   /* VGA 高度縮放暫存器值 */
 #define OV2640_VGA_ZMHH_VALUE       0x00U
 #define OV2640_COM8_AEC_AGC_MASK    0x05U
 #define OV2640_CTRL1_AWB_MASK       0x08U
 #define OV2640_CLKRC_CLOCK_MASK     0xBFU
+
 #if USE_OV2640_ONBOARD_XVCLK
-/* Match the SCCB-only 5 fps test: 12 MHz x 2 / (5 + 1) = 4 MHz. */
 #define OV2640_XVCLK_HZ              OV2640_ONBOARD_XVCLK_HZ
 #define OV2640_CLK_MULTIPLIER        2ULL
 #define OV2640_CLKRC_DOUBLER         0x80U
 #define OV2640_CLKRC_DIVIDER         5U
 #else
-/* ESP32 clock path: 16 MHz XVCLK / (3 + 1) = 4 MHz. */
-#define OV2640_XVCLK_HZ              ESP32_CAMERA_XCLK_HZ
+#define OV2640_XVCLK_HZ              ESP32_CAMERA_XCLK_HZ   /* 16 MHz */
 #define OV2640_CLK_MULTIPLIER        1ULL
 #define OV2640_CLKRC_DOUBLER         0x00U
 #define OV2640_CLKRC_DIVIDER         3U
 #endif
-#define OV2640_CLKRC_VALUE \
-    (OV2640_CLKRC_DOUBLER | OV2640_CLKRC_DIVIDER)
+
+#define OV2640_CLKRC_VALUE          (OV2640_CLKRC_DOUBLER | OV2640_CLKRC_DIVIDER)
 #define OV2640_REG2A_FRARH_MASK     0xF0U
 #define OV2640_DVP_SP_AUTO_MODE     0x80U
-/* Automatic DVP PCLK control plus divisor 6 gives R_DVP_SP=0x86.
- * The 48 MHz sysclk model below is nominal; measure actual DVP PCLK. */
 #define OV2640_DVP_PCLK_DIVIDER     6U
-#define OV2640_DVP_SP_VALUE \
-    (OV2640_DVP_SP_AUTO_MODE | OV2640_DVP_PCLK_DIVIDER)
+#define OV2640_DVP_SP_VALUE         (OV2640_DVP_SP_AUTO_MODE | OV2640_DVP_PCLK_DIVIDER)
 
+/* --- OV7670 暫存器與位元遮罩 --- */
 #define OV7670_REG_COM3             0x000CU
 #define OV7670_REG_COM4             0x000DU
 #define OV7670_REG_CLKRC            0x0011U
@@ -178,37 +223,32 @@
 #define OV7670_REG_ADVFH            0x002EU
 #define OV7670_REG_TSLB             0x003AU
 #define OV7670_REG_COM11            0x003BU
-#define OV7670_REG_DBLV             0x006BU
+#define OV7670_REG_DBLV             0x006BU                 /* PLL 倍頻暫存器 */
 #define OV7670_REG_DM_LNL           0x0092U
 #define OV7670_REG_DM_LNH           0x0093U
 #define OV7670_CLKRC_CLOCK_MASK     0x7FU
-#define OV7670_CLKRC_DIVIDER        7U // Divide by 8 instead of 4: halve prior rate.
+#define OV7670_CLKRC_DIVIDER        7U                      /* 除以 8，調降影格率至 5 FPS */
 #define OV7670_DBLV_PLL_MASK        0xC0U
-#define OV7670_DBLV_PLL_4X          0x40U
-#define OV7670_COM11_NIGHT_MODE     0x80U
+#define OV7670_DBLV_PLL_4X          0x40U                   /* 啟用 PLL 4 倍頻 */
+#define OV7670_COM11_NIGHT_MODE     0x80U                   /* 夜間自動降頻遮罩 (需關閉) */
 
+/* --- 感測器硬體時脈與 FPS 數學理論模型計算 --- */
 #define OV7725_PLL_MULTIPLIER       1U
 #define OV7725_INTERNAL_CLOCK_HZ \
     (ESP32_CAMERA_XCLK_HZ * OV7725_PLL_MULTIPLIER / \
      ((OV7725_CLKRC_DIVIDER + 1U) * 2U))
 
-/* Datasheet VGA YUV timing: 510 lines, 784 tP/line, tP = 2 PCLK. */
-#define OV7725_VGA_LINES_PER_FRAME       510U
-#define OV7725_VGA_TP_PER_LINE           784U
+#define OV7725_VGA_LINES_PER_FRAME       510U               /* OV7725 VGA 總行數 (含消隱區) */
+#define OV7725_VGA_TP_PER_LINE           784U               /* 每行傳輸週期 */
 #define OV7725_YUV_PCLK_PER_TP           2U
 #define OV7725_PCLK_PER_FRAME \
-    (OV7725_VGA_LINES_PER_FRAME * OV7725_VGA_TP_PER_LINE )
+    (OV7725_VGA_LINES_PER_FRAME * OV7725_VGA_TP_PER_LINE)
 #define OV7725_CALCULATED_FPS \
     (OV7725_INTERNAL_CLOCK_HZ / OV7725_PCLK_PER_FRAME)
 #define OV7725_CALCULATED_MILLI_FPS \
     ((uint32_t)(((uint64_t)OV7725_INTERNAL_CLOCK_HZ * 1000ULL) / \
                 OV7725_PCLK_PER_FRAME))
 
-/*
- * OV7670 clock tree:
- * fINT = XCLK * PLL / (2 * (CLKRC + 1)).  The datasheet's VGA/YUV
- * reference is 30 fps at fINT=24 MHz, so fINT=4 MHz targets 5 fps.
- */
 #define OV7670_PLL_MULTIPLIER             4ULL
 #define OV7670_REFERENCE_INTERNAL_HZ       24000000ULL
 #define OV7670_REFERENCE_MILLI_FPS         30000ULL
@@ -220,7 +260,6 @@
                  OV7670_REFERENCE_MILLI_FPS) / \
                 OV7670_REFERENCE_INTERNAL_HZ))
 
-/* VGA is scaled by the OV2640 DSP from the sensor's 800x600 SVGA timing. */
 #define OV2640_SVGA_CLOCKS_PER_LINE 1190ULL
 #define OV2640_SVGA_LINES_PER_FRAME 672ULL
 #define OV2640_INTERNAL_CLOCK_HZ \
@@ -236,6 +275,11 @@
 #define OV2640_DVP_TRANSFER_US \
     ((SENSOR_YUV422_BYTES * 1000000ULL) / OV2640_DVP_PCLK_HZ)
 
+/*
+ * --- 編譯時期靜態斷言驗證 (Static Assertions) ---
+ * 目的：在編譯程式碼的第一時間，由編譯器直接檢查數學常數與硬體限制。
+ * 若工程師修改了常數導致時脈不合或空間溢位，編譯將立即報錯中斷，防止燒錄出有潛在問題的韌體。
+ */
 _Static_assert(CAMERA_WARMUP_FRAMES >= 3U,
                "fps verification requires at least three warm-up frames");
 _Static_assert(OV7670_CALCULATED_MILLI_FPS == TARGET_FPS * 1000U,
@@ -247,60 +291,81 @@ _Static_assert(OV2640_DVP_PCLK_HZ * 100ULL >=
                    SENSOR_YUV422_BYTES * TARGET_FPS * 120ULL,
                "OV2640 DVP PCLK needs at least 20 percent transfer headroom");
 
+/* ============================================================================
+ * 資料結構定義 (Data Structures)
+ * ============================================================================ */
+
+/**
+ * @brief 開機相機硬體 DMA 接收測試統計結構體
+ * 用於在正式錄影前，檢驗相機硬體是否能穩定、按時輸出 5 FPS，完全不掉幀。
+ */
 typedef struct {
-    uint32_t get_calls;
-    uint32_t complete_frames;
-    uint32_t invalid_frames;
-    uint32_t stale_frames;
-    uint32_t after_deadline_frames;
-    uint32_t timeout_count;
-    uint32_t timestamp_errors;
-    uint32_t gap_events;
-    uint32_t estimated_missing_frames;
-    int64_t first_frame_us;
-    int64_t last_frame_us;
-    int64_t min_interval_us;
-    int64_t max_interval_us;
+    uint32_t get_calls;                 /* 呼叫 esp_camera_fb_get() 的總次數 */
+    uint32_t complete_frames;           /* 成功完整收到的合法影格總數 */
+    uint32_t invalid_frames;            /* 格式或大小不合法的異常影格數 */
+    uint32_t stale_frames;              /* 過期影格數 (時間戳早於觸發時間點) */
+    uint32_t after_deadline_frames;     /* 逾期影格數 (時間戳超過 10 秒測試視窗) */
+    uint32_t timeout_count;             /* 呼叫逾時未取得影格的次數 */
+    uint32_t timestamp_errors;          /* 時間戳倒退或異常的錯誤計數 */
+    uint32_t gap_events;                /* 影格間隔過長 (大於 300ms) 的斷層事件數 */
+    uint32_t estimated_missing_frames;  /* 根據時間推估遺失的影格數量 */
+    int64_t first_frame_us;             /* 第一幀到達的硬體時戳 (微秒) */
+    int64_t last_frame_us;              /* 最後一幀到達的硬體時戳 (微秒) */
+    int64_t min_interval_us;            /* 觀察到的兩幀間最小時間間隔 (微秒) */
+    int64_t max_interval_us;            /* 觀察到的兩幀間最大時間間隔 (微秒) */
 } dma_receive_test_stats_t;
 
+/**
+ * @brief 零拷貝queue元素結構體 (Ready Frame)
+ * 在 capture_task 與 writer_task 之間傳遞，僅傳遞指標與中繼資料，不複製 300KB 的像素資料。
+ */
 typedef struct {
-    camera_fb_t *frame;
-    uint32_t frame_id;
-    int64_t timestamp_us;
+    camera_fb_t *frame;                 /* 指向官方驅動 PSRAM 中的影格緩衝區指標 */
+    uint32_t frame_id;                  /* 本次錄影內的影格流水序號 (0, 1, 2...) */
+    int64_t timestamp_us;               /* 該影格採集完成時的系統微秒時戳 */
 } ready_frame_t;
 
+/**
+ * @brief 完整錄影品質監控統計結構體
+ * 紀錄每次 10 秒錄影過程中的每一個關鍵指標，供健康診斷與除錯分析。
+ */
 typedef struct {
-    uint32_t get_calls;
-    uint32_t in_window_frames;
-    uint32_t enqueued_frames;
-    uint32_t saved_frames;
-    uint32_t stale_frames;
-    uint32_t invalid_frames;
-    uint32_t timestamp_errors;
-    uint32_t capture_timeouts;
-    uint32_t pool_overflows;
-    uint32_t queue_errors;
-    uint32_t frame_gaps;
-    uint32_t peak_ready_slots;
-    int64_t first_frame_us;
-    int64_t last_frame_us;
-    int64_t min_interval_us;
-    int64_t max_interval_us;
-    int64_t max_sd_chunk_us;
-    int64_t max_sd_frame_us;
-    int64_t capture_end_us;
-    int64_t writer_end_us;
-    esp_err_t capture_result;
-    esp_err_t writer_result;
+    uint32_t get_calls;                 /* 嘗試讀取相機的次數 */
+    uint32_t in_window_frames;          /* 落在 10 秒合法時間視窗內的影格數 */
+    uint32_t enqueued_frames;           /* 成功推入 FreeRTOS 佇列的影格數 */
+    uint32_t saved_frames;              /* 成功完整寫入 SD 卡的影格數 */
+    uint32_t stale_frames;              /* 丟棄的歷史過期影格數 */
+    uint32_t invalid_frames;            /* 異常損毀影格數 */
+    uint32_t timestamp_errors;          /* 時戳錯誤次數 */
+    uint32_t capture_timeouts;          /* 擷取逾時次數 */
+    uint32_t pool_overflows;            /* 佇列滿載導致掉幀 (Drop) 的次數 */
+    uint32_t queue_errors;              /* 佇列操作錯誤次數 */
+    uint32_t frame_gaps;                /* 掉幀事件計數 */
+    uint32_t peak_ready_slots;          /* 佇列最高積壓深度 (歷史峰值，最高 5) */
+    int64_t first_frame_us;             /* 第一幀時戳 (微秒) */
+    int64_t last_frame_us;              /* 最後一幀時戳 (微秒) */
+    int64_t min_interval_us;            /* 影格間最小間隔 (微秒) */
+    int64_t max_interval_us;            /* 影格間最大間隔 (微秒) */
+    int64_t max_sd_chunk_us;            /* SD 卡寫入單次 32KB 區塊的最長耗時 (微秒) */
+    int64_t max_sd_frame_us;            /* SD 卡寫入完整單幀 (300KB) 的最長耗時 (微秒) */
+    int64_t capture_end_us;             /* 擷取任務結束時戳 (微秒) */
+    int64_t writer_end_us;              /* 寫入任務結束時戳 (微秒) */
+    esp_err_t capture_result;           /* 擷取端最終執行結果狀態碼 */
+    esp_err_t writer_result;            /* 寫入端最終執行結果狀態碼 */
 } recording_stats_t;
 
+/**
+ * @brief 當前錄影全域上下文結構體
+ */
 typedef struct {
-    int fd;
-    int64_t trigger_us;
-    int64_t deadline_us;
-    recording_stats_t stats;
+    int fd;                             /* 當前開啟的 SD 卡檔案描述符 (File Descriptor) */
+    int64_t trigger_us;                 /* 錄影開始觸發的微秒時間點 */
+    int64_t deadline_us;                /* 錄影預計結束的截止微秒時間點 (trigger + 10s) */
+    cam_storage_recording_t storage;    /* undone/done 檔案生命週期 */
+    recording_stats_t stats;            /* 本次錄影統計資訊實體 */
 } recording_context_t;
 
+/* 結構體與資料長度二度驗證 (確保二進位格式完全對齊 SD 扇區) */
 _Static_assert(IMAGE_PIXELS == 307200U,
                "VGA GRAY8 must contain 307200 bytes");
 _Static_assert(EXPECTED_FRAME_COUNT == 50U,
@@ -316,27 +381,37 @@ _Static_assert(CAMERA_FRAME_BUFFERS >= 4U,
 _Static_assert(RECORD_FILE_BYTES <= INT32_MAX,
                "The preallocated RAW file must fit in off_t on ESP32");
 
-static const char *TAG = "cam_record";
-static sdmmc_card_t *s_sd_card = NULL;
-static uint8_t *s_sd_dma_buffer = NULL;
-static size_t s_sd_dma_buffer_bytes = 0;
+/* ============================================================================
+ * 全域與靜態變數 (Global Variables)
+ * ============================================================================ */
 
+static const char *TAG = "cam_record";       /* 系統日誌輸出標籤 */
+static uint8_t *s_sd_dma_buffer = NULL;      /* 位於內部 SRAM 的 32KB DMA 寫入暫存區指標 */
+static size_t s_sd_dma_buffer_bytes = 0;     /* 實際成功分配的 DMA 暫存區大小 (位元組) */
+static bool s_initialized = false;
+
+/* 靜態記憶體配置的 FreeRTOS queue 用來儲存frame buffer的地址 (避免動態 malloc 造成記憶體碎裂) */
 static StaticQueue_t s_ready_queue_control;
-static uint8_t s_ready_queue_storage[
-    FRAME_QUEUE_CAPACITY * sizeof(ready_frame_t)];
+static uint8_t s_ready_queue_storage[FRAME_QUEUE_CAPACITY * sizeof(ready_frame_t)];
 static QueueHandle_t s_ready_queue = NULL;
 
+/* 靜態記憶體配置的 FreeRTOS event group (同步capture/write task)旗標群組 */
 static StaticEventGroup_t s_record_events_control;
 static EventGroupHandle_t s_record_events = NULL;
+
+/* 當前錄影作業運行環境實體 */
 static recording_context_t s_recording;
 
+/**
+ * @brief 官方相機驅動組態設定 (esp_camera configuration)
+ */
 static camera_config_t s_camera_config = {
-    .pin_pwdn = CAM_PIN_PWDN,
-    .pin_reset = CAM_PIN_RESET,
-    .pin_xclk = CAMERA_CONFIG_XCLK_PIN,
-    .pin_sccb_sda = CAM_PIN_SIOD,
-    .pin_sccb_scl = CAM_PIN_SIOC,
-    .pin_d7 = CAM_PIN_D7,
+    .pin_pwdn = CAM_PIN_PWDN,               /* 電源關閉控制腳位 */
+    .pin_reset = CAM_PIN_RESET,             /* 硬體重置腳位 */
+    .pin_xclk = CAMERA_CONFIG_XCLK_PIN,     /* 主時脈 XCLK 腳位 */
+    .pin_sccb_sda = CAM_PIN_SIOD,           /* SCCB (I2C) 資料線腳位 (用於控制感測器暫存器) */
+    .pin_sccb_scl = CAM_PIN_SIOC,           /* SCCB (I2C) 時脈線腳位 */
+    .pin_d7 = CAM_PIN_D7,                   /* 平行資料匯流排 D0 - D7 */
     .pin_d6 = CAM_PIN_D6,
     .pin_d5 = CAM_PIN_D5,
     .pin_d4 = CAM_PIN_D4,
@@ -344,28 +419,42 @@ static camera_config_t s_camera_config = {
     .pin_d2 = CAM_PIN_D2,
     .pin_d1 = CAM_PIN_D1,
     .pin_d0 = CAM_PIN_D0,
-    .pin_vsync = CAM_PIN_VSYNC,
-    .pin_href = CAM_PIN_HREF,
-    .pin_pclk = CAM_PIN_PCLK,
-    .xclk_freq_hz = CAMERA_CONFIG_XCLK_HZ,
-    .ledc_timer = LEDC_TIMER_0,
-    .ledc_channel = LEDC_CHANNEL_0,
+    .pin_vsync = CAM_PIN_VSYNC,             /* 垂直同步訊號 (VSYNC，標誌一幀開始) */
+    .pin_href = CAM_PIN_HREF,               /* 水平參考訊號 (HREF，標誌一行有效資料) */
+    .pin_pclk = CAM_PIN_PCLK,               /* 像素時脈訊號 (PCLK，每個邊緣採樣一個位元組) */
+    .xclk_freq_hz = CAMERA_CONFIG_XCLK_HZ,  /* 輸入感測器的時脈頻率 */
+    .ledc_timer = LEDC_TIMER_0,             /* 用於產生 XCLK 的 LEDC 定時器編號 */
+    .ledc_channel = LEDC_CHANNEL_0,         /* 用於產生 XCLK 的 LEDC 通道編號 */
 
-    /* Sensors transmit YUV422; classic ESP32 DMA retains Y into GRAY8. */
-    .pixel_format = PIXFORMAT_GRAYSCALE,
-    .frame_size = FRAMESIZE_VGA,
-    .jpeg_quality = 12, /* Unused in grayscale mode. */
     /*
-     * Eight driver-owned PSRAM buffers replace the application PSRAM copy.
-     * Writer returns each camera_fb_t only after its RAW payload is committed.
-     * The ready queue limit leaves active and spare buffers for the next VSYNC.
+     * 影像輸出格式設定：
+     * 感測器硬體輸出 YUV422 格式，ESP32 內部 I2S/DVP DMA 在接收時
+     * 會自動捨棄 UV 色度訊號，僅保留 Y 亮度訊號存入緩衝區，得到完美的 GRAY8 灰階影像。
+     */
+    .pixel_format = PIXFORMAT_GRAYSCALE,    /* 灰階模式 (GRAY8) */
+    .frame_size = FRAMESIZE_VGA,            /* 640x480 解析度 */
+    .jpeg_quality = 12,                     /* 非 JPEG 模式下此參數不作用 */
+    
+    /*
+     * 緩衝區數量與位置：
+     * 配置 8 個緩衝區於外部 PSRAM 中。
+     * writer_task 在完成 SD 寫入前會一直持有該緩衝區指標，
+     * 寫入完畢後呼叫 return，使硬體能循環重用這 8 個緩衝區。
      */
     .fb_count = CAMERA_FRAME_BUFFERS,
     .fb_location = CAMERA_FB_IN_PSRAM,
-    /* While waiting for GPIO0, retain only the newest completed frame. */
-    .grab_mode = CAMERA_GRAB_LATEST,
+    .grab_mode = CAMERA_GRAB_LATEST,        /* 閒置等待觸發時，只保留最新完成的一幀，其餘自動丟棄 */
 };
 
+/* ============================================================================
+ * 感測器底層暫存器調校函式 (Sensor Register Configuration)
+ * ============================================================================ */
+
+/**
+ * @brief 取得感測器型號名稱字串
+ * @param pid 感測器產品識別碼 (Product ID)
+ * @return 型號字串 ("OV2640", "OV7670", "OV7725" 或 "unsupported")
+ */
 static const char *sensor_name(uint16_t pid)
 {
     switch (pid) {
@@ -375,7 +464,10 @@ static const char *sensor_name(uint16_t pid)
     default: return "unsupported";
     }
 }
-/* Configure the measured OV7725 grayscale byte order and fixed hardware fps. */
+
+/**
+ * @brief 設定 OV7725 感測器：鎖定固定 5 FPS 並確保灰階位元組順序
+ */
 static esp_err_t configure_ov7725(sensor_t *sensor)
 {
     uint8_t com3 = 0;
@@ -383,10 +475,10 @@ static esp_err_t configure_ov7725(sensor_t *sensor)
     ESP_RETURN_ON_ERROR(camera_reg_read(sensor, OV7725_REG_COM3, 0xFF, &com3),
                         TAG, "Cannot read OV7725 COM3");
     ESP_RETURN_ON_ERROR(camera_reg_read(sensor, OV7725_REG_DSP_CTRL3,
-                                        0xFF, &dsp_ctrl3),
+                                         0xFF, &dsp_ctrl3),
                         TAG, "Cannot read OV7725 DSP_CTRL3");
 
-    /* Previous raw-frame tests proved COM3[4]=1 gives Y-first on this wiring. */
+    /* 驗證 COM3[4] 是否為 1：在目前腳位走線下，此位元必須為 1 才能保證 Y 訊號排在第一個位元組 */
     if ((com3 & OV7725_COM3_SWAP_YUV) == 0) {
         ESP_LOGE(TAG,
                  "OV7725 COM3=0x%02X: COM3[4] must remain 1 for GRAY8 capture",
@@ -394,8 +486,7 @@ static esp_err_t configure_ov7725(sensor_t *sensor)
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* Halve the prior sensor rate through CLKRC; verify VSYNC on hardware.
-     * A calculated rate or delivered-frame rate alone does not prove VSYNC. */
+    /* 透過 CLKRC 暫存器調降感測器時脈，並關閉低光自動降頻，鎖定在 5 FPS */
     ESP_RETURN_ON_ERROR(camera_reg_write(sensor, OV7725_REG_COM4,
                                          OV7725_COM4_PLL_MASK, 0x00),
                         TAG, "Cannot select OV7725 PLL bypass");
@@ -407,6 +498,7 @@ static esp_err_t configure_ov7725(sensor_t *sensor)
                                          OV7725_COM5_AUTO_FPS, 0x00),
                         TAG, "Cannot disable OV7725 automatic frame-rate reduction");
 
+    /* 回讀暫存器，確保寫入生效 */
     uint8_t com4 = 0;
     uint8_t com5 = 0;
     uint8_t clkrc = 0;
@@ -434,13 +526,12 @@ static esp_err_t configure_ov7725(sensor_t *sensor)
     return ESP_OK;
 }
 
+/**
+ * @brief 設定 OV7670 感測器：鎖定固定 5 FPS、停用夜間降頻並清除虛擬行擴展
+ */
 static esp_err_t configure_ov7670(sensor_t *sensor)
 {
-    /*
-     * Keep PLL x4, then divide the multiplied 16 MHz XCLK by 2*(7+1).
-     * This targets a sensor/VSYNC rate of 5 fps; it is not merely
-     * a software-side frame selection interval.
-     */
+    /* 設定 PLL 4倍頻並透過 CLKRC 除頻，使 VSYNC 硬體頻率精準落在 5 FPS */
     ESP_RETURN_ON_ERROR(camera_reg_write(sensor, OV7670_REG_DBLV,
                                          OV7670_DBLV_PLL_MASK,
                                          OV7670_DBLV_PLL_4X),
@@ -450,7 +541,7 @@ static esp_err_t configure_ov7670(sensor_t *sensor)
                                          OV7670_CLKRC_DIVIDER),
                         TAG, "Cannot set OV7670 CLKRC divider");
 
-    /* Do not let low-light/night mode or stale dummy rows lower the fps. */
+    /* 停用夜間模式與清除行擴展，防止低光下自動降速 */
     ESP_RETURN_ON_ERROR(camera_reg_write(sensor, OV7670_REG_COM11,
                                          OV7670_COM11_NIGHT_MODE, 0x00),
                         TAG, "Cannot disable OV7670 night-mode fps reduction");
@@ -463,6 +554,7 @@ static esp_err_t configure_ov7670(sensor_t *sensor)
     ESP_RETURN_ON_ERROR(camera_reg_write(sensor, OV7670_REG_DM_LNH, 0xFF, 0x00),
                         TAG, "Cannot clear OV7670 DM_LNH");
 
+    /* 驗證暫存器設定 */
     uint8_t tslb = 0, com3 = 0, com4 = 0, clkrc = 0, dblv = 0;
     uint8_t com11 = 0, advfl = 0, advfh = 0, dm_lnl = 0, dm_lnh = 0;
     ESP_RETURN_ON_ERROR(camera_reg_read(sensor, OV7670_REG_TSLB, 0xFF, &tslb),
@@ -496,7 +588,6 @@ static esp_err_t configure_ov7670(sensor_t *sensor)
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* esp32-camera's VGA/YUV table is YUYV, so the DMA keeps byte zero. */
     ESP_LOGI(TAG,
              "OV7670 GRAY8: TSLB=0x%02X COM3=0x%02X COM4=0x%02X "
              "CLKRC=0x%02X DBLV=0x%02X; hardware=%u.%03u fps",
@@ -506,16 +597,12 @@ static esp_err_t configure_ov7670(sensor_t *sensor)
     return ESP_OK;
 }
 
+/**
+ * @brief 設定 OV2640 感測器：設定 DSP 縮放、DVP 輸出除頻與 5 FPS 時脈樹
+ */
 static esp_err_t configure_ov2640(sensor_t *sensor)
 {
-    //camera_reg_write(sensor, 0x0112U, 0xFF, 0x80);
-    /*
-     * VGA is produced by scaling the 800x600 SVGA sensor timing.  With
-     * the selected XVCLK/multiplier/divider constants, the sensor timing
-     * clock is 4 MHz.  The SVGA timing model of 1190*672 clocks/frame gives
-     * 5.002 fps.  Match the standalone test's R_DVP_SP=0x86; actual PCLK,
-     * 480 HREF/frame and 1280 PCLK/HREF still require hardware measurement.
-     */
+    /* 設定 DVP 輸出時脈與感測器核心時脈 */
     ESP_RETURN_ON_ERROR(camera_reg_write(sensor, OV2640_DSP_R_DVP_SP,
                                          0xFF, OV2640_DVP_SP_VALUE),
                         TAG, "Cannot set OV2640 DVP PCLK divider");
@@ -524,11 +611,7 @@ static esp_err_t configure_ov2640(sensor_t *sensor)
                                          OV2640_CLKRC_VALUE),
                         TAG, "Cannot set OV2640 CLKRC doubler/divider");
 
-    /*
-     * OV2640 implements PIXFORMAT_GRAYSCALE by transmitting YUV422 and
-     * letting the ESP32 DMA retain Y.  A VGA line must therefore contain
-     * 640 pixels * 2 bytes = 1280 active PCLK edges at the sensor pins.
-     */
+    /* 啟用 YUV422 格式管線與 DSP 縮放至 VGA 尺寸 */
     ESP_RETURN_ON_ERROR(camera_reg_write(sensor, OV2640_DSP_CTRL0,
                                          OV2640_CTRL0_YUV422_MASK,
                                          OV2640_CTRL0_YUV422_MASK),
@@ -540,7 +623,7 @@ static esp_err_t configure_ov2640(sensor_t *sensor)
                                          OV2640_R_BYPASS_DSP_MASK, 0x00),
                         TAG, "Cannot enable OV2640 DSP");
 
-    /* Remove any line/frame extensions left by an earlier sensor setup. */
+    /* 清除歷史殘留的虛擬行與曝光補償暫存器 */
     ESP_RETURN_ON_ERROR(camera_reg_write(sensor, OV2640_SENSOR_REG2A,
                                          OV2640_REG2A_FRARH_MASK, 0x00),
                         TAG, "Cannot clear OV2640 FRARH");
@@ -560,51 +643,52 @@ static esp_err_t configure_ov2640(sensor_t *sensor)
                                          0xFF, 0x00),
                         TAG, "Cannot clear OV2640 FLH");
 
+    /* 回讀暫存器並完整驗證 */
     uint8_t clkrc = 0, dvp_sp = 0, reg2a = 0, frarl = 0;
     uint8_t addvsl = 0, addvsh = 0, fll = 0, flh = 0;
     uint8_t r_bypass = 0, ctrl0 = 0, image_mode = 0;
     uint8_t zmow = 0, zmoh = 0, zmhh = 0;
     ESP_RETURN_ON_ERROR(camera_reg_read(sensor, OV2640_SENSOR_CLKRC,
-                                        0xFF, &clkrc),
+                                         0xFF, &clkrc),
                         TAG, "Cannot verify OV2640 sensor CLKRC");
     ESP_RETURN_ON_ERROR(camera_reg_read(sensor, OV2640_DSP_R_DVP_SP,
                                          0xFF, &dvp_sp),
                         TAG, "Cannot verify OV2640 DSP R_DVP_SP");
     ESP_RETURN_ON_ERROR(camera_reg_read(sensor, OV2640_SENSOR_REG2A,
-                                        0xFF, &reg2a),
+                                         0xFF, &reg2a),
                         TAG, "Cannot verify OV2640 REG2A");
     ESP_RETURN_ON_ERROR(camera_reg_read(sensor, OV2640_SENSOR_FRARL,
-                                        0xFF, &frarl),
+                                         0xFF, &frarl),
                         TAG, "Cannot verify OV2640 FRARL");
     ESP_RETURN_ON_ERROR(camera_reg_read(sensor, OV2640_SENSOR_ADDVSL,
-                                        0xFF, &addvsl),
+                                         0xFF, &addvsl),
                         TAG, "Cannot verify OV2640 ADDVSL");
     ESP_RETURN_ON_ERROR(camera_reg_read(sensor, OV2640_SENSOR_ADDVSH,
-                                        0xFF, &addvsh),
+                                         0xFF, &addvsh),
                         TAG, "Cannot verify OV2640 ADDVSH");
     ESP_RETURN_ON_ERROR(camera_reg_read(sensor, OV2640_SENSOR_FLL,
-                                        0xFF, &fll),
+                                         0xFF, &fll),
                         TAG, "Cannot verify OV2640 FLL");
     ESP_RETURN_ON_ERROR(camera_reg_read(sensor, OV2640_SENSOR_FLH,
                                          0xFF, &flh),
                         TAG, "Cannot verify OV2640 FLH");
     ESP_RETURN_ON_ERROR(camera_reg_read(sensor, OV2640_DSP_R_BYPASS,
-                                        0xFF, &r_bypass),
+                                         0xFF, &r_bypass),
                         TAG, "Cannot verify OV2640 R_BYPASS");
     ESP_RETURN_ON_ERROR(camera_reg_read(sensor, OV2640_DSP_CTRL0,
-                                        0xFF, &ctrl0),
+                                         0xFF, &ctrl0),
                         TAG, "Cannot verify OV2640 CTRL0");
     ESP_RETURN_ON_ERROR(camera_reg_read(sensor, OV2640_DSP_IMAGE_MODE,
-                                        0xFF, &image_mode),
+                                         0xFF, &image_mode),
                         TAG, "Cannot verify OV2640 IMAGE_MODE");
     ESP_RETURN_ON_ERROR(camera_reg_read(sensor, OV2640_DSP_ZMOW,
-                                        0xFF, &zmow),
+                                         0xFF, &zmow),
                         TAG, "Cannot verify OV2640 ZMOW");
     ESP_RETURN_ON_ERROR(camera_reg_read(sensor, OV2640_DSP_ZMOH,
-                                        0xFF, &zmoh),
+                                         0xFF, &zmoh),
                         TAG, "Cannot verify OV2640 ZMOH");
     ESP_RETURN_ON_ERROR(camera_reg_read(sensor, OV2640_DSP_ZMHH,
-                                        0xFF, &zmhh),
+                                         0xFF, &zmhh),
                         TAG, "Cannot verify OV2640 ZMHH");
 
     if (dvp_sp != OV2640_DVP_SP_VALUE ||
@@ -647,6 +731,9 @@ static esp_err_t configure_ov2640(sensor_t *sensor)
     return ESP_OK;
 }
 
+/**
+ * @brief 統一感測器設定入口：依據讀取到的硬體 PID 轉派對應的設定常式
+ */
 static esp_err_t configure_sensor(sensor_t *sensor)
 {
     switch (sensor->id.PID) {
@@ -657,11 +744,109 @@ static esp_err_t configure_sensor(sensor_t *sensor)
     }
 }
 
+/* ============================================================================
+ * SD 卡與底層管線初始化 (SDMMC and Buffer Management)
+ * ============================================================================ */
+
+/**
+ * @brief 在 ESP32 內部 SRAM 配置 4 位元組對齊的 支援 DMA 暫存區
+ * 說明：外部 PSRAM 無法直接供 SDMMC DMA 高效傳輸，故必須透過內部 SRAM 暫存中轉。
+ */
+static esp_err_t allocate_sd_dma_buffer(void)
+{
+    static const size_t candidate_sizes[] = { // SRAM 中配置的 buffer 大小 (依序嘗試 32->16->8 kb)
+        SD_DMA_BUFFER_PREFERRED_BYTES,  /* 優先嘗試 32 KB */
+        16U * 1024U,                    /* 次選 16 KB */
+        SD_DMA_BUFFER_MIN_BYTES,        /* 最低容許 8 KB */
+    };
+
+    for (size_t i = 0; i < sizeof(candidate_sizes) / sizeof(candidate_sizes[0]); ++i) {
+        const size_t bytes = candidate_sizes[i];
+        uint8_t *buffer = heap_caps_aligned_alloc(
+            4, bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+        if (buffer != NULL) { // 配置成功就印出配置的資訊
+            s_sd_dma_buffer = buffer;
+            s_sd_dma_buffer_bytes = bytes;
+            ESP_LOGI(TAG, "SD DMA staging buffer: %u bytes internal RAM",
+                     (unsigned)bytes);
+            return ESP_OK;
+        }
+    }
+    /* 若配置失敗才會執行到這邊，印出錯誤訊息 */
+    ESP_LOGE(TAG,
+             "Cannot allocate an internal DMA staging buffer; largest DMA block=%u",
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+    return ESP_ERR_NO_MEM;
+}
+
+/**
+ * @brief 釋放錄影管線所佔用的 DMA 緩衝區與 FreeRTOS 物件
+ * 呼叫時機 : pipeline初始化失敗時，呼叫來釋放資源
+ */
+static void release_record_pipeline(void)
+{
+    if (s_sd_dma_buffer != NULL) {
+        heap_caps_free(s_sd_dma_buffer);
+        s_sd_dma_buffer = NULL;
+        s_sd_dma_buffer_bytes = 0;
+    }
+    s_ready_queue = NULL;
+    s_record_events = NULL;
+}
+
+/**
+ * @brief 初始化錄影管線 (配置 DMA 暫存區、
+ * capture/write task 需要用到的靜態queue與靜態eventgroup)
+ */
+static esp_err_t init_record_pipeline(void)
+{
+    ESP_RETURN_ON_ERROR(allocate_sd_dma_buffer(), TAG,
+                        "SD DMA staging allocation failed");
+
+    /* 使用 Static 靜態配置，確保運行期間不發生記憶體碎裂 */
+    s_ready_queue = xQueueCreateStatic(
+        FRAME_QUEUE_CAPACITY,   // queue 深度 5
+        sizeof(ready_frame_t),  // 每一個queue的大小
+        s_ready_queue_storage,  // queue 放在哪個記憶體位置
+        &s_ready_queue_control  // queue 控制結構
+    );
+    s_record_events = xEventGroupCreateStatic(&s_record_events_control);
+    if (s_ready_queue == NULL || s_record_events == NULL) { // 建立 queue/eventgroup 失敗
+        release_record_pipeline();                          // 釋放資源
+        return ESP_ERR_NO_MEM;                              // 回報 記憶體空間不足
+    }
+
+    ESP_LOGI(TAG,                                           // 建立成功 -> 印出配置的大小
+             "Zero-copy recording ready: camera_fb=%u, ready_queue=%u, "
+             "SD staging=%u bytes internal DMA RAM",
+             (unsigned)CAMERA_FRAME_BUFFERS,
+             (unsigned)FRAME_QUEUE_CAPACITY,
+             (unsigned)s_sd_dma_buffer_bytes);
+    return ESP_OK;                                          // 回傳 OK
+}
+
+/**
+ * @brief 重置錄影佇列狀態：清空滯留影格並將其歸還相機驅動 (避免記憶體洩漏)
+ * 每次開始拍照前啟動
+ */
+static esp_err_t reset_record_queues(void)
+{
+    ready_frame_t pending = {0}; //用於儲存frame的struct
+    while (xQueueReceive(s_ready_queue, &pending, 0) == pdTRUE) { // 將s_ready_queue中的資料複製pending這個記憶體位置，不等待，空的就直接pdFALSE
+        if (pending.frame != NULL) {                // 若有frame_buffer尚未歸還
+            esp_camera_fb_return(pending.frame);    /* 歸還尚未處理的影格緩衝區 */
+        }
+    }
+    xQueueReset(s_ready_queue);
+    xEventGroupClearBits(s_record_events, CAPTURE_DONE_BIT | WRITER_DONE_BIT);
+    return ESP_OK;
+}
+
 static esp_err_t write_all(int fd, const uint8_t *data, size_t bytes)
 {
     size_t offset = 0;
     while (offset < bytes) {
-        const ssize_t written = write(fd, data + offset, bytes - offset);
+        ssize_t written = write(fd, data + offset, bytes - offset);
         if (written < 0) {
             if (errno == EINTR) {
                 continue;
@@ -676,169 +861,10 @@ static esp_err_t write_all(int fd, const uint8_t *data, size_t bytes)
     return ESP_OK;
 }
 
-static esp_err_t init_sdcard(void)
-{
-    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-    sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
-
-    /*
-     * TTGO T8 V1.7 onboard slot 1: CLK=GPIO14, CMD=GPIO15, D0=GPIO2.
-     * Use the fastest standard SD mode supported by this ESP-IDF version.
-     * VGA GRAY8 at 5 fps requires 1.536 MB/s before filesystem overhead.
-     */
-    host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;
-    slot.width = 1;
-    slot.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
-
-    const esp_vfs_fat_sdmmc_mount_config_t mount = {
-        .format_if_mount_failed = false,
-        .max_files = SD_MAX_OPEN_FILES,
-        .allocation_unit_size = SD_FORMAT_ALLOCATION_BYTES,
-    };
-
-    ESP_RETURN_ON_ERROR(
-        esp_vfs_fat_sdmmc_mount(SD_MOUNT_POINT, &host, &slot, &mount,
-                                &s_sd_card),
-        TAG, "SDMMC 1-bit 40 MHz mount failed");
-
-    sdmmc_card_print_info(stdout, s_sd_card);
-    return ESP_OK;
-}
-
-static esp_err_t allocate_sd_dma_buffer(void)
-{
-    static const size_t candidate_sizes[] = {
-        SD_DMA_BUFFER_PREFERRED_BYTES,
-        16U * 1024U,
-        SD_DMA_BUFFER_MIN_BYTES,
-    };
-
-    for (size_t i = 0; i < sizeof(candidate_sizes) / sizeof(candidate_sizes[0]);
-         ++i) {
-        const size_t bytes = candidate_sizes[i];
-        uint8_t *buffer = heap_caps_aligned_alloc(
-            4, bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-        if (buffer != NULL) {
-            s_sd_dma_buffer = buffer;
-            s_sd_dma_buffer_bytes = bytes;
-            ESP_LOGI(TAG, "SD DMA staging buffer: %u bytes internal RAM",
-                     (unsigned)bytes);
-            return ESP_OK;
-        }
-    }
-
-    ESP_LOGE(TAG,
-             "Cannot allocate an internal DMA staging buffer; largest DMA block=%u",
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
-    return ESP_ERR_NO_MEM;
-}
-
-static void release_record_pipeline(void)
-{
-    if (s_sd_dma_buffer != NULL) {
-        heap_caps_free(s_sd_dma_buffer);
-        s_sd_dma_buffer = NULL;
-        s_sd_dma_buffer_bytes = 0;
-    }
-    s_ready_queue = NULL;
-    s_record_events = NULL;
-}
-
-static esp_err_t init_record_pipeline(void)
-{
-    ESP_RETURN_ON_ERROR(allocate_sd_dma_buffer(), TAG,
-                        "SD DMA staging allocation failed");
-
-    s_ready_queue = xQueueCreateStatic(
-        FRAME_QUEUE_CAPACITY, sizeof(ready_frame_t), s_ready_queue_storage,
-        &s_ready_queue_control);
-    s_record_events = xEventGroupCreateStatic(&s_record_events_control);
-    if (s_ready_queue == NULL || s_record_events == NULL) {
-        release_record_pipeline();
-        return ESP_ERR_NO_MEM;
-    }
-
-    ESP_LOGI(TAG,
-             "Zero-copy recording ready: camera_fb=%u, ready_queue=%u, "
-             "SD staging=%u bytes internal DMA RAM",
-             (unsigned)CAMERA_FRAME_BUFFERS,
-             (unsigned)FRAME_QUEUE_CAPACITY,
-             (unsigned)s_sd_dma_buffer_bytes);
-    return ESP_OK;
-}
-
-static esp_err_t reset_record_queues(void)
-{
-    /* A prior failed recording must never leave a driver framebuffer held. */
-    ready_frame_t pending = {0};
-    while (xQueueReceive(s_ready_queue, &pending, 0) == pdTRUE) {
-        if (pending.frame != NULL) {
-            esp_camera_fb_return(pending.frame);
-        }
-    }
-    xQueueReset(s_ready_queue);
-    xEventGroupClearBits(s_record_events,
-                         CAPTURE_DONE_BIT | WRITER_DONE_BIT);
-    return ESP_OK;
-}
-
-static esp_err_t preallocate_raw_file(int fd, int64_t *elapsed_us)
-{
-    const int64_t start_us = esp_timer_get_time();
-    const off_t final_byte_offset = (off_t)(RECORD_FILE_BYTES - 1U);
-    const uint8_t marker = 0;
-
-    if (lseek(fd, final_byte_offset, SEEK_SET) != final_byte_offset ||
-        write_all(fd, &marker, sizeof(marker)) != ESP_OK ||
-        fsync(fd) != 0 || lseek(fd, 0, SEEK_SET) != 0) {
-        ESP_LOGE(TAG, "RAW preallocation failed: errno=%d (%s)",
-                 errno, strerror(errno));
-        return ESP_FAIL;
-    }
-
-    *elapsed_us = esp_timer_get_time() - start_us;
-    return ESP_OK;
-}
-
-static esp_err_t open_next_raw_file(char *path, size_t path_bytes,
-                                    int *fd_out)
-{
-    for (uint32_t id = 0; id < RECORD_MAX_SEQUENCE; ++id) {
-        const int path_length = snprintf(path, path_bytes,
-                                         SD_MOUNT_POINT "/R%07u.RAW",
-                                         (unsigned)id);
-        if (path_length < 0 || (size_t)path_length >= path_bytes) {
-            return ESP_ERR_INVALID_SIZE;
-        }
-
-        const int fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0644);
-        if (fd >= 0) {
-            int64_t preallocate_us = 0;
-            const esp_err_t err = preallocate_raw_file(fd, &preallocate_us);
-            if (err != ESP_OK) {
-                close(fd);
-                unlink(path);
-                return err;
-            }
-            ESP_LOGI(TAG,
-                     "Prepared %s: preallocated %" PRIu64
-                     " bytes in %" PRId64 " ms",
-                     path, RECORD_FILE_BYTES, preallocate_us / 1000);
-            *fd_out = fd;
-            return ESP_OK;
-        }
-        if (errno != EEXIST) {
-            ESP_LOGE(TAG, "Cannot create %s: errno=%d (%s)",
-                     path, errno, strerror(errno));
-            return ESP_FAIL;
-        }
-    }
-
-    return ESP_ERR_NO_MEM;
-}
-
-static esp_err_t write_frame_to_sd(int fd, const uint8_t *pixels,
-                                   int64_t *max_chunk_us)
+/**
+ * @brief 分段將一整幀 (300KB) 從外部 PSRAM 複製到內部 DMA 暫存區，再寫入 SD 卡
+ */
+static esp_err_t write_frame_to_sd(int fd, const uint8_t *pixels, int64_t *max_chunk_us)
 {
     size_t offset = 0;
     while (offset < IMAGE_PIXELS) {
@@ -847,13 +873,15 @@ static esp_err_t write_frame_to_sd(int fd, const uint8_t *pixels,
                                  ? remaining
                                  : s_sd_dma_buffer_bytes;
 
-        /* SDMMC DMA cannot directly read classic ESP32 PSRAM efficiently. */
+        /* PSRAM -> 內部 SRAM 記憶體複製 */
         memcpy(s_sd_dma_buffer, pixels + offset, chunk);
+        
+        /* 內部 SRAM -> SD 卡寫入 (透過 SDMMC DMA) */
         const int64_t start_us = esp_timer_get_time();
         const esp_err_t err = write_all(fd, s_sd_dma_buffer, chunk);
         const int64_t chunk_us = esp_timer_get_time() - start_us;
         if (chunk_us > *max_chunk_us) {
-            *max_chunk_us = chunk_us;
+            *max_chunk_us = chunk_us;                       /* 紀錄最長分段寫入耗時 */
         }
         if (err != ESP_OK) {
             return err;
@@ -863,15 +891,23 @@ static esp_err_t write_frame_to_sd(int fd, const uint8_t *pixels,
     return ESP_OK;
 }
 
+/* ============================================================================
+ * 相機控制與前置驗證 (Camera Control and Qualification)
+ * ============================================================================ */
+
+/**
+ * @brief 初始化相機驅動、檢查 PSRAM 並調校底層感測器
+ */
 static esp_err_t init_camera(sensor_t **sensor_out)
 {
-    if (!esp_psram_is_initialized()) {
+    const size_t psram_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+    if (psram_total == 0U) {
         ESP_LOGE(TAG, "PSRAM is required for the VGA camera framebuffers");
         return ESP_ERR_NOT_SUPPORTED;
     }
 
     ESP_LOGI(TAG, "PSRAM: %u bytes total, %u bytes free, largest block=%u",
-             (unsigned)esp_psram_get_size(),
+             (unsigned)psram_total,
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
 
@@ -911,11 +947,15 @@ static esp_err_t init_camera(sensor_t **sensor_out)
              sensor_name(sensor->id.PID), sensor->id.PID,
              (unsigned)SENSOR_YUV422_BYTES, (unsigned)IMAGE_PIXELS);
     ESP_RETURN_ON_ERROR(configure_sensor(sensor), TAG,
-                        "Sensor timing/output setup failed");
+                         "Sensor timing/output setup failed");
     *sensor_out = sensor;
     return ESP_OK;
 }
 
+/**
+ * @brief 啟用或鎖定相機自動功能 (自動增益 AGC、自動曝光 AEC、自動白平衡 AWB)
+ * 說明：錄影前需先鎖定曝光與白平衡，避免每幀畫面明暗色調跳動，造成影像閃爍。
+ */
 static esp_err_t set_auto_controls(sensor_t *sensor, bool enable)
 {
     if (sensor->set_gain_ctrl == NULL || sensor->set_exposure_ctrl == NULL ||
@@ -923,7 +963,6 @@ static esp_err_t set_auto_controls(sensor_t *sensor, bool enable)
         return ESP_ERR_NOT_SUPPORTED;
     }
 
-    /* OV7725 returns its resulting state (1 when enabled), not only 0/-1. */
     if (sensor->set_gain_ctrl(sensor, enable) < 0 ||
         sensor->set_exposure_ctrl(sensor, enable) < 0 ||
         sensor->set_whitebal(sensor, enable) < 0) {
@@ -932,11 +971,9 @@ static esp_err_t set_auto_controls(sensor_t *sensor, bool enable)
 
     if (sensor->id.PID == OV2640_PID) {
         uint8_t com8 = 0, ctrl1 = 0;
-        ESP_RETURN_ON_ERROR(camera_reg_read(sensor, OV2640_SENSOR_COM8,
-                                            0xFF, &com8),
+        ESP_RETURN_ON_ERROR(camera_reg_read(sensor, OV2640_SENSOR_COM8, 0xFF, &com8),
                             TAG, "Cannot verify OV2640 COM8");
-        ESP_RETURN_ON_ERROR(camera_reg_read(sensor, OV2640_DSP_CTRL1,
-                                            0xFF, &ctrl1),
+        ESP_RETURN_ON_ERROR(camera_reg_read(sensor, OV2640_DSP_CTRL1, 0xFF, &ctrl1),
                             TAG, "Cannot verify OV2640 DSP CTRL1");
         const uint8_t expected_com8 = enable ? OV2640_COM8_AEC_AGC_MASK : 0;
         const uint8_t expected_ctrl1 = enable ? OV2640_CTRL1_AWB_MASK : 0;
@@ -950,8 +987,7 @@ static esp_err_t set_auto_controls(sensor_t *sensor, bool enable)
                  enable ? "enabled" : "locked", com8, ctrl1);
     } else {
         uint8_t com8 = 0;
-        ESP_RETURN_ON_ERROR(camera_reg_read(sensor, OMNIVISION_REG_COM8,
-                                            0xFF, &com8),
+        ESP_RETURN_ON_ERROR(camera_reg_read(sensor, OMNIVISION_REG_COM8, 0xFF, &com8),
                             TAG, "Cannot verify COM8");
         const uint8_t expected = enable ? OMNIVISION_COM8_AUTO_MASK : 0;
         if ((com8 & OMNIVISION_COM8_AUTO_MASK) != expected) {
@@ -966,6 +1002,9 @@ static esp_err_t set_auto_controls(sensor_t *sensor, bool enable)
     return ESP_OK;
 }
 
+/**
+ * @brief 驗證單一影格緩衝區是否完全符合預期的解析度與長度
+ */
 static bool frame_is_valid(const camera_fb_t *frame)
 {
     return frame != NULL && frame->format == PIXFORMAT_GRAYSCALE &&
@@ -973,12 +1012,18 @@ static bool frame_is_valid(const camera_fb_t *frame)
            frame->len == IMAGE_PIXELS;
 }
 
+/**
+ * @brief 計算影格的微秒 (us) 系統時戳
+ */
 static int64_t frame_timestamp_us(const camera_fb_t *frame)
 {
     return (int64_t)frame->timestamp.tv_sec * 1000000LL +
            (int64_t)frame->timestamp.tv_usec;
 }
 
+/**
+ * @brief 開機暖機常式：接收並丟棄前 10 幀，讓感測器自動曝光收斂穩定
+ */
 static esp_err_t discard_warmup_frames(sensor_t *sensor)
 {
     ESP_LOGI(TAG,
@@ -989,11 +1034,6 @@ static esp_err_t discard_warmup_frames(sensor_t *sensor)
     int64_t last_us = 0;
 
     for (uint32_t complete = 0; complete < CAMERA_WARMUP_FRAMES; ++complete) {
-        /*
-         * esp_camera_fb_get() returns only frames accepted by cam_hal.
-         * A frame rejected by cam_hal for FB-SIZE mismatch is never exposed
-         * here; repeated rejected frames eventually appear as a NULL timeout.
-         */
         camera_fb_t *frame = esp_camera_fb_get();
         if (frame == NULL) {
             ESP_LOGE(TAG, "Warm-up timed out after %u/%u complete frames",
@@ -1018,7 +1058,7 @@ static esp_err_t discard_warmup_frames(sensor_t *sensor)
         if (complete == CAMERA_WARMUP_FRAMES - 1U) {
             last_us = timestamp_us;
         }
-        esp_camera_fb_return(frame);
+        esp_camera_fb_return(frame);    /* 丟棄並歸還緩衝區 */
     }
 
     if (last_us <= first_us) {
@@ -1032,7 +1072,6 @@ static esp_err_t discard_warmup_frames(sensor_t *sensor)
     const uint32_t milli_fps =
         (uint32_t)(((uint64_t)intervals * 1000000000ULL) / elapsed_us);
 
-    /* Diagnostic only: the 10-second test below reports delivery loss. */
     ESP_LOGI(TAG,
              "%s warm-up delivery: %u intervals in %u ms, measured=%u.%03u fps",
              sensor_name(sensor->id.PID), (unsigned)intervals,
@@ -1042,52 +1081,17 @@ static esp_err_t discard_warmup_frames(sensor_t *sensor)
     return ESP_OK;
 }
 
-static void init_record_button(void)
-{
-    const gpio_config_t config = {
-        .pin_bit_mask = 1ULL << TEST_BUTTON_GPIO,
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    ESP_ERROR_CHECK(gpio_config(&config));
-}
-
-static int64_t wait_for_record_trigger(void)
-{
-    ESP_LOGI(TAG,
-             "Press and release GPIO0 to record %u seconds "
-             "(expected about %u GRAY8 frames)",
-             (unsigned)RECORD_DURATION_SECONDS,
-             (unsigned)RECORD_EXPECTED_FRAMES);
-
-    for (;;) {
-        while (gpio_get_level(TEST_BUTTON_GPIO) != 0) {
-            vTaskDelay(pdMS_TO_TICKS(BUTTON_POLL_MS));
-        }
-        vTaskDelay(pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS));
-        if (gpio_get_level(TEST_BUTTON_GPIO) != 0) {
-            continue;
-        }
-
-        ESP_LOGI(TAG, "GPIO0 pressed; release it to start recording");
-        while (gpio_get_level(TEST_BUTTON_GPIO) == 0) {
-            vTaskDelay(pdMS_TO_TICKS(BUTTON_POLL_MS));
-        }
-        vTaskDelay(pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS));
-        if (gpio_get_level(TEST_BUTTON_GPIO) != 0) {
-            return esp_timer_get_time();
-        }
-    }
-}
-
+/**
+ * @brief 開機相機效能資格驗證 (Startup FPS Test)
+ * 說明：
+ * 在不掛載 SD 卡的情況下，純粹接收 10 秒影格並檢驗時戳間隔。
+ * 必須通過 5 FPS 且完全零掉幀的嚴格檢驗，系統才允許掛載 SD 卡進入錄影作業。
+ */
 static esp_err_t run_startup_fps_test(void)
 {
     dma_receive_test_stats_t stats = {0};
     const int64_t trigger_us = esp_timer_get_time();
-    const int64_t deadline_us =
-        trigger_us + (int64_t)TEST_DURATION_SECONDS * 1000000LL;
+    const int64_t deadline_us = trigger_us + (int64_t)TEST_DURATION_SECONDS * 1000000LL;
     int64_t previous_seen_us = 0;
 
     ESP_LOGI(TAG,
@@ -1112,6 +1116,7 @@ static esp_err_t run_startup_fps_test(void)
         const int64_t timestamp_us = frame_timestamp_us(frame);
         const int64_t received_us = esp_timer_get_time();
 
+        /* 時戳合法性檢查 */
         if (timestamp_us <= 0 || timestamp_us > received_us ||
             (previous_seen_us != 0 && timestamp_us <= previous_seen_us)) {
             stats.timestamp_errors++;
@@ -1124,6 +1129,7 @@ static esp_err_t run_startup_fps_test(void)
         }
         previous_seen_us = timestamp_us;
 
+        /* 影格格式與大小檢查 */
         if (!frame_is_valid(frame)) {
             stats.invalid_frames++;
             ESP_LOGE(TAG,
@@ -1134,12 +1140,14 @@ static esp_err_t run_startup_fps_test(void)
             continue;
         }
 
+        /* 濾除觸發前已在硬體管線殘留的歷史影格 */
         if (timestamp_us < trigger_us) {
             stats.stale_frames++;
             esp_camera_fb_return(frame);
             continue;
         }
 
+        /* 超出 10 秒視窗則測試結束 */
         if (timestamp_us >= deadline_us) {
             stats.after_deadline_frames++;
             esp_camera_fb_return(frame);
@@ -1151,23 +1159,21 @@ static esp_err_t run_startup_fps_test(void)
             stats.first_frame_us = timestamp_us;
         } else {
             interval_us = timestamp_us - stats.last_frame_us;
-            if (stats.complete_frames == 1U ||
-                interval_us < stats.min_interval_us) {
+            if (stats.complete_frames == 1U || interval_us < stats.min_interval_us) {
                 stats.min_interval_us = interval_us;
             }
             if (interval_us > stats.max_interval_us) {
                 stats.max_interval_us = interval_us;
             }
 
+            /* 檢查是否發生掉幀 (間隔大於 300ms) */
             if (interval_us > GAP_THRESHOLD_US) {
                 stats.gap_events++;
                 const uint32_t represented_periods =
-                    (uint32_t)((interval_us +
-                                EXPECTED_FRAME_PERIOD_US / 2LL) /
+                    (uint32_t)((interval_us + EXPECTED_FRAME_PERIOD_US / 2LL) /
                                EXPECTED_FRAME_PERIOD_US);
                 if (represented_periods > 1U) {
-                    stats.estimated_missing_frames +=
-                        represented_periods - 1U;
+                    stats.estimated_missing_frames += represented_periods - 1U;
                 }
                 ESP_LOGW(TAG,
                          "Delivery gap before complete frame %u: "
@@ -1181,8 +1187,7 @@ static esp_err_t run_startup_fps_test(void)
         stats.last_frame_us = timestamp_us;
         stats.complete_frames++;
 
-        if (stats.complete_frames == 1U ||
-            (stats.complete_frames % 10U) == 0U) {
+        if (stats.complete_frames == 1U || (stats.complete_frames % 10U) == 0U) {
             ESP_LOGI(TAG,
                      "FPS test frame %u: timestamp_offset=%" PRId64
                      " us interval=%" PRId64 " us",
@@ -1191,23 +1196,20 @@ static esp_err_t run_startup_fps_test(void)
                      interval_us);
         }
 
-        /* No application copy or SD write: isolate camera HAL/DMA delivery. */
-        esp_camera_fb_return(frame);
+        esp_camera_fb_return(frame);    /* 立即歸還，不進行任何 SD 寫入 */
     }
 
-    const int64_t span_us =
-        stats.complete_frames > 1U
-            ? stats.last_frame_us - stats.first_frame_us
-            : 0;
+    /* 計算平均 FPS 與檢驗結果 */
+    const int64_t span_us = stats.complete_frames > 1U
+                                ? stats.last_frame_us - stats.first_frame_us
+                                : 0;
     const uint32_t timestamp_milli_fps =
         stats.complete_frames > 1U && span_us > 0
-            ? (uint32_t)(((uint64_t)(stats.complete_frames - 1U) *
-                          1000000000ULL) /
+            ? (uint32_t)(((uint64_t)(stats.complete_frames - 1U) * 1000000000ULL) /
                          (uint64_t)span_us)
             : 0;
     const uint32_t window_milli_fps =
-        (uint32_t)(((uint64_t)stats.complete_frames * 1000ULL) /
-                   TEST_DURATION_SECONDS);
+        (uint32_t)(((uint64_t)stats.complete_frames * 1000ULL) / TEST_DURATION_SECONDS);
     const uint32_t deficit =
         stats.complete_frames < EXPECTED_FRAME_COUNT
             ? EXPECTED_FRAME_COUNT - stats.complete_frames
@@ -1217,6 +1219,8 @@ static esp_err_t run_startup_fps_test(void)
     const bool fps_in_range =
         timestamp_milli_fps >= target_milli_fps - FPS_TOLERANCE_MILLI &&
         timestamp_milli_fps <= target_milli_fps + FPS_TOLERANCE_MILLI;
+    
+    /* 驗證通過準則：影格數達標、零斷層、零異常幀、零逾時、零時戳錯亂且 FPS 在誤差內 */
     const bool pass =
         stats.complete_frames >= EXPECTED_FRAME_COUNT &&
         stats.gap_events == 0U &&
@@ -1255,6 +1259,17 @@ static esp_err_t run_startup_fps_test(void)
     return pass ? ESP_OK : ESP_ERR_INVALID_STATE;
 }
 
+/* ============================================================================
+ * 雙核心並行錄影任務實作 (Capture and Writer FreeRTOS Tasks)
+ * ============================================================================ */
+
+/**
+ * @brief 影像擷取任務 (Capture Task)
+ * 運行於：CPU Core 1，高優先權 (Priority 6)
+ * 職責：
+ * 從相機驅動讀取影格，嚴格審核時戳與格式，並封裝成 ready_frame_t 丟入佇列。
+ * 本任務絕對不執行阻塞的檔案操作，確保相機硬體 FIFO 隨時能被及時清空。
+ */
 static void capture_task(void *argument)
 {
     (void)argument;
@@ -1294,23 +1309,26 @@ static void capture_task(void *argument)
             continue;
         }
 
+        /* 濾除觸發前的歷史殘留影格 */
         if (timestamp_us < s_recording.trigger_us) {
             stats->stale_frames++;
             esp_camera_fb_return(frame);
             continue;
         }
+        
+        /* 達到 10 秒錄影截止時間點，正常結束採集 */
         if (timestamp_us >= s_recording.deadline_us) {
             esp_camera_fb_return(frame);
             break;
         }
 
+        /* 統計影格時間間隔 */
         int64_t interval_us = 0;
         if (stats->in_window_frames == 0U) {
             stats->first_frame_us = timestamp_us;
         } else {
             interval_us = timestamp_us - stats->last_frame_us;
-            if (stats->in_window_frames == 1U ||
-                interval_us < stats->min_interval_us) {
+            if (stats->in_window_frames == 1U || interval_us < stats->min_interval_us) {
                 stats->min_interval_us = interval_us;
             }
             if (interval_us > stats->max_interval_us) {
@@ -1328,11 +1346,13 @@ static void capture_task(void *argument)
             .frame_id = frame_id,
             .timestamp_us = timestamp_us,
         };
+
+        /* 將影格指標推入 FreeRTOS 佇列 (非阻塞呼叫) */
         if (xQueueSend(s_ready_queue, &ready_frame, 0) != pdTRUE) {
+            /* 若佇列已滿 (代表 SD 卡寫入不及)，被迫放棄此影格 (Drop) 並歸還硬體 */
             stats->pool_overflows++;
             esp_camera_fb_return(frame);
-            if (stats->pool_overflows == 1U ||
-                (stats->pool_overflows % 10U) == 0U) {
+            if (stats->pool_overflows == 1U || (stats->pool_overflows % 10U) == 0U) {
                 ESP_LOGW(TAG,
                          "Ready queue full at frame %u: dropped=%u ready=%u/%u",
                          (unsigned)frame_id,
@@ -1343,19 +1363,26 @@ static void capture_task(void *argument)
             continue;
         }
 
-        /* Writer owns this driver framebuffer until esp_camera_fb_return(). */
+        /* 成功排隊：此緩衝區所有權暫時轉移給 writer_task */
         stats->enqueued_frames++;
         const uint32_t ready = uxQueueMessagesWaiting(s_ready_queue);
         if (ready > stats->peak_ready_slots) {
-            stats->peak_ready_slots = ready;
+            stats->peak_ready_slots = ready;               /* 紀錄佇列最高水位 */
         }
     }
 
     stats->capture_end_us = esp_timer_get_time();
-    xEventGroupSetBits(s_record_events, CAPTURE_DONE_BIT);
-    vTaskDelete(NULL);
+    xEventGroupSetBits(s_record_events, CAPTURE_DONE_BIT);  /* 通知系統：擷取任務已結束 */
+    vTaskDelete(NULL);                                      /* 自我刪除任務 */
 }
 
+/**
+ * @brief SD 卡寫入任務 (Writer Task)
+ * 運行於：CPU Core 0，優先權 (Priority 5)
+ * 職責：
+ * 從佇列取出 ready_frame_t，將 300KB 資料分段透過 DMA 寫入 SD 卡。
+ * 寫入完成後，負責呼叫 esp_camera_fb_return() 將緩衝區釋放回相機驅動。
+ */
 static void writer_task(void *argument)
 {
     (void)argument;
@@ -1363,17 +1390,20 @@ static void writer_task(void *argument)
 
     for (;;) {
         ready_frame_t ready_frame = {0};
+        /* 等待佇列提供已完成影格，逾時時間 50 毫秒 */
         if (xQueueReceive(s_ready_queue, &ready_frame,
                           pdMS_TO_TICKS(RECORD_QUEUE_WAIT_MS)) == pdTRUE) {
             if (stats->writer_result == ESP_OK) {
                 const int64_t frame_write_start_us = esp_timer_get_time();
+                
+                /* 呼叫分段寫入函式寫入 SD 卡 */
                 const esp_err_t err = write_frame_to_sd(
                     s_recording.fd, ready_frame.frame->buf,
                     &stats->max_sd_chunk_us);
-                const int64_t frame_write_us =
-                    esp_timer_get_time() - frame_write_start_us;
+                
+                const int64_t frame_write_us = esp_timer_get_time() - frame_write_start_us;
                 if (frame_write_us > stats->max_sd_frame_us) {
-                    stats->max_sd_frame_us = frame_write_us;
+                    stats->max_sd_frame_us = frame_write_us;/* 紀錄單幀最長寫入耗時 */
                 }
                 if (err == ESP_OK) {
                     stats->saved_frames++;
@@ -1381,8 +1411,7 @@ static void writer_task(void *argument)
                         ESP_LOGI(TAG,
                                  "Saved %u frames; ready=%u/%u",
                                  (unsigned)stats->saved_frames,
-                                 (unsigned)uxQueueMessagesWaiting(
-                                     s_ready_queue),
+                                 (unsigned)uxQueueMessagesWaiting(s_ready_queue),
                                  (unsigned)FRAME_QUEUE_CAPACITY);
                     }
                 } else {
@@ -1394,22 +1423,23 @@ static void writer_task(void *argument)
                 }
             }
 
+            /* 【關鍵零拷貝節點】：寫入完成後，正式歸還緩衝區供硬體下一輪使用 */
             if (ready_frame.frame != NULL) {
                 esp_camera_fb_return(ready_frame.frame);
             }
             continue;
         }
 
+        /* 當 capture_task 已完成且佇列中的影格已全部清空寫畢時，退出迴圈 */
         if ((xEventGroupGetBits(s_record_events) & CAPTURE_DONE_BIT) != 0 &&
             uxQueueMessagesWaiting(s_ready_queue) == 0U) {
             break;
         }
     }
 
-    const off_t saved_bytes =
-        (off_t)((uint64_t)stats->saved_frames * IMAGE_PIXELS);
-    if (ftruncate(s_recording.fd, saved_bytes) != 0 ||
-        fsync(s_recording.fd) != 0) {
+    /* 錄影結束收尾：根據實際寫入的幀數截斷 (ftruncate) 預先配置的多餘空間並同步 (fsync) */
+    const off_t saved_bytes = (off_t)((uint64_t)stats->saved_frames * IMAGE_PIXELS);
+    if (ftruncate(s_recording.fd, saved_bytes) != 0 || fsync(s_recording.fd) != 0) {
         if (stats->writer_result == ESP_OK) {
             stats->writer_result = ESP_FAIL;
         }
@@ -1418,50 +1448,78 @@ static void writer_task(void *argument)
     }
 
     stats->writer_end_us = esp_timer_get_time();
-    xEventGroupSetBits(s_record_events, WRITER_DONE_BIT);
-    vTaskDelete(NULL);
+    xEventGroupSetBits(s_record_events, WRITER_DONE_BIT);   /* 通知系統：寫入任務已結束 */
+    vTaskDelete(NULL);                                      /* 自我刪除任務 */
 }
 
-static esp_err_t record_raw_sequence(void)
+/**
+ * @brief 協調整合單次完整 10 秒錄影程序
+ */
+esp_err_t cam_record_once(cam_record_result_t *result)
 {
-    char path[RECORD_PATH_BYTES];
-    int fd = -1;
-    ESP_RETURN_ON_ERROR(open_next_raw_file(path, sizeof(path), &fd),
-                        TAG, "Cannot prepare RAW recording file");
-
-    esp_err_t err = reset_record_queues();
-    if (err != ESP_OK) {
-        close(fd);
-        unlink(path);
-        return err;
+    if (!result) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(result, 0, sizeof(*result));
+    result->error = ESP_OK;
+    result->recorded_at_epoch = time(NULL);
+    if (!s_initialized) {
+        result->error = ESP_ERR_INVALID_STATE;
+        return result->error;
     }
 
     memset(&s_recording, 0, sizeof(s_recording));
-    s_recording.fd = fd;
+    s_recording.fd = -1;
+    s_recording.storage.fd = -1;
+
+    /* 1. 重置佇列與旗標狀態 */
+    esp_err_t err = reset_record_queues();
+    if (err != ESP_OK) {
+        result->error = err;
+        return err;
+    }
+
+    /* 2. 在 cam_undone 建立 UTC+8 命名的 RAW，並預先配置空間 */
+    err = cam_storage_begin_recording(
+        &s_recording.storage, result->recorded_at_epoch,
+        (size_t)RECORD_FILE_BYTES);
+    if (err != ESP_OK) {
+        result->error = err;
+        return err;
+    }
+
+    /* 3. 設定本次錄影時間參數 */
+    s_recording.fd = s_recording.storage.fd;
     s_recording.stats.capture_result = ESP_OK;
     s_recording.stats.writer_result = ESP_OK;
-    s_recording.trigger_us = wait_for_record_trigger();
-    s_recording.deadline_us =
-        s_recording.trigger_us +
-        (int64_t)RECORD_DURATION_SECONDS * 1000000LL;
+    s_recording.trigger_us = esp_timer_get_time();
+    s_recording.deadline_us = s_recording.trigger_us +
+                              (int64_t)RECORD_DURATION_SECONDS * 1000000LL;
 
     ESP_LOGI(TAG,
              "Recording to %s: timestamp window=%u s, expected~%u frames, "
              "camera_fb=%u ready_queue=%u",
-             path, (unsigned)RECORD_DURATION_SECONDS,
+             s_recording.storage.undone_path,
+             (unsigned)RECORD_DURATION_SECONDS,
              (unsigned)RECORD_EXPECTED_FRAMES,
              (unsigned)CAMERA_FRAME_BUFFERS,
              (unsigned)FRAME_QUEUE_CAPACITY);
 
+    /* 4. 在 CPU 0 啟動 SD 卡寫入任務 */
     if (xTaskCreatePinnedToCore(writer_task, "sd_writer",
                                 WRITER_TASK_STACK_BYTES, NULL,
                                 WRITER_TASK_PRIORITY, NULL,
                                 WRITER_TASK_CORE) != pdPASS) {
-        close(fd);
-        unlink(path);
-        return ESP_ERR_NO_MEM;
+        (void)ftruncate(s_recording.fd, 0);
+        err = ESP_ERR_NO_MEM;
+        (void)cam_storage_finish_recording(&s_recording.storage, false);
+        strlcpy(result->file_path, s_recording.storage.undone_path,
+                sizeof(result->file_path));
+        result->error = err;
+        return err;
     }
 
+    /* 5. 在 CPU 1 啟動相機擷取任務 */
     if (xTaskCreatePinnedToCore(capture_task, "camera_capture",
                                 CAPTURE_TASK_STACK_BYTES, NULL,
                                 CAPTURE_TASK_PRIORITY, NULL,
@@ -1470,14 +1528,12 @@ static esp_err_t record_raw_sequence(void)
         xEventGroupSetBits(s_record_events, CAPTURE_DONE_BIT);
     }
 
+    /* 6. 阻塞等待兩大任務雙雙回報完成 (CAPTURE_DONE & WRITER_DONE) */
     xEventGroupWaitBits(s_record_events,
                         CAPTURE_DONE_BIT | WRITER_DONE_BIT,
                         pdFALSE, pdTRUE, portMAX_DELAY);
 
-    if (close(fd) != 0 && s_recording.stats.writer_result == ESP_OK) {
-        s_recording.stats.writer_result = ESP_FAIL;
-    }
-
+    /* 7. 輸出完整效能報告與統計日誌 */
     recording_stats_t *stats = &s_recording.stats;
     const int64_t timestamp_span_us =
         stats->in_window_frames > 1U
@@ -1485,15 +1541,14 @@ static esp_err_t record_raw_sequence(void)
             : 0;
     const uint32_t timestamp_milli_fps =
         stats->in_window_frames > 1U && timestamp_span_us > 0
-            ? (uint32_t)(((uint64_t)(stats->in_window_frames - 1U) *
-                          1000000000ULL) /
+            ? (uint32_t)(((uint64_t)(stats->in_window_frames - 1U) * 1000000000ULL) /
                          (uint64_t)timestamp_span_us)
             : 0U;
 
     ESP_LOGI(TAG,
              "Recording finished: file=%s in_window=%u enqueued=%u saved=%u "
              "dropped=%u timestamp_fps=%u.%03u wall=%" PRId64 " ms",
-             path,
+             s_recording.storage.undone_path,
              (unsigned)stats->in_window_frames,
              (unsigned)stats->enqueued_frames,
              (unsigned)stats->saved_frames,
@@ -1516,88 +1571,120 @@ static esp_err_t record_raw_sequence(void)
              stats->max_sd_frame_us,
              stats->max_sd_chunk_us);
 
+    /* 8. 嚴格品質檢核：任一錯誤或掉幀即保留在 cam_undone */
     if (stats->capture_result != ESP_OK) {
-        return stats->capture_result;
+        err = stats->capture_result;
+    } else if (stats->writer_result != ESP_OK) {
+        err = stats->writer_result;
+    } else if (stats->saved_frames < RECORD_EXPECTED_FRAMES ||
+               stats->saved_frames != stats->in_window_frames ||
+               stats->pool_overflows != 0U || stats->queue_errors != 0U ||
+               stats->frame_gaps != 0U) {
+        err = ESP_ERR_INVALID_STATE;
+    } else {
+        err = ESP_OK;
     }
-    if (stats->writer_result != ESP_OK) {
-        return stats->writer_result;
+
+    bool recording_ok = err == ESP_OK;
+    esp_err_t storage_err = cam_storage_finish_recording(
+        &s_recording.storage, recording_ok);
+    if (storage_err != ESP_OK) {
+        err = storage_err;
+        recording_ok = false;
     }
-    if (stats->saved_frames < RECORD_EXPECTED_FRAMES ||
-        stats->saved_frames != stats->in_window_frames ||
-        stats->pool_overflows != 0U || stats->queue_errors != 0U ||
-        stats->frame_gaps != 0U) {
-        return ESP_ERR_INVALID_STATE;
+
+    result->success = recording_ok;
+    result->saved_frames = stats->saved_frames;
+    result->dropped_frames = stats->pool_overflows;
+    result->frame_gaps = stats->frame_gaps;
+    result->elapsed_ms =
+        (stats->writer_end_us - s_recording.trigger_us) / 1000;
+    result->error = err;
+    const char *result_path = recording_ok
+                                  ? s_recording.storage.done_path
+                                  : s_recording.storage.undone_path;
+    strlcpy(result->file_path, result_path, sizeof(result->file_path));
+    if (result_path[0] != '\0') {
+        (void)cam_storage_get_file_size(result_path, &result->file_bytes);
     }
-    return ESP_OK;
+    return err;
 }
 
-void app_main(void)
+esp_err_t cam_record_init(void)
 {
+    if (s_initialized) {
+        return ESP_OK;
+    }
+
+    /* 步驟 1：相機感測器與外部 PSRAM 初始化 */
     sensor_t *sensor = NULL;
     esp_err_t err = init_camera(&sensor);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Camera initialization failed: %s",
-                 esp_err_to_name(err));
-        return;
+        ESP_LOGE(TAG, "Camera initialization failed: %s", esp_err_to_name(err));
+        return err;
     }
 
+    /* 步驟 2：開啟自動曝光/白平衡，準備進行暖機 */
     err = set_auto_controls(sensor, true);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Cannot enable camera auto controls: %s",
-                 esp_err_to_name(err));
+        ESP_LOGE(TAG, "Cannot enable camera auto controls: %s", esp_err_to_name(err));
         esp_camera_deinit();
-        return;
+        return err;
     }
 
+    /* 步驟 3：丟棄前 10 幀，讓感測器自動曝光收斂到適當明暗度 */
     err = discard_warmup_frames(sensor);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Camera warm-up failed: %s", esp_err_to_name(err));
         esp_camera_deinit();
-        return;
+        return err;
     }
 
+    /* 步驟 4：鎖定曝光與白平衡，防止錄影期間畫面閃爍變色 */
     err = set_auto_controls(sensor, false);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Cannot lock camera controls: %s",
-                 esp_err_to_name(err));
+        ESP_LOGE(TAG, "Cannot lock camera controls: %s", esp_err_to_name(err));
         esp_camera_deinit();
-        return;
+        return err;
     }
 
-    /* Qualification must pass before any SD mount or filesystem access. */
+    /* 步驟 5：執行開機 10 秒 5 FPS 資格驗證測試 (未掛載 SD 卡狀態下驗證硬體純度) */
     err = run_startup_fps_test();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG,
-                 "Startup FPS test failed; SD capture remains disabled");
+        ESP_LOGE(TAG, "Startup FPS test failed; SD capture remains disabled");
         esp_camera_deinit();
-        return;
+        return err;
     }
 
-    err = init_sdcard();
+    /* 步驟 6：掛載 SD 並建立 cam_undone/cam_done */
+    err = cam_storage_init();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "SD initialization failed: %s",
-                 esp_err_to_name(err));
+        ESP_LOGE(TAG, "SD initialization failed: %s", esp_err_to_name(err));
         esp_camera_deinit();
-        return;
+        return err;
     }
 
+    /* 步驟 7：建立錄影管線 (內部 SRAM DMA 暫存區、靜態佇列與事件群組) */
     err = init_record_pipeline();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Recording pipeline initialization failed: %s",
-                 esp_err_to_name(err));
-        esp_vfs_fat_sdcard_unmount(SD_MOUNT_POINT, s_sd_card);
-        s_sd_card = NULL;
+        ESP_LOGE(TAG, "Recording pipeline initialization failed: %s", esp_err_to_name(err));
+        cam_storage_deinit();
         esp_camera_deinit();
+        return err;
+    }
+
+    s_initialized = true;
+    ESP_LOGI(TAG, "Camera recorder initialized");
+    return ESP_OK;
+}
+
+void cam_record_deinit(void)
+{
+    if (!s_initialized) {
         return;
     }
-
-    init_record_button();
-
-    while (true) {
-        err = record_raw_sequence();
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Recording completed with error: %s",
-                     esp_err_to_name(err));
-        }
-    }
+    release_record_pipeline();
+    cam_storage_deinit();
+    esp_camera_deinit();
+    s_initialized = false;
 }
