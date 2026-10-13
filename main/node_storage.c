@@ -34,7 +34,7 @@
  * 40 MHz high-speed clock. Drop to SDMMC_FREQ_DEFAULT (20 MHz) only to debug
  * wiring: it is too slow for recording.
  */
-#define STORAGE_SD_FREQ_KHZ      20000
+#define STORAGE_SD_FREQ_KHZ      40000
 
 static const char *TAG = "STORAGE";
 static sdmmc_card_t *s_sd_card = NULL;

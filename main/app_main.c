@@ -12,6 +12,7 @@
 
 #include "app_config.h"
 #include "cam_record.h"
+#include "cam_stream.h"
 #include "device_identity.h"
 #include "mic_record.h"
 #include "net_bench.h"
@@ -176,10 +177,16 @@ void app_main(void)
      * SD command timed out from the moment the camera powered on (PWDN low +
      * XCLK start), which looks like the card being reset by a supply glitch.
      */
+#if APP_MIC_ENABLE
     const esp_err_t mic_err = mic_record_init();
     if (mic_err != ESP_OK) {
         ESP_LOGE(TAG, "Microphone unavailable: %s", esp_err_to_name(mic_err));
     }
+#else
+    /* Debug: I2S 完全不啟動，排除 mic 時脈對相機影像的影響 (debug_sdcard #31) */
+    const esp_err_t mic_err = ESP_ERR_NOT_SUPPORTED;
+    ESP_LOGW(TAG, "Microphone disabled (APP_MIC_ENABLE=0): recording video only");
+#endif
     net_bench_log_heap("mic init");
     esp_err_t cam_err = init_camera_recorder();
     net_bench_log_heap("camera init");
@@ -207,6 +214,13 @@ void app_main(void)
         (void)cam_record_set_xclk_output(true);
         (void)net_bench_run("xclk on again");
     }
+#if APP_CAM_STREAM_ENABLE
+    if (cam_err == ESP_OK) {
+        /* Debug: 只串流不錄影 (cam_stream.c)；只有相機無法恢復時才會返回 */
+        const esp_err_t stream_err = cam_stream_run();
+        ESP_LOGE(TAG, "Camera stream stopped: %s", esp_err_to_name(stream_err));
+    }
+#endif
     if (cam_err == ESP_OK) {
         /* 不錄影時 XCLK 保持停止；rec_session 在每次準備錄影時恢復 */
         (void)cam_record_set_xclk_output(false);

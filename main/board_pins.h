@@ -43,7 +43,13 @@
 /* 1: I2S standard mic (BCLK/WS/DIN), 0: PDM mic (CLK/DIN, WS unused). */
 #define MIC_INTERFACE_I2S 1
 
-#define MIC_PIN_CLK    14   /* I2S BCLK or PDM CLK */
+/*
+ * Keep the mic clock away from the camera bus. BCLK used to be GPIO14, next
+ * to PCLK (GPIO13) on the header: its ~1 MHz square wave coupled into the
+ * PCLK jumper and corrupted every recording (byte-phase slips and bit errors),
+ * even with the mic wires unplugged (docs/debug_sdcard.md #32-#33).
+ */
+#define MIC_PIN_CLK    47   /* I2S BCLK or PDM CLK */
 #define MIC_PIN_WS     1    /* I2S WS/LRCLK, unused by PDM */
 #define MIC_PIN_DIN    2
 

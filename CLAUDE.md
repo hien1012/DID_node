@@ -31,9 +31,11 @@ idf.py -B build\s3 build
   檔名 `YYYY_MM_DD_HHMMSS.raw|.wav`；開機時 `undone/` 殘檔視為 broken。
 - `node_upload.c`：上傳 `done/`（舊的先），ACK 驗證後刪除；4xx 永久拒收移到 `broken/`；有 deadline 不擋下次錄製。
 - `node_health.c`：每分鐘 heartbeat，兼 Wi-Fi watchdog。`wifi_manager.c`：重連 backoff、強制重連、driver 重啟。
+- `cam_stream.c`（debug）：`APP_CAM_STREAM_ENABLE=1` 時取代錄影，拍一幀→停 XCLK→TCP 送 PC（`tools/cam_stream_view.py`），可加背景寫 SD A/B。
+  `net_bench.c`（debug）：開機 iperf 測速，`APP_NET_BENCH_ENABLE`。`APP_MIC_ENABLE=0` 只錄影。
 - `board_pins.h`：所有腳位。`app_config.h`：**Wi-Fi / server URL / 週期等設定的唯一來源**（換場地改這裡，不用 Kconfig）。
-- `components/esp32-camera/`：**本地修改**（被 git ignore）。`cam_record.c` include 私有 `cam_hal.h` 用 pause/resume；
-  乾淨 checkout 需套 `patches/esp32-camera-pause.patch`。改驅動要同步更新 patch。
+- `components/esp32-camera/`：**本地修改版，已納入 git**（2026-10-13 起；之前被 ignore，換電腦會缺檔）。
+  `cam_record.c` include 私有 `cam_hal.h` 用 pause/resume。`patches/esp32-camera-pause.patch` 只是對原版的差異參考，可能落後於目前驅動。
 
 ## FreeRTOS tasks
 | 名稱 | 優先權 | stack | core | 用途 |
@@ -54,7 +56,8 @@ idf.py -B build\s3 build
 
 ## GPIO（詳見 `board_pins.h`）
 - CAM：XCLK 15、SIOD 4、SIOC 5、D0..D7 = 11,9,8,10,12,18,17,16、VSYNC 6、HREF 7、PCLK 13、PWDN 21。
-- MIC：CLK 14、WS 1、DIN 2。SD：CLK 40、CMD 38、D0 39。RGB LED（WS2812）：48。空閒：41、42、47。
+- MIC：CLK 47、WS 1、DIN 2。SD：CLK 40、CMD 38、D0 39。RGB LED（WS2812）：48。空閒：14、41、42。
+- **GPIO14 不要放時脈訊號**：它緊鄰 PCLK（13），I2S BCLK 放在 14 時耦合進 PCLK，錄影全部損壞（debug_sdcard #32–#33）。時脈類訊號放右側排針。
 - 禁用：26–37（flash / Octal PSRAM）、0/3/45/46（strapping）、19/20（原生 USB/JTAG 口）、43/44（UART0 = 板上 COM 口，燒錄與主要 log）。
 - OV2640 用板載 12 MHz → `USE_OV2640_ONBOARD_XVCLK=1`；OV7670/OV7725 由 S3 輸出 16 MHz → `=0`（預設）。換模組要切。
 
@@ -86,3 +89,4 @@ idf.py -B build\s3 build
 ## 待確認
 - SD 卡寫入穩定性：進行中，紀錄在 `docs/debug_sdcard.md`（新的測試結果要補進時間軸）。目前 40 MHz + 新卡可運作。
 - 已上板確認：S3 GRAY8 5 fps 穩定、pause/resume 正常、I2S mic 正常。尚未驗證：PDM 16-bit 取樣。
+- 錄影影像損壞已解決（10/13，BCLK 14→47，見 `docs/debug_sdcard.md` 狀態摘要）。待查：錄影期間內部 RAM 最低約 2.7 KB。

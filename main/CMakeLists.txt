@@ -3,6 +3,7 @@ idf_component_register(
         "app_main.c"
         "rec_session.c"
         "cam_record.c"
+        "cam_stream.c"
         "camera_registers.c"
         "mic_record.c"
         "node_storage.c"
