@@ -87,3 +87,4 @@ managed_components/
 .eclipse/
 # components/ is tracked on purpose: components/esp32-camera is a locally
 # modified driver (pause/resume) that every machine needs to build.
+sheet.png

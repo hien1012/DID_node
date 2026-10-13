@@ -21,6 +21,7 @@
 
 **待處理**
 1. **內部 RAM**：錄影期間最低只剩約 2.7 KB（`HEAP [before upload] min=2783`；掛 SD 後還有約 15 KB）→ Wi-Fi／lwIP／SD 配置可能失敗；10/13 曾出現上傳讀 SD `0x107`（#30 那輪）。
+   **可能主因**：#17 的 `SPIRAM_TRY_ALLOCATE_WIFI_LWIP` 只存在另一台電腦的 `sdkconfig`，這台沒有開。已補進 `sdkconfig.defaults`，待重新 build 驗證。
 2. 開機偶發 `Warm-up timed out after 0/10`（#30）：換 BCLK 腳位後未再出現，原因未證實，持續觀察。
 3. 正式使用前把 `APP_NET_BENCH_ENABLE` 改 0（目前每次開機多約 20 s；XCLK 開著的兩次測速會因相機匯流排干擾失敗，屬預期）。
 
@@ -70,6 +71,7 @@
 
 | 日期 | 變更 | 目的 | 驗證方式 |
 |---|---|---|---|
+| 10/13 | `sdkconfig.defaults` 加 `CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y` | #17 開過這個選項，但只存在另一台電腦的 `sdkconfig`（未進 git），這台的 `sdkconfig` 是關閉的 → `camera init` 後 internal 只剩 29.0 KB（#25 為 100.6 KB）、錄影期間最低約 2.7 KB（#34） | 刪除根目錄 `sdkconfig` 後重新 build；開機 log 應有 `WiFi/LWIP prefer SPIRAM`；`HEAP [camera init]` internal free 應回到約 80–100 KB，`before upload` 的 min 應遠大於 2.7 KB |
 | 10/13 | `APP_MIC_ENABLE`（暫設 0）：`app_main` 不呼叫 `mic_record_init()`，I2S 完全不啟動、不產生 WAV，只錄影並上傳 RAW | 拔 mic 線後錄影仍損壞；排除 ESP 端 I2S 時脈（GPIO14 緊鄰 PCLK GPIO13）與 mic_writer 寫 SD | 開機 log `Microphone disabled`；錄影後不應有 `MIC_RECORD`／`I2S clock` log；`raw_view.py --stats` 與 bitcheck 比較 #30 |
 | 10/13 | 串流加 SD 負載 A/B（`APP_CAM_STREAM_SD_LOAD`）：背景 task（Core 0、prio 5、共用 32 KB I/O 緩衝）每 200 ms 寫 307200 B 亂數到 `/sdcard/stream_load.bin`，每 20 幀切換開／關；負載開著擷取的幀 magic 為 `CAMS`，viewer 分開統計 | #30：錄影檔在 SD 上就已損壞且越錄越糟，但錄影統計正常（dropped 0、SD avg 98 ms）。同一次開機、同一套接線下區分「寫 SD 的電氣干擾」與「錄影流程本身」 | viewer 結尾 `no SD x/N, SD y/M`：只有 SD 組壞 → 電氣（接地／電源）；兩組都乾淨 → 錄影流程 |
 | 10/13 | 新增 `cam_stream.c` + `tools/cam_stream_view.py`：`APP_CAM_STREAM_ENABLE=1` 時開機測速後不進錄影排程，每擷取一幀直接從 frame buffer 用 TCP（port 5002）送 PC，不經 SD／HTTP。PC 端逐幀算 row_jump／col_jump | #26 影像損壞；LA 確認每行 PCLK 1280 個（數量正確）→ 區分「擷取當下就壞」與「錄影／寫 SD 路徑造成」 | PC 端 `suspect` 比例：串流也壞 → 擷取問題（取樣時序／資料線）；串流乾淨 → 錄影路徑（寫 SD 干擾） |

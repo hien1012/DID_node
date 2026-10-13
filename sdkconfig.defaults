@@ -18,6 +18,10 @@ CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=32768
+# Wi-Fi/lwIP allocations prefer PSRAM: internal RAM after camera init went from
+# ~34 KB to ~80 KB, and ~29 KB / min ~2.7 KB while recording without it
+# (debug_sdcard #17, #34). The static Wi-Fi TX buffers stay internal.
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
 
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 
