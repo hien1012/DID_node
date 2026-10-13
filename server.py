@@ -13,7 +13,7 @@ from flask import Flask, jsonify, request
 
 
 TAIPEI_TZ = timezone(timedelta(hours=8))
-DATA_ROOT = Path(os.environ.get("FIELD_DATA_ROOT", "D:/"))
+DATA_ROOT = Path(os.environ.get("FIELD_DATA_ROOT", "C:\\Users\Potato\ESP_project file\server_send"))
 DATABASE_PATH = DATA_ROOT / "field_data.db"
 VALID_ID = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 MAX_UPLOAD_BYTES = 64 * 1024 * 1024

@@ -18,6 +18,44 @@
 
 static const char *TAG = "CAM_APP";
 
+#define CAMERA_INIT_TASK_STACK_BYTES 8192U
+#define CAMERA_INIT_TASK_PRIORITY    6U
+
+typedef struct {
+    TaskHandle_t caller;
+    esp_err_t result;
+} camera_init_context_t;
+
+static void camera_init_on_core1(void *arg)
+{
+    camera_init_context_t *context = (camera_init_context_t *)arg;
+    context->result = cam_record_init();
+    xTaskNotifyGive(context->caller);
+    vTaskDelete(NULL);
+}
+
+static esp_err_t init_camera_recorder(void)
+{
+    camera_init_context_t context = {
+        .caller = xTaskGetCurrentTaskHandle(),
+        .result = ESP_FAIL,
+    };
+    /* app_main 保持在 Core 0；感測器配置、暖機與 FPS 測試在 Core 1 執行。 */
+#if CONFIG_FREERTOS_UNICORE
+    const BaseType_t camera_core = 0;
+#else
+    const BaseType_t camera_core = 1;
+#endif
+    if (xTaskCreatePinnedToCore(camera_init_on_core1, "camera_init",
+                                CAMERA_INIT_TASK_STACK_BYTES, &context,
+                                CAMERA_INIT_TASK_PRIORITY, NULL,
+                                camera_core) != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    return context.result;
+}
+
 static esp_err_t init_nvs(void)
 {
     esp_err_t err = nvs_flash_init();
@@ -84,7 +122,9 @@ void app_main(void)
     ESP_ERROR_CHECK(cam_health_monitor_start());
 
     upload_boot_backlog();
-    ESP_ERROR_CHECK(cam_record_init());
+    ESP_ERROR_CHECK(init_camera_recorder());
+    /* 開機測試後到第一輪錄影前，不讓相機持續收集未使用的影格。 */
+    ESP_ERROR_CHECK(cam_record_pause());
     ESP_LOGI(TAG, "Automatic camera schedule started: %u seconds every %u seconds",
              (unsigned)CAM_RECORD_DURATION_SEC,
              (unsigned)(CAM_RECORD_PERIOD_MS / 1000U));
@@ -94,6 +134,8 @@ void app_main(void)
 
         cam_record_result_t record_result = {0};
         esp_err_t err = cam_record_once(&record_result);
+        /* 早期失敗路徑也要停相機；正常路徑已在 cam_record_once() 停止。 */
+        ESP_ERROR_CHECK(cam_record_pause());
         cam_health_note_recording(&record_result);
         if (err == ESP_OK && record_result.success) {
             ESP_LOGI(TAG, "Camera recording saved: %s, frames=%u, bytes=%u",
