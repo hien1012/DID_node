@@ -18,6 +18,43 @@
 
 static const char *TAG = "CAM_APP";
 
+typedef struct {
+    TaskHandle_t waiter;
+    esp_err_t result;
+} cam_init_context_t;
+
+#if CONFIG_FREERTOS_UNICORE
+#define CAM_INIT_TASK_CORE 0
+#else
+#define CAM_INIT_TASK_CORE 1
+#endif
+
+static void cam_init_task(void *arg)
+{
+    cam_init_context_t *context = arg;
+    context->result = cam_record_init();
+    xTaskNotifyGive(context->waiter);
+    vTaskDelete(NULL);
+}
+
+static esp_err_t cam_record_init_on_camera_core(void)
+{
+    cam_init_context_t context = {
+        .waiter = xTaskGetCurrentTaskHandle(),
+        .result = ESP_FAIL,
+    };
+    BaseType_t created = xTaskCreatePinnedToCore(
+        cam_init_task, "cam_init", 8192, &context, 5, NULL,
+        CAM_INIT_TASK_CORE);
+    if (created != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create camera initialization task");
+        return ESP_ERR_NO_MEM;
+    }
+
+    (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    return context.result;
+}
+
 static esp_err_t init_nvs(void)
 {
     esp_err_t err = nvs_flash_init();
@@ -74,6 +111,8 @@ static void upload_boot_backlog(void)
 
 void app_main(void)
 {
+    
+
     ESP_ERROR_CHECK(init_nvs());
     ESP_ERROR_CHECK(device_identity_init(DEVICE_ID_CAMERA_PREFIX));
     ESP_LOGI(TAG, "Device ID: %s", device_identity_get());
@@ -84,11 +123,12 @@ void app_main(void)
     ESP_ERROR_CHECK(cam_health_monitor_start());
 
     upload_boot_backlog();
-    ESP_ERROR_CHECK(cam_record_init());
+
+    ESP_ERROR_CHECK(cam_record_init_on_camera_core());
     ESP_LOGI(TAG, "Automatic camera schedule started: %u seconds every %u seconds",
              (unsigned)CAM_RECORD_DURATION_SEC,
              (unsigned)(CAM_RECORD_PERIOD_MS / 1000U));
-
+             
     while (true) {
         TickType_t cycle_started = xTaskGetTickCount();
 
@@ -105,7 +145,7 @@ void app_main(void)
                      esp_err_to_name(record_result.error));
         }
 
-        if (wifi_manager_wait_connected(pdMS_TO_TICKS(15000)) == ESP_OK) {
+        if (wifi_manager_wait_connected(pdMS_TO_TICKS(15000)) == ESP_OK) { //等待15sec
             cam_upload_summary_t summary = {0};
             err = cam_upload_process_pending(&summary);
             cam_health_note_upload(&summary);

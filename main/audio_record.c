@@ -408,7 +408,7 @@ static void writer_task(void *arg)
 
     while (1) {
         audio_block_t *blk = NULL;
-        xQueueReceive(q_full_blocks, &blk, portMAX_DELAY);
+        xQueueReceive(q_full_blocks, &blk, portMAX_DELAY); // // 從q_full_block讀取, 複製讀到的資料到blk, 最多等q_full_block的資料多久
         if (blk == NULL) break;  // sentinel，結束迴圈
 
         // [+] 增益（使用 #define PCM_GAIN，統一管理）

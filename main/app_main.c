@@ -100,7 +100,7 @@ void app_main(void)
                      esp_err_to_name(record_result.error));
         }
 
-        if (wifi_manager_wait_connected(pdMS_TO_TICKS(15000)) == ESP_OK) {
+        if (wifi_manager_wait_connected(pdMS_TO_TICKS(15000)) == ESP_OK) { //只等待15sec
             upload_summary_t summary = {0};
             err = upload_process_pending(&summary);
             health_note_upload(&summary);

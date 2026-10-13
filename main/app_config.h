@@ -14,7 +14,8 @@
 #define APP_RECORD_DURATION_SEC    300
 #define APP_RECORD_PERIOD_MS       (10U * 60U * 1000U)
 #define APP_HEARTBEAT_PERIOD_MS    (1U * 60U * 1000U)
-#define APP_HTTP_TIMEOUT_MS        30000
+#define APP_HTTP_TIMEOUT_MS        30000    // 音訊保留原值
+#define CAM_HTTP_TIMEOUT_MS        120000    // 相機上傳：2 分鐘 (15MB @ 200KB/s ≈ 76s)
 #define APP_UPLOAD_RETRY_MS        10000
 
-#define CAM_RECORD_PERIOD_MS       (1U * 60U * 10000U)
+#define CAM_RECORD_PERIOD_MS       (1U * 60U * 5000U) // 5min 拍攝一次10sec

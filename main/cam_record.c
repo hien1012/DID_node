@@ -95,7 +95,7 @@
 #define USE_OV2640_ONBOARD_XVCLK 0                          /* 0: 由 ESP32 產生 16MHz XCLK; 1: 使用 OV2640 板載 12MHz 時脈 */
 #define ESP32_CAMERA_XCLK_HZ     16000000U                  /* ESP32 輸出的 XCLK 時脈頻率：16 MHz */
 #define OV2640_ONBOARD_XVCLK_HZ  12000000U                  /* OV2640 外部板載震盪器頻率：12 MHz */
-#define OV2640_HAL_XCLK_HINT_HZ  20000000U                  /* 提供給相機底層驅動的時脈提示值 (設定超過 10MHz 會影響 I2S 採樣模式選擇) */
+#define OV2640_HAL_XCLK_HINT_HZ  8000000U                  /* 提供給相機底層驅動的時脈提示值 (設定超過 10MHz 會影響 I2S 採樣模式選擇) */
 
 #if USE_OV2640_ONBOARD_XVCLK
 #define CAMERA_CONFIG_XCLK_PIN   (-1)                       /* -1 代表不啟用 ESP32 的 XCLK 輸出腳位，由板載震盪器自行驅動 */
@@ -862,7 +862,7 @@ static esp_err_t write_all(int fd, const uint8_t *data, size_t bytes)
 }
 
 /**
- * @brief 分段將一整幀 (300KB) 從外部 PSRAM 複製到內部 DMA 暫存區，再寫入 SD 卡
+ * @brief 分段將一整幀 (307.2KB) 從外部 PSRAM 複製到內部 DMA 暫存區，再寫入 SD 卡
  */
 static esp_err_t write_frame_to_sd(int fd, const uint8_t *pixels, int64_t *max_chunk_us)
 {
@@ -1347,10 +1347,10 @@ static void capture_task(void *argument)
             .timestamp_us = timestamp_us,
         };
 
-        /* 將影格指標推入 FreeRTOS 佇列 (非阻塞呼叫) */
+        /* 將影格指標推入 FreeRTOS 佇列 (非阻塞呼叫 aka 不等待) */
         if (xQueueSend(s_ready_queue, &ready_frame, 0) != pdTRUE) {
             /* 若佇列已滿 (代表 SD 卡寫入不及)，被迫放棄此影格 (Drop) 並歸還硬體 */
-            stats->pool_overflows++;
+            stats->pool_overflows++; // 紀錄為overflow
             esp_camera_fb_return(frame);
             if (stats->pool_overflows == 1U || (stats->pool_overflows % 10U) == 0U) {
                 ESP_LOGW(TAG,

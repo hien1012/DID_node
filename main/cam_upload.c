@@ -81,8 +81,13 @@ static esp_err_t upload_one_file(const char *path, time_t recorded_at_epoch,
     esp_http_client_config_t config = {
         .url = APP_SERVER_VIDEO_URL,
         .method = HTTP_METHOD_POST,
-        .timeout_ms = APP_HTTP_TIMEOUT_MS,
+        .timeout_ms = CAM_HTTP_TIMEOUT_MS, //修改這邊
         .keep_alive_enable = true,
+
+        // 新增：TCP keepalive 參數（讓 LwIP 每 10 秒送一次 keepalive 探測）
+        .keep_alive_idle    = 10,   // 閒置 10 秒後開始送 keepalive
+        .keep_alive_interval = 5,   // 每 5 秒送一次
+        .keep_alive_count   = 3,    // 最多 3 次無回應才放棄
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (!client) {

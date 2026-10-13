@@ -1,0 +1,21 @@
+dependencies:
+  espressif/esp_jpeg:
+    component_hash: defb83669293cbf86d0fa86b475ba5517aceed04ed70db435388c151ab37b5d7
+    source:
+      service_url: https://api.components.espressif.com/
+      type: service
+    version: 1.3.1
+  espressif__esp32-camera:
+    component_hash: null
+    source:
+      path: C:\Users\hien\ESP_project\esp_http_client\components\espressif__esp32-camera
+      type: local
+    version: 2.1.5
+  idf:
+    component_hash: null
+    source:
+      type: idf
+    version: 5.1.2
+manifest_hash: e277be57e60eb45b7e0ff5e9485e82f6e2f4fc5206dcf42beb2e5549b01114cf
+target: esp32
+version: 1.0.0

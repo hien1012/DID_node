@@ -1,0 +1,175 @@
+digraph FieldNodeArchitecture {
+    graph [
+        rankdir=TB,
+        bgcolor="#F8FAFC",
+        pad="0.35",
+        nodesep="0.34",
+        ranksep="0.62",
+        splines=polyline,
+        fontname="Microsoft JhengHei",
+        fontsize=20,
+        label="ESP32 Audio / Camera 錄製、離線保存與 Server 上傳架構（目前程式碼）",
+        labelloc=t,
+        labeljust=c
+    ];
+
+    node [
+        shape=box,
+        style="rounded,filled",
+        fontname="Microsoft JhengHei",
+        fontsize=11,
+        color="#475569",
+        fillcolor="#FFFFFF",
+        fontcolor="#0F172A",
+        margin="0.16,0.10"
+    ];
+    edge [
+        fontname="Microsoft JhengHei",
+        fontsize=9,
+        color="#64748B",
+        fontcolor="#334155",
+        arrowsize=0.7
+    ];
+
+    build [label="編譯版本選擇\nFIELD_FIRMWARE", shape=diamond, fillcolor="#E0E7FF", color="#4F46E5"];
+
+    subgraph cluster_common {
+        label="共同開機流程";
+        color="#94A3B8";
+        style="rounded,dashed";
+        common_start [label="開機 / NVS 初始化\n以 Wi-Fi STA MAC 建立 device_id", fillcolor="#E2E8F0"];
+        wifi_boot [label="連接 Wi-Fi\n每 15 秒持續等待", fillcolor="#FEF3C7", color="#D97706"];
+        time_sync [label="向 /time 校時\n失敗則持續重試", fillcolor="#FEF3C7", color="#D97706"];
+        common_start -> wifi_boot -> time_sync;
+    }
+
+    build -> common_start [label="audio 或 camera"];
+
+    subgraph cluster_audio {
+        label="Audio firmware：app_main.c";
+        color="#0EA5E9";
+        style="rounded";
+
+        audio_init [label="初始化 I2S / PDM、SD\n啟動 audio heartbeat", fillcolor="#E0F2FE", color="#0284C7"];
+        audio_boot [label="開機檢查 /sdcard/done\n有檔案就逐一上傳", fillcolor="#FEF3C7", color="#D97706"];
+        audio_block [label="Wi-Fi / server / ACK 失敗\n開機會停在 backlog 重試", fillcolor="#FEE2E2", color="#DC2626"];
+        audio_record [label="錄音 5 分鐘\n每 10 分鐘啟動一輪", fillcolor="#DBEAFE", color="#2563EB"];
+        audio_undone [label="錄製中或失敗\n/sdcard/undone\nYYYYMMDD_HHMMSS.wav", shape=folder, fillcolor="#FFF7ED", color="#EA580C"];
+        audio_done [label="錄製成功後 rename\n/sdcard/done\n等待 ACK", shape=folder, fillcolor="#DCFCE7", color="#16A34A"];
+        audio_wifi [label="等待 Wi-Fi 最多 15 秒", shape=diamond, fillcolor="#E0E7FF", color="#4F46E5"];
+        audio_upload [label="由最舊檔案開始\nPOST /upload/audio", fillcolor="#DBEAFE", color="#2563EB"];
+        audio_ack [label="HTTP 200 且 ACK 通過？\nstatus / capture_id / bytes", shape=diamond, fillcolor="#E0E7FF", color="#4F46E5"];
+        audio_delete [label="刪除本機 done 檔案\n繼續下一個待上傳檔", fillcolor="#DCFCE7", color="#16A34A"];
+        audio_keep [label="保留 done 檔案\n本輪上傳結束", fillcolor="#FEE2E2", color="#DC2626"];
+        audio_wait [label="等待本輪剩餘時間\n再開始下一次錄音", fillcolor="#F1F5F9"];
+
+        time_sync -> audio_init [label="audio"];
+        audio_init -> audio_boot;
+        audio_boot -> audio_record [label="backlog 清空"];
+        audio_boot -> audio_block [label="上傳失敗"];
+        audio_block -> audio_boot [label="10 秒後重試"];
+        audio_record -> audio_undone [label="寫入"];
+        audio_undone -> audio_done [label="錄製完整"];
+        audio_done -> audio_wifi;
+        audio_wifi -> audio_upload [label="已連線"];
+        audio_wifi -> audio_keep [label="離線"];
+        audio_upload -> audio_ack;
+        audio_ack -> audio_delete [label="是"];
+        audio_ack -> audio_keep [label="否 / timeout"];
+        audio_delete -> audio_upload [label="尚有 done", constraint=false];
+        audio_delete -> audio_wait [label="全部完成"];
+        audio_keep -> audio_wait;
+        audio_wait -> audio_record;
+    }
+
+    subgraph cluster_camera {
+        label="Camera firmware：cam_app_main.c";
+        color="#8B5CF6";
+        style="rounded";
+
+        cam_preinit [label="掛載 SD\n啟動 camera heartbeat", fillcolor="#F3E8FF", color="#7C3AED"];
+        cam_boot [label="開機檢查 /sdcard/cam_done\n有檔案就逐一上傳", fillcolor="#FEF3C7", color="#D97706"];
+        cam_block [label="Wi-Fi / server / ACK 失敗\n開機會停在 backlog 重試", fillcolor="#FEE2E2", color="#DC2626"];
+        cam_init [label="相機初始化、warm-up\n啟動 FPS test", fillcolor="#F3E8FF", color="#7C3AED"];
+        cam_record [label="錄影 10 秒\n每 5 分鐘啟動一輪", fillcolor="#EDE9FE", color="#7C3AED"];
+        cam_tasks [label="Core 1：camera_capture\nCore 0：sd_writer\nQueue 傳遞 frame pointer", fillcolor="#F3E8FF", color="#7C3AED"];
+        cam_undone [label="錄製中或品質失敗\n/sdcard/cam_undone\nYYYYMMDD_HHMMSS.raw", shape=folder, fillcolor="#FFF7ED", color="#EA580C"];
+        cam_done [label="零掉幀且檢核通過後 rename\n/sdcard/cam_done\n等待 ACK", shape=folder, fillcolor="#DCFCE7", color="#16A34A"];
+        cam_wifi [label="等待 Wi-Fi 最多 15 秒", shape=diamond, fillcolor="#E0E7FF", color="#4F46E5"];
+        cam_upload [label="由最舊檔案開始\nPOST /upload/video", fillcolor="#EDE9FE", color="#7C3AED"];
+        cam_ack [label="HTTP 200 且 ACK 通過？\nstatus / capture_id / bytes", shape=diamond, fillcolor="#E0E7FF", color="#4F46E5"];
+        cam_delete [label="刪除本機 cam_done 檔案\n繼續下一個待上傳檔", fillcolor="#DCFCE7", color="#16A34A"];
+        cam_keep [label="保留 cam_done 檔案\n本輪上傳結束", fillcolor="#FEE2E2", color="#DC2626"];
+        cam_wait [label="等待本輪剩餘時間\n再開始下一次錄影", fillcolor="#F1F5F9"];
+
+        time_sync -> cam_preinit [label="camera"];
+        cam_preinit -> cam_boot;
+        cam_boot -> cam_init [label="backlog 清空"];
+        cam_boot -> cam_block [label="上傳失敗"];
+        cam_block -> cam_boot [label="10 秒後重試"];
+        cam_init -> cam_record [label="FPS test 通過"];
+        cam_record -> cam_tasks;
+        cam_tasks -> cam_undone [label="寫入"];
+        cam_undone -> cam_done [label="品質檢核通過"];
+        cam_done -> cam_wifi;
+        cam_wifi -> cam_upload [label="已連線"];
+        cam_wifi -> cam_keep [label="離線"];
+        cam_upload -> cam_ack;
+        cam_ack -> cam_delete [label="是"];
+        cam_ack -> cam_keep [label="否 / timeout"];
+        cam_delete -> cam_upload [label="尚有 cam_done", constraint=false];
+        cam_delete -> cam_wait [label="全部完成"];
+        cam_keep -> cam_wait;
+        cam_wait -> cam_record;
+    }
+
+    subgraph cluster_monitor {
+        label="獨立監控 task（目前每 1 分鐘）";
+        color="#14B8A6";
+        style="rounded,dashed";
+        heartbeat [label="收集設備狀態\nWi-Fi / heap / SD / pending / 成敗統計", fillcolor="#CCFBF1", color="#0F766E"];
+        hb_post [label="POST /heartbeat", fillcolor="#CCFBF1", color="#0F766E"];
+        hb_result [label="成功：記錄 acknowledged\n失敗：記錄錯誤後等待下次\n不會停止錄製", fillcolor="#CCFBF1", color="#0F766E"];
+        heartbeat -> hb_post -> hb_result -> heartbeat [label="下一週期"];
+    }
+
+    audio_init -> heartbeat [style=dashed, label="audio health"];
+    cam_preinit -> heartbeat [style=dashed, label="camera health"];
+
+    subgraph cluster_server {
+        label="PC Server：Flask server.py";
+        color="#334155";
+        style="rounded";
+
+        server_time [label="GET /time\n回傳 UTC 時間", fillcolor="#E2E8F0"];
+        server_audio [label="POST /upload/audio\n驗證 WAV、headers、大小", fillcolor="#DBEAFE", color="#2563EB"];
+        server_video [label="POST /upload/video\n驗證 GRAY8 / 640×480 / frames / fps", fillcolor="#EDE9FE", color="#7C3AED"];
+        server_hb [label="POST /heartbeat\n寫入設備狀態", fillcolor="#CCFBF1", color="#0F766E"];
+        server_store [label="檔案儲存\nD:/sound/{device}/{date}/{time}.wav\nD:/video/{device}/{date}/{time}.raw", shape=folder, fillcolor="#DCFCE7", color="#16A34A"];
+        server_db [label="D:/field_data.db\nuploads、heartbeats、SHA-256、metadata", shape=cylinder, fillcolor="#F1F5F9"];
+        server_ack [label="ACK JSON\nstatus=ok\ncapture_id + bytes", fillcolor="#DCFCE7", color="#16A34A"];
+
+        server_audio -> server_store;
+        server_video -> server_store;
+        server_store -> server_db;
+        server_store -> server_ack;
+        server_hb -> server_db;
+    }
+
+    time_sync -> server_time [style=dashed, color="#D97706", label="HTTP"];
+    audio_upload -> server_audio [color="#2563EB", label="WAV + headers"];
+    cam_upload -> server_video [color="#7C3AED", label="RAW + metadata"];
+    server_ack -> audio_ack [color="#16A34A"];
+    server_ack -> cam_ack [color="#16A34A"];
+    hb_post -> server_hb [color="#0F766E"];
+
+    offline_note [
+        label="離線行為摘要\n• 運作中斷線：保留 done，下一輪仍錄製\n• Heartbeat 失敗：不阻塞錄製\n• 開機無網路／校時失敗／backlog 無 ACK：尚未進入錄製循環\n• 長期離線：檔案持續累積，最後受 SD 空間限制",
+        shape=note,
+        fillcolor="#FFF7ED",
+        color="#EA580C",
+        fontsize=11
+    ];
+    audio_wait -> offline_note [style=invis];
+    cam_wait -> offline_note [style=invis];
+}
