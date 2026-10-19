@@ -1,0 +1,230 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<title>S3 節點 RAM 預算</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&family=Noto+Sans+TC:wght@400;500;700&display=swap">
+<style>
+/* Layout: datasheet page — summary, two memory-map columns (physical SRAM / dynamic heap), then margin tables. */
+:root {
+  --bg: #f7f8fa; --paper: #ffffff; --ink: #18202b; --muted: #5a6575; --line: #d9dee6; --accent: #1f5fa8;
+  --c-sys: #9aa6b6; --c-wifi: #6f8fd6; --c-cam: #d9893b; --c-mic: #3f9e7a; --c-store: #a873c9;
+  --c-free: #e9edf2; --c-trans: #d65c5c; --c-cache: #c9d0da;
+  --good: #2f7d4f; --warn: #a8661a; --bad: #b23b3b;
+  --f-sans: "IBM Plex Sans", "Noto Sans TC", "Microsoft JhengHei", system-ui, sans-serif;
+  --f-mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  --px-per-kb: 1.55px;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #11161d; --paper: #18202a; --ink: #e3e8ef; --muted: #98a3b3; --line: #2c3644; --accent: #7fb0ec;
+  --c-sys: #5d6878; --c-wifi: #5670bb; --c-cam: #c27a33; --c-mic: #358a6a; --c-store: #8f5fae;
+  --c-free: #243040; --c-trans: #c45252; --c-cache: #3a4553;
+  --good: #6cc192; --warn: #e0a25a; --bad: #ef8080; color-scheme: dark; } }
+:root[data-theme="dark"] {
+  --bg: #11161d; --paper: #18202a; --ink: #e3e8ef; --muted: #98a3b3; --line: #2c3644; --accent: #7fb0ec;
+  --c-sys: #5d6878; --c-wifi: #5670bb; --c-cam: #c27a33; --c-mic: #358a6a; --c-store: #8f5fae;
+  --c-free: #243040; --c-trans: #c45252; --c-cache: #3a4553;
+  --good: #6cc192; --warn: #e0a25a; --bad: #ef8080; color-scheme: dark; }
+
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--ink); font-family: var(--f-sans); font-size: 15px; line-height: 1.6; }
+.wrap { max-width: 1120px; margin: 0 auto; padding-inline: 20px; padding-block: 32px 64px; display: grid; gap: 40px; }
+h1, h2, h3 { text-wrap: balance; line-height: 1.25; margin: 0; }
+h1 { font-size: 1.9rem; font-weight: 600; }
+h2 { font-size: 1.3rem; font-weight: 600; }
+h3 { font-size: 1.02rem; font-weight: 600; }
+p { margin: 0; max-width: 72ch; }
+.eyebrow { font-family: var(--f-mono); font-size: .75rem; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+.mono, code { font-family: var(--f-mono); font-size: .88em; }
+code { background: var(--c-free); padding: 1px 5px; border-radius: 3px; }
+.num { font-family: var(--f-mono); font-variant-numeric: tabular-nums; }
+section { display: grid; gap: 16px; }
+.head { display: grid; gap: 10px; }
+.sub { color: var(--muted); }
+
+.verdicts { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+.verdict { background: var(--paper); border: 1px solid var(--line); border-radius: 6px; padding: 14px 16px; display: grid; gap: 6px; align-content: start; min-width: 0; }
+.verdict .k { font-family: var(--f-mono); font-size: 1.35rem; font-weight: 600; }
+.verdict.bad .k { color: var(--bad); } .verdict.good .k { color: var(--good); } .verdict.warn .k { color: var(--warn); }
+
+/* memory maps */
+.maps { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 28px; align-items: start; }
+.map { background: var(--paper); border: 1px solid var(--line); border-radius: 6px; padding: 16px; display: grid; gap: 12px; min-width: 0; }
+.rows { display: grid; gap: 2px; }
+.row { display: grid; grid-template-columns: 84px 44px 1fr; gap: 10px; align-items: center; min-height: 22px; }
+.row .addr { font-family: var(--f-mono); font-size: .72rem; color: var(--muted); text-align: right; align-self: start; padding-top: 2px; }
+.row .bar { align-self: stretch; border-radius: 2px; height: calc(var(--kb) * var(--px-per-kb)); min-height: 20px; }
+.row .lbl { font-size: .86rem; line-height: 1.35; min-width: 0; }
+.row .lbl b { font-weight: 600; }
+.row .lbl .sz { font-family: var(--f-mono); font-size: .8rem; color: var(--muted); margin-left: 6px; }
+.row .lbl small { display: block; color: var(--muted); font-size: .76rem; }
+.row.indent .lbl { padding-left: 12px; border-left: 2px solid var(--line); }
+.row.indent .bar { margin-left: 10px; }
+.sys { background: var(--c-sys); } .wifi { background: var(--c-wifi); } .cam { background: var(--c-cam); }
+.mic { background: var(--c-mic); } .store { background: var(--c-store); } .free { background: var(--c-free); border: 1px dashed var(--muted); }
+.trans { background: repeating-linear-gradient(135deg, var(--c-trans) 0 6px, transparent 6px 10px); border: 1px solid var(--c-trans); }
+.cache { background: var(--c-cache); }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: .8rem; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend i { width: 14px; height: 10px; border-radius: 2px; display: inline-block; }
+.note { font-size: .8rem; color: var(--muted); }
+
+/* tables */
+.tbl { overflow-x: auto; background: var(--paper); border: 1px solid var(--line); border-radius: 6px; }
+table { border-collapse: collapse; width: 100%; min-width: 720px; font-size: .86rem; }
+th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-weight: 600; font-size: .78rem; color: var(--muted); letter-spacing: .03em; background: var(--bg); }
+tr:last-child td { border-bottom: 0; }
+td.r, th.r { text-align: right; }
+.pill { display: inline-block; font-size: .72rem; font-weight: 600; padding: 1px 8px; border-radius: 10px; white-space: nowrap; border: 1px solid currentColor; }
+.pill.over { color: var(--warn); } .pill.ok { color: var(--good); } .pill.tight { color: var(--bad); }
+.swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
+
+.callout { border-left: 3px solid var(--bad); background: var(--paper); padding: 12px 16px; border-radius: 0 6px 6px 0; display: grid; gap: 6px; }
+.callout.info { border-left-color: var(--accent); }
+ol.plan { margin: 0; padding-left: 1.3em; display: grid; gap: 8px; max-width: 80ch; }
+ol.plan li::marker { font-family: var(--f-mono); color: var(--muted); }
+.tot { font-weight: 600; }
+</style>
+
+<div class="wrap">
+
+<header class="head">
+  <div class="eyebrow">did_node · ESP32-S3 N16R8 · cam-mic-s3 @ 0e7e521 · 2026-10-19 log</div>
+  <h1>S3 節點內部 RAM 預算與錄影／錄音餘裕</h1>
+  <p class="sub">資料來源：<code>build/did_node.map</code>（與 log 同一次 build，16:07）的靜態配置、開機 log 的 <code>NET_BENCH: HEAP</code> 量測、原始碼常數。未開 application tracing。標「估」的數字是從量測差值推算，非逐項量測。</p>
+</header>
+
+<section>
+  <div class="verdicts">
+    <div class="verdict bad"><div class="eyebrow">錄影期間內部 RAM 最低</div><div class="k num">2,595 B</div><p class="note">上傳期間 2,395 B。開 JTAG trace 要再拿走 32,768 B，現況一定不夠。</p></div>
+    <div class="verdict warn"><div class="eyebrow">相機 DMA 30 KB</div><div class="k">過大約 2 倍</div><p class="note">每個 half buffer 可撐約 4.7 ms，cam_task 只需數十 µs。16 KB 就夠，省 15 KB。</p></div>
+    <div class="verdict warn"><div class="eyebrow">mic 緩衝 52 KB 在內部 RAM</div><div class="k">32 KB 放錯地方</div><p class="note"><code>s_blocks</code> 不走 DMA，可搬到 PSRAM，餘裕不變。</p></div>
+    <div class="verdict good"><div class="eyebrow">可回收合計</div><div class="k num">≈ 60 KB</div><p class="note">前四項只改常數或配置，不影響錄影／錄音餘裕，足以容納 TRAX 的 32 KB。</p></div>
+  </div>
+</section>
+
+<section>
+  <div class="head">
+    <h2>內部 SRAM 切割圖</h2>
+    <p class="sub">左圖：512 KB 實體 SRAM 依位址切割（低位址在上），高度與大小成比例，小於 13 KB 的區塊放大到可讀。右圖：其中的動態 heap（含 RTC 8 KB）在錄影峰值時被誰吃掉。</p>
+  </div>
+  <div class="legend">
+    <span><i class="sys"></i>IDF / 系統</span><span><i class="wifi"></i>Wi-Fi / lwIP</span><span><i class="cam"></i>相機</span>
+    <span><i class="mic"></i>麥克風</span><span><i class="store"></i>SD / 上傳</span><span><i class="trans"></i>錄影瞬態</span>
+    <span><i class="free"></i>可用</span><span><i class="cache"></i>Cache / ROM</span>
+  </div>
+  <div class="maps">
+
+    <div class="map">
+      <h3>實體 SRAM 512 KB（SRAM0 32K + SRAM1 416K + SRAM2 64K）</h3>
+      <div class="rows">
+        <div class="row" style="--kb:16"><div class="addr">4037_0000</div><div class="bar cache"></div><div class="lbl"><b>ICache</b><span class="sz">16,384</span><small>INSTRUCTION_CACHE_16KB</small></div></div>
+        <div class="row" style="--kb:90.75"><div class="addr">4037_4000</div><div class="bar sys"></div><div class="lbl"><b>IRAM .text / .vectors</b><span class="sz">92,928</span><small>跨 SRAM0→SRAM1，佔走 76.5 KB 的 D/IRAM。含 Wi-Fi IRAM_OPT（libpp 7.7K + net80211 3.3K）、FreeRTOS 16.8K、spi_flash 11.9K</small></div></div>
+        <div class="row" style="--kb:28.5"><div class="addr">3FC9_AB00</div><div class="bar sys"></div><div class="lbl"><b>.data</b><span class="sz">29,196</span><small>其中 esp32-camera 9,403：15 種感測器的 DRAM_ATTR 暫存器表，實際只用 OV7725</small></div></div>
+        <div class="row" style="--kb:52.8"><div class="addr">3FCA_1D10</div><div class="bar mic"></div><div class="lbl"><b>.bss · mic_record.c</b><span class="sz">54,030</span><small>s_blocks 32,832 · s_write_buffer 16,384 · s_read_buffer 4,096</small></div></div>
+        <div class="row indent" style="--kb:32"><div class="addr"></div><div class="bar store"></div><div class="lbl"><b>.bss · node_storage.c</b><span class="sz">32,781</span><small>s_io_buffer 32 KB（錄影時 cam staging，上傳時 2×16 KB 讀檔）</small></div></div>
+        <div class="row indent" style="--kb:4.67"><div class="addr"></div><div class="bar store"></div><div class="lbl"><b>.bss · node_upload.c</b><span class="sz">4,782</span><small>upload_reader static stack 4,096 + TCB</small></div></div>
+        <div class="row indent" style="--kb:17.4"><div class="addr"></div><div class="bar sys"></div><div class="lbl"><b>.bss · 其他</b><span class="sz">17,823</span><small>IDF 16,685（net80211 7.2K、lwip 3.7K…）+ main 其餘 1,138</small></div></div>
+        <div class="row" style="--kb:179.6"><div class="addr">3FCB_C878</div><div class="bar free"></div><div class="lbl"><b>heap · DRAM</b><span class="sz">183,960</span><small>動態配置主區，Wi-Fi、相機 DMA、task stack 都在這（見右圖）</small></div></div>
+        <div class="row" style="--kb:21.8"><div class="addr">3FCE_9710</div><div class="bar free"></div><div class="lbl"><b>heap · STACK/DRAM</b><span class="sz">22,308</span><small>開機 stack 用完後回收</small></div></div>
+        <div class="row" style="--kb:4.45"><div class="addr">3FCE_EE34</div><div class="bar cache"></div><div class="lbl"><b>ROM 保留</b><span class="sz">4,556</span></div></div>
+        <div class="row" style="--kb:32"><div class="addr">3FCF_0000</div><div class="bar free"></div><div class="lbl"><b>heap · SRAM2</b><span class="sz">32,768</span><small>開機時唯一 ≥30 KB 的連續 DMA 區塊（log：DMA largest 31,744），相機 DMA buffer 很可能落在這裡</small></div></div>
+        <div class="row" style="--kb:32"><div class="addr">3FCF_8000</div><div class="bar cache"></div><div class="lbl"><b>DCache</b><span class="sz">32,768</span><small>DATA_CACHE_32KB（PSRAM 存取用）</small></div></div>
+      </div>
+      <p class="note">靜態合計：IRAM 92,928 + .data 29,196 + .bss 109,416。.bss 依模組彙總，不是位址順序。另有 RTC fast RAM 8,152 B 也算進 internal heap，但它不能做 DMA。</p>
+    </div>
+
+    <div class="map">
+      <h3>動態 heap 247,188 B · 錄影峰值時</h3>
+      <div class="rows">
+        <div class="row" style="--kb:29.4"><div class="addr">開機</div><div class="bar sys"></div><div class="lbl"><b>系統 task</b><span class="sz">30,141</span><small>main 8K、IPC×2、idle×2、timer、esp_timer stack 與 TCB（247,188 − app start free 217,047）</small></div></div>
+        <div class="row" style="--kb:124.4"><div class="addr">Wi-Fi</div><div class="bar wifi"></div><div class="lbl"><b>Wi-Fi + lwIP + netif</b><span class="sz">127,360</span><small>217,047 → 89,687。估：static TX 16×1.6K ≈ 26K、static RX 8×1.6K ≈ 13K、wifi task 6.5K、tcpip 3K、event 2.3K，其餘 ~75K 是 driver / PHY 內部結構</small></div></div>
+        <div class="row" style="--kb:16.7"><div class="addr">mic init</div><div class="bar mic"></div><div class="lbl"><b>I2S DMA</b><span class="sz">17,136</span><small>8 desc × 512 frame × 4 B = 16,384 + descriptor／channel（常駐，錄音之間也不釋放）</small></div></div>
+        <div class="row" style="--kb:35.6"><div class="addr">cam init</div><div class="bar cam"></div><div class="lbl"><b>相機驅動</b><span class="sz">≈ 36,457</span><small>LCD_CAM DMA buffer 30,720 + cam_task stack 4,096 + cam_obj／descriptor／SCCB ~1.6K（camera_init 的 8K stack 之後會釋放，已扣除）</small></div></div>
+        <div class="row" style="--kb:8.8"><div class="addr">其他</div><div class="bar store"></div><div class="lbl"><b>SD 驅動 + 其他常駐</b><span class="sz">≈ 8,979</span><small>sdmmc card、heartbeat task 6K stack 等（差值推算）</small></div></div>
+        <div class="row" style="--kb:23.9"><div class="addr">錄影中</div><div class="bar trans"></div><div class="lbl"><b>錄影瞬態</b><span class="sz">≈ 24,520</span><small>4 個錄製 task 4×4,096 stack + TCB ≈ 17.8K；其餘 ~6.7K 估為 Wi-Fi 動態 RX / lwIP pbuf / FATFS（≤16 KB 的 malloc 優先放內部）</small></div></div>
+        <div class="row" style="--kb:2.53"><div class="addr">剩</div><div class="bar free"></div><div class="lbl"><b>最低剩餘</b><span class="sz">2,595</span><small>錄影之間閒置時約 27–32 KB 可用</small></div></div>
+      </div>
+      <p class="note">上傳時另有一段類似的瞬態：TCP_SND_BUF 65,534 加上 lwIP pbuf 都在內部 RAM（SPIRAM_TRY_ALLOCATE_WIFI_LWIP 未開），最低剩 2,395 B。</p>
+    </div>
+
+  </div>
+</section>
+
+<section>
+  <div class="head">
+    <h2>開機各階段的內部 RAM（log 原值）</h2>
+  </div>
+  <div class="tbl"><table>
+    <thead><tr><th>階段</th><th class="r">internal free</th><th class="r">largest</th><th class="r">min since boot</th><th>這一步吃掉的</th></tr></thead>
+    <tbody>
+      <tr><td>app start</td><td class="r num">217,047</td><td class="r num">122,880</td><td class="r num">216,759</td><td>系統 task</td></tr>
+      <tr><td>wifi connected</td><td class="r num">89,687</td><td class="r num">31,744</td><td class="r num">83,287</td><td>Wi-Fi + lwIP 127,360</td></tr>
+      <tr><td>net bench（boot）</td><td class="r num">56,339</td><td class="r num">—</td><td class="r num">33,823</td><td>TCP 送 8 MB 時的 pbuf 瞬態，送完會還</td></tr>
+      <tr><td>mic init</td><td class="r num">72,551</td><td class="r num">31,744</td><td class="r num">17,307</td><td>I2S DMA 17,136</td></tr>
+      <tr><td>camera init</td><td class="r num">27,519</td><td class="r num">14,848</td><td class="r num">16,887</td><td>相機 45,032（含之後釋放的 camera_init 8K stack）</td></tr>
+      <tr><td>sd mounted</td><td class="r num">34,575</td><td class="r num">14,848</td><td class="r num">16,371</td><td>camera_init stack 歸還，SD 小量</td></tr>
+      <tr><td>before upload（錄完）</td><td class="r num">27,115</td><td class="r num">14,848</td><td class="r num tot" style="color:var(--bad)">2,595</td><td>錄影瞬態最低點</td></tr>
+      <tr><td>after upload</td><td class="r num">27,115</td><td class="r num">14,848</td><td class="r num tot" style="color:var(--bad)">2,395</td><td>上傳瞬態最低點</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section>
+  <div class="head">
+    <h2>錄影的餘裕</h2>
+    <p class="sub">640×480 GRAY8、5 fps。感測器送 YUV422 614,400 B/幀，經 DMA 進內部 RAM，cam_task 取出 Y 寫進 PSRAM fb，平均 3.07 MB/s；寫 SD 的資料量是 1.54 MB/s。</p>
+  </div>
+  <div class="tbl"><table>
+    <thead><tr><th>緩衝</th><th>位置</th><th class="r">大小</th><th>可撐多久</th><th>實際需要</th><th>判斷</th></tr></thead>
+    <tbody>
+      <tr><td><span class="swatch cam"></span>LCD_CAM DMA<br><span class="mono note">CAMERA_DMA_BUFFER_SIZE_MAX</span></td><td>內部 DMA</td><td class="r num">30,720</td><td>2 個 half，各 12 行 ≈ 4.7 ms（估 200 ms / ~510 行 ≈ 0.39 ms/行）</td><td>cam_task（prio 23，core 1）在下一個 half 填滿前取出 7,680 B Y，數十 µs</td><td><span class="pill over">過大</span><br>改 16384：half = 6 行 ≈ 2.35 ms，總大小 15,360，仍是需求的數十倍。省 15,360。</td></tr>
+      <tr><td><span class="swatch cam"></span>frame buffer ×8</td><td>PSRAM</td><td class="r num">2,457,600</td><td>ready queue 5 幀 = 1.0 s</td><td>SD 平均 90 ms/幀、最大 149 ms，週期 200 ms；peak_ready = 1/5</td><td><span class="pill ok">合適</span><br>在 PSRAM（剩 5.9 MB），不佔內部 RAM，不用動。</td></tr>
+      <tr><td><span class="swatch store"></span>SD staging<br><span class="mono note">s_io_buffer</span></td><td>內部 .bss</td><td class="r num">32,768</td><td>每次寫 32 KB；實測 3,387 kB/s</td><td>1,536 kB/s</td><td><span class="pill ok">合適</span><br>2.2 倍餘裕。縮到 16 KB 可省 16 KB，但寫入效率會下降，SD 穩定性也還在追，要先實測再決定。</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section>
+  <div class="head">
+    <h2>錄音的餘裕</h2>
+    <p class="sub">16 kHz mono。I2S 取 32-bit slot，DMA 端 64 KB/s；轉成 16-bit PCM 後寫 SD 32 KB/s。</p>
+  </div>
+  <div class="tbl"><table>
+    <thead><tr><th>緩衝</th><th>位置</th><th class="r">大小</th><th>可撐多久</th><th>實際需要</th><th>判斷</th></tr></thead>
+    <tbody>
+      <tr><td><span class="swatch mic"></span>I2S DMA<br><span class="mono note">DMA_DESC_NUM 8 × FRAME_NUM 512</span></td><td>內部 DMA（heap）</td><td class="r num">16,384</td><td>8 desc × 32 ms = 256 ms；driver queue 深度 desc−1，實際可落後 224 ms</td><td>mic_capture（prio 7）每 64 ms 讀一次</td><td><span class="pill ok">略大</span><br>3.5 倍餘裕。改 6 desc（160 ms）可省 4 KB，優先度低。</td></tr>
+      <tr><td><span class="swatch mic"></span>audio blocks<br><span class="mono note">s_blocks 16 × 1024</span></td><td>內部 .bss</td><td class="r num">32,832</td><td>1.02 s</td><td>mic_writer 被 cam 的 SD 寫入擋住時要能撐住：最大 149 ms/幀 + FAT，約 0.3 s</td><td><span class="pill over">放錯地方</span><br>只有 CPU 讀寫、不走 DMA，改成 init 時 <code>heap_caps_malloc(MALLOC_CAP_SPIRAM)</code>，餘裕不變，省 32,832。</td></tr>
+      <tr><td><span class="swatch mic"></span>SD 寫入緩衝<br><span class="mono note">s_write_buffer</span></td><td>內部 .bss</td><td class="r num">16,384</td><td>512 ms PCM</td><td>必須在內部 RAM（SDMMC DMA）；8 KB 以上寫入效率就夠</td><td><span class="pill over">偏大</span><br>改 8 KB（每 256 ms 寫一次），省 8,192。</td></tr>
+      <tr><td><span class="swatch mic"></span>讀取緩衝<br><span class="mono note">s_read_buffer</span></td><td>內部 .bss</td><td class="r num">4,096</td><td>64 ms</td><td>—</td><td><span class="pill ok">合適</span></td></tr>
+    </tbody>
+  </table></div>
+  <div class="callout info">
+    <h3>log 裡的「I2S overflow 5」大概不是真的掉資料</h3>
+    <p><code>mic_record_finish()</code> 在 <span class="mono">mic_record.c:520</span> 讀 <code>s_overflow_count</code>，而它是在 <code>cam_record_finish()</code> 之後才被呼叫。mic_capture 錄滿 160,000 樣本就結束，但 I2S 時脈要到 finish 才停，所以這段時間沒人讀 DMA。queue 滿（224 ms）之後每 32 ms 會算一次 overflow。以 log 推算這段空窗約 450 ms，大約會算到 5–7 次，和 log 相符。要確認的話，可以在 capture_task 結束迴圈時先把計數存下來。</p>
+  </div>
+</section>
+
+<section>
+  <div class="head">
+    <h2>可回收的內部 RAM（依投報排序）</h2>
+  </div>
+  <div class="tbl"><table>
+    <thead><tr><th>#</th><th>改法</th><th>在哪改</th><th class="r">省</th><th>代價</th></tr></thead>
+    <tbody>
+      <tr><td class="num">1</td><td>mic <code>s_blocks</code> 改到 PSRAM</td><td>mic_record.c</td><td class="r num">32,832</td><td>幾乎沒有；PSRAM 64 KB/s 存取量很小</td></tr>
+      <tr><td class="num">2</td><td><code>CONFIG_CAMERA_DMA_BUFFER_SIZE_MAX</code> 32768 → 16384</td><td>sdkconfig.defaults</td><td class="r num">15,360</td><td>EOF 中斷頻率加倍（每 ~2.35 ms 一次），要跑一次開機 FPS 測試確認</td></tr>
+      <tr><td class="num">3</td><td>關掉用不到的感測器（保留 OV7725 / OV7670 / OV2640）</td><td>sdkconfig.defaults</td><td class="r num">≈ 6–8K（估）</td><td>無；.data 裡 9.4 KB 的暫存器表大多屬於 OV5640、HM0360 等</td></tr>
+      <tr><td class="num">4</td><td>mic <code>WRITE_BUFFER_BYTES</code> 16 KB → 8 KB</td><td>mic_record.c</td><td class="r num">8,192</td><td>SD 寫入次數加倍（每 256 ms 一次）</td></tr>
+      <tr class="tot"><td></td><td>1–4 小計</td><td></td><td class="r num">≈ 62,000</td><td>足以容納 TRAX 的 32,768，還剩約 30 KB</td></tr>
+      <tr><td class="num">5</td><td><code>SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y</code></td><td>sdkconfig（defaults 寫 y，但目前 sdkconfig 是 not set）</td><td class="r num">瞬態</td><td>主要拉高上傳／錄影時的最低點；吞吐量可能降一點</td></tr>
+      <tr><td class="num">6</td><td><code>SPIRAM_MALLOC_ALWAYSINTERNAL</code> 16384 → 4096</td><td>sdkconfig.defaults</td><td class="r num">瞬態</td><td>HTTP client、cJSON 等中型 malloc 改走 PSRAM</td></tr>
+      <tr><td class="num">7</td><td><code>ESP_WIFI_STATIC_TX_BUFFER_NUM</code> 16 → 8</td><td>sdkconfig.defaults</td><td class="r num">≈ 13K（估）</td><td>上傳吞吐量會降，要重新量</td></tr>
+      <tr><td class="num">8</td><td>I2S <code>DMA_DESC_NUM</code> 8 → 6</td><td>mic_record.c</td><td class="r num">4,096</td><td>可落後時間 224 → 160 ms</td></tr>
+    </tbody>
+  </table></div>
+  <p class="note">相機 DMA 與 TRAX 都需要內部 RAM。改完 #2 之後，相機只需要 15,360 B 的連續 DMA 區塊；開機時 Wi-Fi 之後的最大連續區塊只有 31,744 B，被 TRAX 拿走一塊 32 KB 區域後，30,720 就配不到了。</p>
+</section>
+
+</div>
+
+</body></html>
