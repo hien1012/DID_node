@@ -25,4 +25,11 @@ typedef struct {
 
 esp_err_t audio_record_init(void);
 esp_err_t audio_record_once(audio_record_result_t *result);
+
+/*
+ * Start or stop the I2S channel (BCLK/WS output and RX DMA). The channel stays
+ * stopped after init and between recordings; audio_record_once() starts it for
+ * the recording only. Exposed for the boot throughput A/B test (app_main.c).
+ */
+esp_err_t audio_record_set_clock_enabled(bool enable);
 void audio_record_deinit(void);

@@ -272,15 +272,41 @@ static esp_err_t i2s_init(void)
     };
     ESP_RETURN_ON_ERROR(i2s_channel_register_event_callback(rx_handle, &cbs, NULL),
                         TAG, "register cb failed");
-    ESP_RETURN_ON_ERROR(i2s_channel_enable(rx_handle),
-                        TAG, "i2s_channel_enable failed");
+    /* 通道建立後保持停止；錄音時才由 audio_record_set_clock_enabled(true) 啟動 */
     return ESP_OK;
+}
+
+/*
+ * 開關 I2S 通道：停止時 rx_start=0，BCLK/WS 不再輸出、GDMA 不再搬運，
+ * 沒有 DMA 完成中斷。DMA 緩衝保留，下次啟動不需重新配置。
+ * 非錄音期間保持停止，避免時脈干擾上傳 (S3 版 docs/debug_sdcard.md #20)。
+ */
+static bool s_clock_enabled = false;
+
+esp_err_t audio_record_set_clock_enabled(bool enable)
+{
+    if (rx_handle == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (enable == s_clock_enabled) {
+        return ESP_OK;
+    }
+    const esp_err_t err = enable ? i2s_channel_enable(rx_handle)
+                                 : i2s_channel_disable(rx_handle);
+    if (err == ESP_OK) {
+        s_clock_enabled = enable;
+        ESP_LOGI(TAG, "I2S clock %s", enable ? "started" : "stopped");
+    } else {
+        ESP_LOGE(TAG, "i2s_channel_%s failed: %s", enable ? "enable" : "disable",
+                 esp_err_to_name(err));
+    }
+    return err;
 }
 
 static void i2s_deinit(void)
 {
     if (rx_handle) {
-        i2s_channel_disable(rx_handle);
+        (void)audio_record_set_clock_enabled(false);
         i2s_del_channel(rx_handle);
         rx_handle = NULL;
     }
@@ -505,7 +531,7 @@ esp_err_t audio_record_init(void)
         g_record_mutex = NULL;
         return err;
     }
-    ESP_LOGI(TAG, "I2S initialized");
+    ESP_LOGI(TAG, "I2S initialized (clock stopped until recording)");
 
     g_initialized = true;
     return ESP_OK;
@@ -574,6 +600,16 @@ esp_err_t audio_record_once(audio_record_result_t *result)
         goto cleanup_pipeline;
     }
 
+    /* capture_task 建立前才啟動 I2S 時脈 (前幾次讀取會被 flush 丟掉) */
+    err = audio_record_set_clock_enabled(true);
+    if (err != ESP_OK) {
+        g_record_error = err;
+        audio_block_t *sentinel = NULL;
+        xQueueSend(q_full_blocks, &sentinel, portMAX_DELAY);
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        goto cleanup_pipeline;
+    }
+
     ok = xTaskCreatePinnedToCore(
         capture_task, "cap_task", 4096, NULL, 10, &g_capture_task, 1);
     if (ok != pdPASS) {
@@ -588,6 +624,8 @@ esp_err_t audio_record_once(audio_record_result_t *result)
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
 cleanup_pipeline:
+    /* 兩個 task 都已結束；上傳期間 BCLK/WS 停止、DMA 不搬運 */
+    (void)audio_record_set_clock_enabled(false);
     audio_pipeline_deinit();
 
 finish:

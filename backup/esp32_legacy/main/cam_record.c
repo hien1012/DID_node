@@ -54,6 +54,7 @@
 
 /* ESP-IDF 硬體驅動與周邊控制 */
 #include "esp_camera.h"         /* 官方相機驅動介面 (相機初始化、擷取影格) */
+#include "driver/ledc.h"        /* XCLK 由 LEDC 產生；非錄影期間停止輸出 */
 #include "cam_hal.h"            /* 停止/恢復 VSYNC 與 I2S DMA 擷取 */
 #include "esp_check.h"          /* ESP-IDF 錯誤檢查巨集 (ESP_RETURN_ON_ERROR) */
 #include "esp_err.h"            /* ESP 錯誤碼型別定義 (esp_err_t) */
@@ -1727,6 +1728,34 @@ esp_err_t cam_record_resume(void)
         s_camera_paused = false;
     }
     return ESP_OK;
+}
+
+esp_err_t cam_record_set_xclk_output(bool enable)
+{
+#if USE_OV2640_ONBOARD_XVCLK
+    (void)enable;
+    return ESP_ERR_NOT_SUPPORTED;
+#else
+    if (!s_initialized || !s_camera_paused) {
+        return ESP_ERR_INVALID_STATE;       /* 只在相機暫停時切換，避免錄影中斷 */
+    }
+    /*
+     * ESP32 的 XCLK 由 LEDC (low speed mode，1-bit 50% duty) 產生
+     * (esp32-camera target/xclk.c)。ledc_stop 關閉輸出並固定低電位；
+     * ledc_update_duty 重新開啟輸出，計時器與 duty 設定都還在。
+     */
+    const ledc_channel_t channel = s_camera_config.ledc_channel;
+    const esp_err_t err = enable ? ledc_update_duty(LEDC_LOW_SPEED_MODE, channel)
+                                 : ledc_stop(LEDC_LOW_SPEED_MODE, channel, 0);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "XCLK output %s (GPIO%d)", enable ? "restored" : "stopped",
+                 CAM_PIN_XCLK);
+    } else {
+        ESP_LOGE(TAG, "XCLK %s failed: %s", enable ? "restore" : "stop",
+                 esp_err_to_name(err));
+    }
+    return err;
+#endif
 }
 
 void cam_record_deinit(void)

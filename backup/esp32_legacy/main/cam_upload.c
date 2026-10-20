@@ -1,13 +1,19 @@
 #include "cam_upload.h"
 
+#include <fcntl.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/types.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "cJSON.h"
+#include "esp_attr.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 #include "app_config.h"
 #include "cam_record.h"
@@ -15,12 +21,17 @@
 #include "device_identity.h"
 #include "wifi_manager.h"
 
-#define UPLOAD_BUFFER_SIZE 4096U
+#define UPLOAD_BUFFER_SIZE (16U * 1024U)
 #define ACK_BUFFER_SIZE    512U
 #define CAPTURE_ID_SIZE    64U
 
 static const char *TAG = "CAM_UPLOAD";
-static uint8_t s_upload_buffer[UPLOAD_BUFFER_SIZE];
+/*
+ * 讀檔用 open()/read() 直接讀進這塊緩衝：4-byte 對齊、內部 RAM，SDMMC 可直接
+ * DMA，FATFS 一次讀多個 sector。fread() 經 stdio 128 B 緩衝會變成逐 sector
+ * 讀取 (S3 版實測 1.1 MB/s → 4.0 MB/s，docs/debug_sdcard.md #22-#23)。
+ */
+static WORD_ALIGNED_ATTR uint8_t s_upload_buffer[UPLOAD_BUFFER_SIZE];
 
 static esp_err_t verify_ack(const char *json, const char *capture_id,
                             size_t expected_size)
@@ -54,8 +65,8 @@ static esp_err_t upload_one_file(const char *path, time_t recorded_at_epoch,
     }
     size_t frame_count = file_size / CAM_IMAGE_FRAME_BYTES;
 
-    FILE *file = fopen(path, "rb");
-    if (!file) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
         return ESP_FAIL;
     }
 
@@ -86,7 +97,7 @@ static esp_err_t upload_one_file(const char *path, time_t recorded_at_epoch,
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (!client) {
-        fclose(file);
+        close(fd);
         return ESP_ERR_NO_MEM;
     }
 
@@ -103,20 +114,34 @@ static esp_err_t upload_one_file(const char *path, time_t recorded_at_epoch,
 
     err = esp_http_client_open(client, (int)file_size);
     if (err != ESP_OK) {
-        fclose(file);
+        close(fd);
         esp_http_client_cleanup(client);
         return err;
     }
 
     ESP_LOGI(TAG, "Uploading %s (%u bytes, %u frames), capture_id=%s",
              path, (unsigned)file_size, (unsigned)frame_count, capture_id);
+    const int64_t started_us = esp_timer_get_time();
+    /* 計時 (debug)：分開累計讀 SD 與 Wi-Fi 送出的時間，找出上傳瓶頸 */
+    int64_t sd_read_us = 0;
+    int64_t net_send_us = 0;
+    int64_t max_sd_read_us = 0;
+    int64_t max_net_send_us = 0;
     size_t total_written = 0;
     while (total_written < file_size) {
-        size_t read_size = fread(s_upload_buffer, 1, sizeof(s_upload_buffer), file);
-        if (read_size == 0) {
+        const int64_t read_start_us = esp_timer_get_time();
+        const ssize_t read_result = read(fd, s_upload_buffer, sizeof(s_upload_buffer));
+        const int64_t read_us = esp_timer_get_time() - read_start_us;
+        sd_read_us += read_us;
+        if (read_us > max_sd_read_us) {
+            max_sd_read_us = read_us;
+        }
+        if (read_result <= 0) {   /* 0 = 檔案比預期短，-1 = I/O 錯誤 */
             err = ESP_FAIL;
             break;
         }
+        const size_t read_size = (size_t)read_result;
+        const int64_t send_start_us = esp_timer_get_time();
         size_t offset = 0;
         while (offset < read_size) {
             int written = esp_http_client_write(
@@ -129,15 +154,21 @@ static esp_err_t upload_one_file(const char *path, time_t recorded_at_epoch,
             offset += (size_t)written;
             total_written += (size_t)written;
         }
+        const int64_t send_us = esp_timer_get_time() - send_start_us;
+        net_send_us += send_us;
+        if (send_us > max_net_send_us) {
+            max_net_send_us = send_us;
+        }
         if (err != ESP_OK) {
             break;
         }
     }
-    fclose(file);
+    close(fd);
 
     char ack[ACK_BUFFER_SIZE] = {0};
     int status = 0;
     int ack_bytes = 0;
+    const int64_t ack_start_us = esp_timer_get_time();
     if (err == ESP_OK && total_written == file_size) {
         (void)esp_http_client_fetch_headers(client);
         status = esp_http_client_get_status_code(client);
@@ -151,8 +182,24 @@ static esp_err_t upload_one_file(const char *path, time_t recorded_at_epoch,
             err = verify_ack(ack, capture_id, file_size);
         }
     }
+    const int64_t ack_wait_us = esp_timer_get_time() - ack_start_us;
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
+
+    /* 速度 = 位元組 * 1000 / 微秒 = kB/s */
+    const int64_t total_us = esp_timer_get_time() - started_us;
+    ESP_LOGI(TAG, "Upload timing: total=%" PRId64 " ms (%" PRId64 " kB/s) | sd_read=%" PRId64
+             " ms (%" PRId64 " kB/s, max %" PRId64 " ms/16KB) | wifi_send=%" PRId64
+             " ms (%" PRId64 " kB/s, max %" PRId64 " ms/16KB) | ack_wait=%" PRId64 " ms",
+             total_us / 1000,
+             total_us > 0 ? (int64_t)total_written * 1000 / total_us : 0,
+             sd_read_us / 1000,
+             sd_read_us > 0 ? (int64_t)total_written * 1000 / sd_read_us : 0,
+             max_sd_read_us / 1000,
+             net_send_us / 1000,
+             net_send_us > 0 ? (int64_t)total_written * 1000 / net_send_us : 0,
+             max_net_send_us / 1000,
+             ack_wait_us / 1000);
 
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Upload not acknowledged: HTTP %d, response=%s",

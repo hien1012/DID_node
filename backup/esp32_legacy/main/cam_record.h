@@ -30,4 +30,15 @@ esp_err_t cam_record_init(void);
 esp_err_t cam_record_once(cam_record_result_t *result);
 esp_err_t cam_record_pause(void);
 esp_err_t cam_record_resume(void);
+
+/*
+ * Stop (hold low) or restore the XCLK output (LEDC) while the camera is paused.
+ * cam_record_pause() only stops the ESP32 side (VSYNC interrupt + I2S DMA); the
+ * sensor keeps driving PCLK and the data lines until XCLK stops. The running
+ * camera bus slows Wi-Fi uploads (S3 node, docs/debug_sdcard.md #19-#20), so
+ * the app keeps XCLK stopped between recordings.
+ * Returns ESP_ERR_INVALID_STATE unless paused, ESP_ERR_NOT_SUPPORTED when the
+ * sensor has its own oscillator (USE_OV2640_ONBOARD_XVCLK).
+ */
+esp_err_t cam_record_set_xclk_output(bool enable);
 void cam_record_deinit(void);

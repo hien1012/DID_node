@@ -15,6 +15,7 @@
 #include "upload.h"
 #include "wifi_manager.h"
 #include "device_identity.h"
+#include "net_bench.h"
 
 static const char *TAG = "APP_MAIN";
 
@@ -71,15 +72,39 @@ static void upload_boot_backlog(void)
     }
 }
 
+/*
+ * Debug: 開機吞吐量 A/B (net_bench.c)。I2S 初始化後通道是停止的。
+ *   i2s off       BCLK/WS 停止、DMA 不搬運 (錄音以外的正常狀態)
+ *   i2s on        BCLK/WS 輸出、DMA 搬運 (沒有 task 讀取，DMA 環形覆寫)
+ *   i2s off again 再停一次，確認結果可重現
+ */
+static void run_audio_benchmarks(void)
+{
+    net_bench_log_heap("mic init");
+    (void)net_bench_run("after init: i2s off");
+    if (audio_record_set_clock_enabled(true) == ESP_OK) {
+        (void)net_bench_run("i2s on");
+        (void)audio_record_set_clock_enabled(false);
+        (void)net_bench_run("i2s off again");
+    }
+}
+
 void app_main(void)
 {
     ESP_ERROR_CHECK(init_nvs());
     ESP_ERROR_CHECK(device_identity_init(DEVICE_ID_AUDIO_PREFIX));
     ESP_LOGI(TAG, "Device ID: %s", device_identity_get());
+    net_bench_log_heap("app start");
     ESP_ERROR_CHECK(wifi_manager_init());
     time_sync_configure_timezone();
     synchronize_clock();
+    /* 軟體重開後系統時間仍有效，synchronize_clock() 不會等 Wi-Fi；測速前一定要連上 */
+    wait_for_wifi();
+    net_bench_log_heap("wifi connected");
+    /* Debug: mic 初始化前的 Wi-Fi 吞吐量 (基準) */
+    (void)net_bench_run("boot");
     ESP_ERROR_CHECK(audio_record_init());
+    run_audio_benchmarks();
     ESP_ERROR_CHECK(health_monitor_start());
 
     upload_boot_backlog();

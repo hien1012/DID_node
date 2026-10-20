@@ -11,8 +11,10 @@
 #include "cam_health.h"
 #include "cam_record.h"
 #include "cam_storage.h"
+#include "cam_stream.h"
 #include "cam_upload.h"
 #include "device_identity.h"
+#include "net_bench.h"
 #include "time_sync.h"
 #include "wifi_manager.h"
 
@@ -20,6 +22,8 @@ static const char *TAG = "CAM_APP";
 
 #define CAMERA_INIT_TASK_STACK_BYTES 8192U
 #define CAMERA_INIT_TASK_PRIORITY    6U
+/* XCLK 恢復後等感測器重新起振、時序穩定再開始錄影 (S3 版在錄影前約 8 s 恢復) */
+#define CAMERA_XCLK_SETTLE_MS        1000U
 
 typedef struct {
     TaskHandle_t caller;
@@ -110,21 +114,60 @@ static void upload_boot_backlog(void)
     }
 }
 
+/*
+ * Debug: 開機吞吐量 A/B (net_bench.c)。進入時相機剛初始化完、仍在運作
+ * (XCLK 輸出、I2S DMA 搬運)；返回時相機暫停且 XCLK 停止。
+ *   after init  XCLK 開、DMA 開
+ *   dma off     cam_record_pause()：VSYNC 中斷與 DMA 停止，感測器仍收到 XCLK
+ *   xclk off    XCLK 也停止，PCLK / 資料線靜止
+ *   xclk on     再開 XCLK (DMA 仍停)，確認結果可重現
+ */
+static void run_camera_benchmarks(void)
+{
+    net_bench_log_heap("camera init");
+    (void)net_bench_run("after init: xclk on, dma on");
+    ESP_ERROR_CHECK(cam_record_pause());
+    (void)net_bench_run("dma off, xclk on");
+    if (cam_record_set_xclk_output(false) == ESP_OK) {
+        (void)net_bench_run("dma off, xclk off");
+        (void)cam_record_set_xclk_output(true);
+        (void)net_bench_run("dma off, xclk on again");
+        (void)cam_record_set_xclk_output(false);
+    }
+}
+
 void app_main(void)
 {
     ESP_ERROR_CHECK(init_nvs());
     ESP_ERROR_CHECK(device_identity_init(DEVICE_ID_CAMERA_PREFIX));
     ESP_LOGI(TAG, "Device ID: %s", device_identity_get());
+    net_bench_log_heap("app start");
     ESP_ERROR_CHECK(wifi_manager_init());
     time_sync_configure_timezone();
     synchronize_clock();
+    /* 軟體重開後系統時間仍有效，synchronize_clock() 不會等 Wi-Fi；測速前一定要連上 */
+    wait_for_wifi();
+    net_bench_log_heap("wifi connected");
+    /* Debug: 相機初始化前的 Wi-Fi 吞吐量 (基準) */
+    (void)net_bench_run("boot");
     ESP_ERROR_CHECK(cam_storage_init());
     ESP_ERROR_CHECK(cam_health_monitor_start());
 
     upload_boot_backlog();
     ESP_ERROR_CHECK(init_camera_recorder());
-    /* 開機測試後到第一輪錄影前，不讓相機持續收集未使用的影格。 */
+    run_camera_benchmarks();
+    /* 開機測試後到第一輪錄影前，相機暫停 (不收影格) 且 XCLK 停止 */
     ESP_ERROR_CHECK(cam_record_pause());
+    (void)cam_record_set_xclk_output(false);
+
+#if APP_CAM_STREAM_ENABLE
+    /* Debug: 只串流不錄影 (cam_stream.c)；只有相機無法暫停／恢復時才會返回 */
+    const esp_err_t stream_err = cam_stream_run();
+    ESP_LOGE(TAG, "Camera stream stopped: %s", esp_err_to_name(stream_err));
+    (void)cam_record_pause();
+    (void)cam_record_set_xclk_output(false);
+#endif
+
     ESP_LOGI(TAG, "Automatic camera schedule started: %u seconds every %u seconds",
              (unsigned)CAM_RECORD_DURATION_SEC,
              (unsigned)(CAM_RECORD_PERIOD_MS / 1000U));
@@ -132,10 +175,16 @@ void app_main(void)
     while (true) {
         TickType_t cycle_started = xTaskGetTickCount();
 
+        /* 錄影前恢復 XCLK，等感測器穩定；cam_record_once() 內再恢復 DMA */
+        if (cam_record_set_xclk_output(true) == ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(CAMERA_XCLK_SETTLE_MS));
+        }
         cam_record_result_t record_result = {0};
         esp_err_t err = cam_record_once(&record_result);
         /* 早期失敗路徑也要停相機；正常路徑已在 cam_record_once() 停止。 */
         ESP_ERROR_CHECK(cam_record_pause());
+        /* 上傳期間相機匯流排完全靜止：DMA 已停，再停 XCLK */
+        (void)cam_record_set_xclk_output(false);
         cam_health_note_recording(&record_result);
         if (err == ESP_OK && record_result.success) {
             ESP_LOGI(TAG, "Camera recording saved: %s, frames=%u, bytes=%u",

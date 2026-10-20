@@ -1,5 +1,5 @@
-"""Receiving server for the ESP32-S3 camera + microphone node.
 
+"""Receiving server for the ESP32-S3 camera + microphone node.
 Every session produces one GRAY8 RAW video and one WAV recording that share a
 session ID; both are stored side by side:
 
