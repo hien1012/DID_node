@@ -11,8 +11,10 @@
 #include "cam_health.h"
 #include "cam_record.h"
 #include "cam_storage.h"
+#include "cam_stream.h"
 #include "cam_upload.h"
 #include "device_identity.h"
+#include "net_bench.h"
 #include "time_sync.h"
 #include "wifi_manager.h"
 
@@ -110,21 +112,67 @@ static void upload_boot_backlog(void)
     }
 }
 
+#if APP_NET_BENCH_ENABLE
+static esp_err_t run_camera_benchmarks(void)
+{
+    net_bench_log_heap("camera init");
+    (void)net_bench_run("after init: camera running");
+
+    /* 只停接收，再另測停止 XCLK；一般 pause/resume 的行為保持不變。 */
+    esp_err_t err = cam_record_pause_dma();
+    if (err != ESP_OK) {
+        return err;
+    }
+    (void)net_bench_run("dma off, sensor clock on");
+
+    err = cam_record_set_xclk_output(false);
+    if (err == ESP_ERR_NOT_SUPPORTED) {
+        ESP_LOGI(TAG, "Onboard sensor oscillator: skipping XCLK off/on tests");
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+    (void)net_bench_run("dma off, xclk off");
+    err = cam_record_set_xclk_output(true);
+    if (err != ESP_OK) {
+        return err;
+    }
+    (void)net_bench_run("dma off, xclk on again");
+    return cam_record_pause();
+}
+#endif
+
 void app_main(void)
 {
     ESP_ERROR_CHECK(init_nvs());
     ESP_ERROR_CHECK(device_identity_init(DEVICE_ID_CAMERA_PREFIX));
     ESP_LOGI(TAG, "Device ID: %s", device_identity_get());
+    net_bench_log_heap("app start");
     ESP_ERROR_CHECK(wifi_manager_init());
     time_sync_configure_timezone();
     synchronize_clock();
+#if APP_NET_BENCH_ENABLE
+    wait_for_wifi();
+    net_bench_log_heap("wifi connected");
+    (void)net_bench_run("boot: before camera init");
+#endif
     ESP_ERROR_CHECK(cam_storage_init());
     ESP_ERROR_CHECK(cam_health_monitor_start());
 
     upload_boot_backlog();
     ESP_ERROR_CHECK(init_camera_recorder());
+#if APP_NET_BENCH_ENABLE
+    ESP_ERROR_CHECK(run_camera_benchmarks());
+#endif
     /* 開機測試後到第一輪錄影前，不讓相機持續收集未使用的影格。 */
     ESP_ERROR_CHECK(cam_record_pause());
+#if APP_CAM_STREAM_ENABLE
+    /* 串流不寫入 SD；僅致命錯誤才返回，之後恢復原有錄影排程。 */
+    const esp_err_t stream_err = cam_stream_run();
+    ESP_LOGE(TAG, "Camera stream stopped: %s", esp_err_to_name(stream_err));
+    ESP_ERROR_CHECK(cam_record_pause());
+#endif
     ESP_LOGI(TAG, "Automatic camera schedule started: %u seconds every %u seconds",
              (unsigned)CAM_RECORD_DURATION_SEC,
              (unsigned)(CAM_RECORD_PERIOD_MS / 1000U));

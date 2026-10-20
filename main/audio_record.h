@@ -25,4 +25,7 @@ typedef struct {
 
 esp_err_t audio_record_init(void);
 esp_err_t audio_record_once(audio_record_result_t *result);
+/* 僅供開機測速：獨占 recorder 切換 I2S/DMA，結束後還原原本時脈狀態。
+ * PDM 若曾停止時脈，會重新計算第一輪錄音前的穩定等待時間。 */
+esp_err_t audio_record_run_network_benchmarks(void);
 void audio_record_deinit(void);

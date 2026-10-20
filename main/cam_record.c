@@ -94,7 +94,7 @@
  * 若感測器已有自帶震盪器，ESP32 絕不可再由內部輸出 XCLK，否則兩組時脈訊號會互相打架短路。
  * 反之，OV7670/OV7725 模組通常需要由 ESP32 的內部定時器產生 16 MHz XCLK 供給它。
  */
-#define USE_OV2640_ONBOARD_XVCLK 1                          /* 0: 由 ESP32 產生 16MHz XCLK; 1: 使用 OV2640 板載 12MHz 時脈 */
+#define USE_OV2640_ONBOARD_XVCLK 0                          /* 0: 由 ESP32 產生 16MHz XCLK; 1: 使用 OV2640 板載 12MHz 時脈 */
 #define ESP32_CAMERA_XCLK_HZ     16000000U                  /* ESP32 輸出的 XCLK 時脈頻率：16 MHz */
 #define OV2640_ONBOARD_XVCLK_HZ  12000000U                  /* OV2640 外部板載震盪器頻率：12 MHz */
 #define OV2640_HAL_XCLK_HINT_HZ  20000000U                  /* 提供給相機底層驅動的時脈提示值 (設定超過 10MHz 會影響 I2S 採樣模式選擇) */
@@ -1790,6 +1790,35 @@ esp_err_t cam_record_resume(void)
         s_camera_paused = false;
     }
     return ESP_OK;
+}
+
+esp_err_t cam_record_pause_dma(void)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_camera_paused) {
+        return ESP_OK;
+    }
+    /* 仍由 HAL 擁有者清除 DMA/影格事件；只在開機測速時保留 XCLK。
+     * 不改變原有 cam_record_pause() 連同 XCLK 一起停止的行為。 */
+    const esp_err_t err = cam_stop();
+    if (err == ESP_OK) {
+        s_camera_paused = true;
+    }
+    return err;
+}
+
+esp_err_t cam_record_set_xclk_output(bool enable)
+{
+    if (!s_initialized || !s_camera_paused) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_camera_config.pin_xclk < 0) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    /* 共用原有 XCLK 狀態與 LEDC timer；不可另建一份開關狀態。 */
+    return enable ? xclk_start() : xclk_stop();
 }
 
 void cam_record_deinit(void)

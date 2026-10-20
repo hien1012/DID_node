@@ -15,6 +15,7 @@
 #include "upload.h"
 #include "wifi_manager.h"
 #include "device_identity.h"
+#include "net_bench.h"
 
 static const char *TAG = "APP_MAIN";
 
@@ -76,10 +77,18 @@ void app_main(void)
     ESP_ERROR_CHECK(init_nvs());
     ESP_ERROR_CHECK(device_identity_init(DEVICE_ID_AUDIO_PREFIX));
     ESP_LOGI(TAG, "Device ID: %s", device_identity_get());
+    net_bench_log_heap("app start");
     ESP_ERROR_CHECK(wifi_manager_init());
     time_sync_configure_timezone();
     synchronize_clock();
+#if APP_NET_BENCH_ENABLE
+    /* 軟體重開可能保留有效時間；測速仍需明確等候 Wi-Fi。 */
+    wait_for_wifi();
+    net_bench_log_heap("wifi connected");
+    (void)net_bench_run("boot: before mic init");
+#endif
     ESP_ERROR_CHECK(audio_record_init());
+    ESP_ERROR_CHECK(audio_record_run_network_benchmarks());
     ESP_ERROR_CHECK(health_monitor_start());
 
     upload_boot_backlog();

@@ -8,6 +8,7 @@
 #include "audio_record.h"
 #include "app_config.h"
 #include "storage.h"
+#include "net_bench.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -573,6 +574,45 @@ esp_err_t audio_record_init(void)
     g_init_us = esp_timer_get_time();
     g_initialized = true;
     return ESP_OK;
+}
+
+esp_err_t audio_record_run_network_benchmarks(void)
+{
+#if APP_NET_BENCH_ENABLE
+    if (!g_initialized || xSemaphoreTake(g_record_mutex, 0) != pdTRUE) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* 沿用既有狀態：PDM 初始化後持續開啟，標準 I2S 初始化後停止。
+     * 使用錄音 mutex，避免測速切換通道時另有 capture/writer 正在使用。 */
+    const bool initially_enabled = g_i2s_enabled;
+    net_bench_log_heap("mic init");
+    (void)net_bench_run(initially_enabled ? "after init: i2s on" :
+                                          "after init: i2s off");
+
+    esp_err_t err = initially_enabled ? i2s_channel_disable(rx_handle) :
+                                       i2s_channel_enable(rx_handle);
+    if (err == ESP_OK) {
+        g_i2s_enabled = !initially_enabled;
+        (void)net_bench_run(g_i2s_enabled ? "i2s on" : "i2s off");
+
+        /* 即使網路測速失敗，也必須還原原有通道狀態。 */
+        err = initially_enabled ? i2s_channel_enable(rx_handle) :
+                                  i2s_channel_disable(rx_handle);
+        if (err == ESP_OK) {
+            g_i2s_enabled = initially_enabled;
+            if (initially_enabled) {
+                /* PDM 重給時脈後重新套用既有 7 秒穩定等待。 */
+                g_init_us = esp_timer_get_time();
+            }
+            (void)net_bench_run(initially_enabled ? "i2s on again" : "i2s off again");
+        }
+    }
+    xSemaphoreGive(g_record_mutex);
+    return err;
+#else
+    return ESP_OK;
+#endif
 }
 
 esp_err_t audio_record_once(audio_record_result_t *result)

@@ -93,3 +93,4 @@ managed_components/
 # modified driver (pause/resume) that every machine needs to build.
 sheet.png
 /server_mix_data/
+output.mp4

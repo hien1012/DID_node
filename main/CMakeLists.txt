@@ -9,6 +9,7 @@ set(common_sources
     "device_identity.c"
     "wifi_manager.c"
     "time_sync.c"
+    "net_bench.c"
 )
 
 set(common_requires
@@ -20,6 +21,7 @@ set(common_requires
     esp_wifi
     fatfs
     json
+    lwip
     nvs_flash
     sdmmc
 )
@@ -41,6 +43,7 @@ elseif(FIELD_FIRMWARE STREQUAL "camera")
         "cam_storage.c"
         "cam_upload.c"
         "cam_health.c"
+        "cam_stream.c"
     )
     set(firmware_requires
         esp32-camera
