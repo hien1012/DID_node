@@ -11,7 +11,7 @@
 #define CAM_IMAGE_HEIGHT         480U
 #define CAM_IMAGE_FRAME_BYTES    (CAM_IMAGE_WIDTH * CAM_IMAGE_HEIGHT)
 #define CAM_TARGET_FPS           5U
-#define CAM_RECORD_DURATION_SEC  10U
+#define CAM_RECORD_DURATION_SEC  20U
 #define CAM_RECORD_PATH_MAX      96U
 
 typedef struct {

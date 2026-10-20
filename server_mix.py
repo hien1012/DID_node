@@ -16,6 +16,7 @@ Endpoints
     GET  /uploads         recent uploaded files
 
 Run:  python server_mix.py   (listens on 0.0.0.0:5000)
+Data defaults to ./server_mix_data; set FIELD_MIX_DATA_ROOT to override it.
 """
 
 import hashlib
@@ -35,7 +36,10 @@ from flask import Flask, jsonify, request
 
 TAIPEI_TZ = timezone(timedelta(hours=8))
 DATA_ROOT = Path(
-    os.environ.get("FIELD_MIX_DATA_ROOT", r"C:\Users\Potato\ESP_project file\server_mix")
+    os.environ.get(
+        "FIELD_MIX_DATA_ROOT",
+        str(Path(__file__).resolve().parent / "server_mix_data"),
+    )
 )
 DATABASE_PATH = DATA_ROOT / "field_mix.db"
 VALID_ID = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")

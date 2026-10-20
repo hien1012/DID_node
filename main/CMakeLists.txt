@@ -63,5 +63,5 @@ idf_component_register(
 if(FIELD_FIRMWARE STREQUAL "camera")
     # cam_record.c calls the bundled camera HAL pause/resume API.
     target_include_directories(${COMPONENT_LIB} PRIVATE
-        "${PROJECT_DIR}/../../components/esp32-camera/driver/private_include")
+        "${PROJECT_DIR}/components/esp32-camera/driver/private_include")
 endif()

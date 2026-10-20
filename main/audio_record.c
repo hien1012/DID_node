@@ -22,7 +22,7 @@
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 
-#define I2S_MIC 1
+#define I2S_MIC 0
 
 #if I2S_MIC
 #include "driver/i2s_std.h"
@@ -68,6 +68,23 @@
 // [+] 開錄前丟棄的 DMA 暖身讀次數（清掉 I2S pipeline 殘留資料）
 #define I2S_FLUSH_READS         4
 
+// I2S 只在錄音期間 enable（上傳時不輸出時脈）。重新給時脈後麥克風需要啟動時間：
+// INMP441 為 2^18 SCK ≈ 256 ms（BCLK 1.024 MHz），PDM 麥克風通常 < 50 ms，取 300 ms 都涵蓋
+#define MIC_STARTUP_DISCARD_MS  300
+
+// PDM 麥克風停時脈會進睡眠，重新給時脈後 DC 偏移要十幾秒才降下（×PCM_GAIN 後削波），
+// 所以 PDM 開機 enable 後時脈一直開著；I2S（INMP441）內建高通，維持只在錄音期間 enable
+#define MIC_CLOCK_ALWAYS_ON     (!I2S_MIC)
+
+// 開機第一輪錄音至少等到 audio_record_init() 之後這麼久才開始，之後各輪早已超過，不會再等。
+// PDM：init 時就給時脈，讓 DC 穩定（第 1 秒削波、之後數秒漂移）；
+// I2S：時脈仍只在錄音時開，這裡只是讓兩種麥克風開機時序一致（之後要一起擺放同步）
+#define MIC_BOOT_DELAY_MS       7000
+
+// debug：錄音中每秒 log 一次原始 PCM（增益前）的平均 / 最小 / 最大值與增益後削波數，
+// 用來分辨開機第一輪無聲是 DC 偏移被 PCM_GAIN 削波、還是麥克風根本沒輸出
+#define MIC_LEVEL_LOG_ENABLE    1
+
 static const char *TAG = "RECORD";
 
 // ================= 型別定義 =================
@@ -94,6 +111,8 @@ typedef struct {
 
 // ================= 全域變數 =================
 static i2s_chan_handle_t rx_handle  = NULL;
+static bool              g_i2s_enabled = false;
+static int64_t           g_init_us = 0;          // audio_record_init() 時間，開機延遲用
 
 static QueueHandle_t q_free_blocks = NULL;
 static QueueHandle_t q_full_blocks = NULL;
@@ -272,15 +291,22 @@ static esp_err_t i2s_init(void)
     };
     ESP_RETURN_ON_ERROR(i2s_channel_register_event_callback(rx_handle, &cbs, NULL),
                         TAG, "register cb failed");
+#if MIC_CLOCK_ALWAYS_ON
     ESP_RETURN_ON_ERROR(i2s_channel_enable(rx_handle),
                         TAG, "i2s_channel_enable failed");
+    g_i2s_enabled = true;
+#endif
+    // 否則 channel 保持 disabled，錄音時才由 audio_record_once() enable
     return ESP_OK;
 }
 
 static void i2s_deinit(void)
 {
     if (rx_handle) {
-        i2s_channel_disable(rx_handle);
+        if (g_i2s_enabled) {
+            i2s_channel_disable(rx_handle);
+            g_i2s_enabled = false;
+        }
         i2s_del_channel(rx_handle);
         rx_handle = NULL;
     }
@@ -324,6 +350,15 @@ static void capture_task(void *arg)
     size_t total_samples_captured = 0;
     size_t bytes_read            = 0;
 
+#if !MIC_CLOCK_ALWAYS_ON
+    // 麥克風剛恢復時脈，啟動期間輸出無效，丟棄（不計入錄音長度）
+    const int64_t startup_end_us = esp_timer_get_time() +
+                                   (int64_t)MIC_STARTUP_DISCARD_MS * 1000;
+    while (esp_timer_get_time() < startup_end_us) {
+        i2s_channel_read(rx_handle, g_i2s_read_buffer, I2S_READ_BYTES, &bytes_read, 100);
+    }
+#endif
+
     // [+] 暖身：丟棄 DMA pipeline 中的殘留資料，避免開頭有雜音
     for (int flush = 0; flush < I2S_FLUSH_READS; flush++) {
         i2s_channel_read(rx_handle, g_i2s_read_buffer, I2S_READ_BYTES, &bytes_read, 100);
@@ -337,6 +372,14 @@ static void capture_task(void *arg)
     gpio_set_level(DBG_REC_PIN, 1);
     int64_t t0 = esp_timer_get_time();
     ESP_LOGI(TAG, "capture_task start, target=%u samples", (unsigned)target_samples);
+
+#if MIC_LEVEL_LOG_ENABLE
+    int64_t  level_sum = 0;
+    int16_t  level_min = INT16_MAX;
+    int16_t  level_max = INT16_MIN;
+    uint32_t level_count = 0;
+    uint32_t level_clipped = 0;
+#endif
 
     while (total_samples_captured < target_samples) {
         esp_err_t ret = i2s_channel_read(rx_handle,
@@ -355,6 +398,26 @@ static void capture_task(void *arg)
             int16_t pcm = (int16_t)(g_i2s_read_buffer[i] >> PCM_SHIFT_BITS);
             blk->samples[blk->sample_count++] = pcm;
             total_samples_captured++;
+
+#if MIC_LEVEL_LOG_ENABLE
+            level_sum += pcm;
+            if (pcm < level_min) { level_min = pcm; }
+            if (pcm > level_max) { level_max = pcm; }
+            const int32_t gained = (int32_t)pcm * PCM_GAIN;
+            if (gained > INT16_MAX || gained < INT16_MIN) { level_clipped++; }
+            if (++level_count >= SAMPLE_RATE) {
+                ESP_LOGI(TAG, "level %us: mean=%d min=%d max=%d clipped=%u/%u",
+                         (unsigned)(total_samples_captured / SAMPLE_RATE),
+                         (int)(level_sum / (int64_t)level_count),
+                         (int)level_min, (int)level_max,
+                         (unsigned)level_clipped, (unsigned)level_count);
+                level_sum = 0;
+                level_min = INT16_MAX;
+                level_max = INT16_MIN;
+                level_count = 0;
+                level_clipped = 0;
+            }
+#endif
 
             if (blk->sample_count >= AUDIO_BLOCK_SAMPLES) {
                 xQueueSend(q_full_blocks, &blk, portMAX_DELAY);
@@ -507,6 +570,7 @@ esp_err_t audio_record_init(void)
     }
     ESP_LOGI(TAG, "I2S initialized");
 
+    g_init_us = esp_timer_get_time();
     g_initialized = true;
     return ESP_OK;
 }
@@ -531,6 +595,15 @@ esp_err_t audio_record_once(audio_record_result_t *result)
     g_requesting_task = xTaskGetCurrentTaskHandle();
     ulTaskNotifyTake(pdTRUE, 0);
     xSemaphoreTake(g_writer_ready_sem, 0);
+
+    // 開機延遲：在取檔名時間之前等待，檔名才會對應實際開始錄音的時間
+    const int64_t boot_ready_us = g_init_us + (int64_t)MIC_BOOT_DELAY_MS * 1000;
+    const int64_t now_us = esp_timer_get_time();
+    if (now_us < boot_ready_us) {
+        const uint32_t wait_ms = (uint32_t)((boot_ready_us - now_us + 999) / 1000);
+        ESP_LOGI(TAG, "Boot delay: waiting %u ms before first recording", (unsigned)wait_ms);
+        vTaskDelay(pdMS_TO_TICKS(wait_ms) + 1);
+    }
 
     overflow_count = 0;
     capture_done = false;
@@ -574,11 +647,17 @@ esp_err_t audio_record_once(audio_record_result_t *result)
         goto cleanup_pipeline;
     }
 
-    ok = xTaskCreatePinnedToCore(
-        capture_task, "cap_task", 4096, NULL, 10, &g_capture_task, 1);
-    if (ok != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create capture_task");
-        g_record_error = ESP_ERR_NO_MEM;
+    // MIC_CLOCK_ALWAYS_ON 時 init 已 enable，這裡不再重複
+    err = g_i2s_enabled ? ESP_OK : i2s_channel_enable(rx_handle);
+    if (err == ESP_OK) {
+        g_i2s_enabled = true;
+        ok = xTaskCreatePinnedToCore(
+            capture_task, "cap_task", 4096, NULL, 10, &g_capture_task, 1);
+    }
+    if (err != ESP_OK || ok != pdPASS) {
+        ESP_LOGE(TAG, "Failed to start capture: %s",
+                 err != ESP_OK ? esp_err_to_name(err) : "task create failed");
+        g_record_error = err != ESP_OK ? err : ESP_ERR_NO_MEM;
         audio_block_t *sentinel = NULL;
         xQueueSend(q_full_blocks, &sentinel, portMAX_DELAY);
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
@@ -588,6 +667,16 @@ esp_err_t audio_record_once(audio_record_result_t *result)
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
 cleanup_pipeline:
+    // writer 收到 sentinel 時 capture_task 已讀完最後一筆，可安全停時脈
+    if (g_i2s_enabled && !MIC_CLOCK_ALWAYS_ON) {
+        esp_err_t disable_err = i2s_channel_disable(rx_handle);
+        if (disable_err != ESP_OK) {
+            ESP_LOGW(TAG, "i2s_channel_disable failed: %s",
+                     esp_err_to_name(disable_err));
+        } else {
+            g_i2s_enabled = false;
+        }
+    }
     audio_pipeline_deinit();
 
 finish:

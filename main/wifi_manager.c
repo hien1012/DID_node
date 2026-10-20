@@ -92,6 +92,10 @@ esp_err_t wifi_manager_init(void)
     if (err == ESP_OK) {
         err = esp_wifi_start();
     }
+    if (err == ESP_OK) {
+        /* 預設 WIFI_PS_MIN_MODEM 會讓上傳吞吐量大幅下降；USB 供電不需省電 */
+        err = esp_wifi_set_ps(WIFI_PS_NONE);
+    }
     if (err != ESP_OK) {
         return err;
     }

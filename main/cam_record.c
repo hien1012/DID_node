@@ -55,6 +55,7 @@
 /* ESP-IDF 硬體驅動與周邊控制 */
 #include "esp_camera.h"         /* 官方相機驅動介面 (相機初始化、擷取影格) */
 #include "cam_hal.h"            /* 停止/恢復 VSYNC 與 I2S DMA 擷取 */
+#include "driver/ledc.h"        /* 暫停/恢復 XCLK (LEDC) 輸出 */
 #include "esp_check.h"          /* ESP-IDF 錯誤檢查巨集 (ESP_RETURN_ON_ERROR) */
 #include "esp_err.h"            /* ESP 錯誤碼型別定義 (esp_err_t) */
 #include "esp_heap_caps.h"      /* 記憶體堆積能力分配器 (指定內部 SRAM、DMA、PSRAM) */
@@ -93,7 +94,7 @@
  * 若感測器已有自帶震盪器，ESP32 絕不可再由內部輸出 XCLK，否則兩組時脈訊號會互相打架短路。
  * 反之，OV7670/OV7725 模組通常需要由 ESP32 的內部定時器產生 16 MHz XCLK 供給它。
  */
-#define USE_OV2640_ONBOARD_XVCLK 0                          /* 0: 由 ESP32 產生 16MHz XCLK; 1: 使用 OV2640 板載 12MHz 時脈 */
+#define USE_OV2640_ONBOARD_XVCLK 1                          /* 0: 由 ESP32 產生 16MHz XCLK; 1: 使用 OV2640 板載 12MHz 時脈 */
 #define ESP32_CAMERA_XCLK_HZ     16000000U                  /* ESP32 輸出的 XCLK 時脈頻率：16 MHz */
 #define OV2640_ONBOARD_XVCLK_HZ  12000000U                  /* OV2640 外部板載震盪器頻率：12 MHz */
 #define OV2640_HAL_XCLK_HINT_HZ  20000000U                  /* 提供給相機底層驅動的時脈提示值 (設定超過 10MHz 會影響 I2S 採樣模式選擇) */
@@ -109,12 +110,14 @@
 /* --- 錄影與影格率驗證參數 --- */
 #define CAMERA_WARMUP_FRAMES    10U                         /* 開機暖機幀數：丟棄前 10 幀，讓感測器自動曝光/白平衡穩定 */
 #define CAMERA_FRAME_BUFFERS    8U                          /* 配置於外部 PSRAM 的影格緩衝區數量 (總計 8 * 300KB ≈ 2.4MB) */
-#define TEST_DURATION_SECONDS   10U                         /* 開機硬體資格測試時間：10 秒 */
+#define TEST_DURATION_SECONDS   5U                         /* 開機硬體資格測試時間：10 秒 */
 #define TARGET_FPS              CAM_TARGET_FPS              /* 目標影格率：每秒 5 幀 */
 #define EXPECTED_FRAME_COUNT     (TEST_DURATION_SECONDS * TARGET_FPS) /* 10 秒預期應收到的影格數：50 幀 */
 #define EXPECTED_FRAME_PERIOD_US (1000000LL / TARGET_FPS)   /* 每一幀的理想間隔微秒數：1,000,000 / 5 = 200,000 us (200 毫秒) */
 #define GAP_THRESHOLD_US         (EXPECTED_FRAME_PERIOD_US * 3LL / 2LL) /* 掉幀判定門檻：間隔超過 1.5 週期 (300 毫秒) 即視為掉幀事件 */
 #define FPS_TOLERANCE_MILLI      250U                       /* 影格率容許誤差：±0.25 FPS (4.75 ~ 5.25 FPS 視為合格) */
+/* XCLK 停止後重新輸出，感測器內部時序需要約兩幀才穩定；曝光已在開機鎖定，不必重新暖機 */
+#define CAMERA_XCLK_SETTLE_MS    500U
 
 /* --- SD 卡寫入緩衝參數 --- */
 #define SD_DMA_BUFFER_PREFERRED_BYTES (32U * 1024U)         /* SD 寫入 DMA 暫存區偏好大小：32 KB (位於內部高速 SRAM) */
@@ -369,7 +372,7 @@ typedef struct {
 /* 結構體與資料長度二度驗證 (確保二進位格式完全對齊 SD 扇區) */
 _Static_assert(IMAGE_PIXELS == 307200U,
                "VGA GRAY8 must contain 307200 bytes");
-_Static_assert(EXPECTED_FRAME_COUNT == 50U,
+_Static_assert(EXPECTED_FRAME_COUNT == 25U,
                "10 seconds at 5 fps must contain about 50 frames");
 _Static_assert(OV7725_CALCULATED_FPS == TARGET_FPS,
                "OV7725 clock model must match TARGET_FPS");
@@ -391,6 +394,8 @@ static uint8_t *s_sd_dma_buffer = NULL;      /* 位於內部 SRAM 的 32KB DMA �
 static size_t s_sd_dma_buffer_bytes = 0;     /* 實際成功分配的 DMA 暫存區大小 (位元組) */
 static bool s_initialized = false;
 static bool s_camera_paused = false;
+static bool s_xclk_stopped = false;          /* XCLK (LEDC) 是否已在暫停期間停止輸出 */
+static int64_t s_xclk_started_us = 0;        /* 最近一次恢復 XCLK 的時間，用來等待感測器穩定 */
 
 /* 靜態記憶體配置的 FreeRTOS queue 用來儲存frame buffer的地址 (避免動態 malloc 造成記憶體碎裂) */
 static StaticQueue_t s_ready_queue_control;
@@ -447,6 +452,51 @@ static camera_config_t s_camera_config = {
     .fb_location = CAMERA_FB_IN_PSRAM,
     .grab_mode = CAMERA_GRAB_LATEST,        /* 閒置等待觸發時，只保留最新完成的一幀，其餘自動丟棄 */
 };
+
+/* ============================================================================
+ * XCLK 開關 (錄影以外的時間停止 16 MHz 時脈，減少上傳期間對 Wi-Fi 的干擾與耗電)
+ * ============================================================================ */
+
+/* esp32-camera 的 xclk.c 固定使用 LEDC_LOW_SPEED_MODE。
+ * 停止期間不可存取 SCCB：OV7670 的 SCCB 需要 XCLK 才能運作。 */
+static esp_err_t xclk_stop(void)
+{
+    if (s_camera_config.pin_xclk < 0 || s_xclk_stopped) {
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_ERROR(ledc_stop(LEDC_LOW_SPEED_MODE, s_camera_config.ledc_channel, 0),
+                        TAG, "XCLK output stop failed");
+    ESP_RETURN_ON_ERROR(ledc_timer_pause(LEDC_LOW_SPEED_MODE, s_camera_config.ledc_timer),
+                        TAG, "XCLK timer pause failed");
+    s_xclk_stopped = true;
+    return ESP_OK;
+}
+
+static esp_err_t xclk_start(void)
+{
+    if (s_camera_config.pin_xclk < 0 || !s_xclk_stopped) {
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_ERROR(ledc_timer_resume(LEDC_LOW_SPEED_MODE, s_camera_config.ledc_timer),
+                        TAG, "XCLK timer resume failed");
+    /* ledc_update_duty 會重新開啟 ledc_stop 關掉的通道輸出 */
+    ESP_RETURN_ON_ERROR(ledc_update_duty(LEDC_LOW_SPEED_MODE, s_camera_config.ledc_channel),
+                        TAG, "XCLK output restart failed");
+    s_xclk_stopped = false;
+    s_xclk_started_us = esp_timer_get_time();
+    return ESP_OK;
+}
+
+/* 只等待尚未經過的部分；呼叫端先恢復 XCLK 再做 SD 預配置，通常不必再等。 */
+static void xclk_wait_settled(void)
+{
+    const int64_t settled_us = s_xclk_started_us + (int64_t)CAMERA_XCLK_SETTLE_MS * 1000LL;
+    const int64_t now_us = esp_timer_get_time();
+    if (now_us < settled_us) {
+        const uint32_t remaining_ms = (uint32_t)((settled_us - now_us + 999LL) / 1000LL);
+        vTaskDelay(pdMS_TO_TICKS(remaining_ms) + 1U);
+    }
+}
 
 /* ============================================================================
  * 感測器底層暫存器調校函式 (Sensor Register Configuration)
@@ -1481,6 +1531,13 @@ esp_err_t cam_record_once(cam_record_result_t *result)
         return err;
     }
 
+    /* 先恢復 XCLK，讓感測器穩定時間與下面的 SD 預配置重疊 */
+    err = xclk_start();
+    if (err != ESP_OK) {
+        result->error = err;
+        return err;
+    }
+
     /* 2. 在 cam_undone 建立 UTC+8 命名的 RAW，並預先配置空間 */
     err = cam_storage_begin_recording(
         &s_recording.storage, result->recorded_at_epoch,
@@ -1490,7 +1547,8 @@ esp_err_t cam_record_once(cam_record_result_t *result)
         return err;
     }
 
-    /* 3. 設定本次錄影時間參數 */
+    /* 3. 設定本次錄影時間參數（感測器穩定後才開始計時，錄影長度不被吃掉） */
+    xclk_wait_settled();
     s_recording.fd = s_recording.storage.fd;
     s_recording.stats.capture_result = ESP_OK;
     s_recording.stats.writer_result = ESP_OK;
@@ -1705,15 +1763,18 @@ esp_err_t cam_record_pause(void)
         return ESP_ERR_INVALID_STATE;
     }
     if (s_camera_paused) {
-        return ESP_OK;
+        /* 錄影在 resume 前失敗時 XCLK 可能已恢復，這裡一併停掉 */
+        return xclk_stop();
     }
 
     /* 錄影兩個任務皆已結束後，等待 cam_task 清除未完成的 DMA/影格事件。 */
     esp_err_t err = cam_stop();
-    if (err == ESP_OK) {
-        s_camera_paused = true;
+    if (err != ESP_OK) {
+        return err;
     }
-    return err;
+    s_camera_paused = true;
+    /* DMA 已停，才停 XCLK，避免 cam_task 收到半幀 */
+    return xclk_stop();
 }
 
 esp_err_t cam_record_resume(void)
@@ -1722,6 +1783,8 @@ esp_err_t cam_record_resume(void)
         return ESP_ERR_INVALID_STATE;
     }
     if (s_camera_paused) {
+        ESP_RETURN_ON_ERROR(xclk_start(), TAG, "XCLK restart failed");
+        xclk_wait_settled();
         /* cam_start 只開 VSYNC；下一個 VSYNC 由 cam_task 呼叫 ll_cam_start。 */
         cam_start();
         s_camera_paused = false;
@@ -1736,6 +1799,11 @@ void cam_record_deinit(void)
     }
     release_record_pipeline();
     cam_storage_deinit();
+    if (s_xclk_stopped) {
+        /* 讓之後重新 init 時 LEDC timer 不停在暫停狀態 */
+        (void)ledc_timer_resume(LEDC_LOW_SPEED_MODE, s_camera_config.ledc_timer);
+        s_xclk_stopped = false;
+    }
     esp_camera_deinit();
     s_initialized = false;
     s_camera_paused = false;

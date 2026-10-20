@@ -31,6 +31,10 @@ build/
 flasher_args.json # Generated in build directory
 sdkconfig.old
 sdkconfig
+sdkconfig.audio
+sdkconfig.audio.old
+sdkconfig.camera
+sdkconfig.camera.old
 
 # ESP-IDF dependencies
 # For older versions or manual component management
@@ -88,3 +92,4 @@ managed_components/
 # components/ is tracked on purpose: components/esp32-camera is a locally
 # modified driver (pause/resume) that every machine needs to build.
 sheet.png
+/server_mix_data/

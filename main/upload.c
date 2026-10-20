@@ -14,7 +14,7 @@
 #include "storage.h"
 #include "wifi_manager.h"
 
-#define UPLOAD_BUFFER_SIZE 4096
+#define UPLOAD_BUFFER_SIZE (16 * 1024)
 #define ACK_BUFFER_SIZE    512
 #define CAPTURE_ID_SIZE    64
 
@@ -80,6 +80,7 @@ static esp_err_t upload_one_file(const char *path, time_t recorded_at_epoch,
     esp_http_client_set_header(client, "Content-Type", "audio/wav");
     esp_http_client_set_header(client, "X-Device-ID", device_id);
     esp_http_client_set_header(client, "X-Capture-ID", capture_id);
+    esp_http_client_set_header(client, "X-Session-ID", capture_id);
     esp_http_client_set_header(client, "X-Recorded-At", recorded_at);
     esp_http_client_set_header(client, "X-File-Size", file_size_text);
 
