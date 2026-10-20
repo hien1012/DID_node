@@ -22,6 +22,7 @@
 #include "rec_session.h"
 #include "status_led.h"
 #include "time_sync.h"
+#include "timing_trace.h"
 #include "wifi_manager.h"
 
 static const char *TAG = "NODE_APP";
@@ -143,7 +144,9 @@ static void upload_pass(time_t deadline_epoch)
     node_health_set_state(NODE_STATE_UPLOADING);
     net_bench_log_heap("before upload");
     node_upload_summary_t summary = {0};
+    timing_trace_mark(TT_MARK_UPLOAD_START);
     (void)node_upload_process_pending(deadline_epoch, &summary);
+    timing_trace_mark(TT_MARK_UPLOAD_END);
     node_health_note_upload(&summary);
     net_bench_log_heap("after upload");   /* min = 上傳期間內部 RAM 的最低點 */
     ESP_LOGI(TAG, "Upload pass: ok=%u failed=%u rejected=%u deferred=%s",
@@ -154,6 +157,7 @@ static void upload_pass(time_t deadline_epoch)
     if (wifi_manager_is_connected() && time_sync_from_server() != ESP_OK) {
         ESP_LOGW(TAG, "Clock resync failed; keeping local time");
     }
+    timing_trace_mark(TT_MARK_RESYNC_DONE);
     node_health_set_state(NODE_STATE_IDLE);
 }
 
@@ -241,6 +245,8 @@ void app_main(void)
                  local_start.tm_hour, local_start.tm_min, local_start.tm_sec,
                  (unsigned)APP_RECORD_DURATION_SEC, (unsigned)APP_RECORD_PERIOD_SEC);
         sleep_until(start_epoch, APP_PREPARE_LEAD_MS);
+        timing_trace_begin();
+        timing_trace_mark(TT_MARK_WAKE);
 
         node_health_set_state(NODE_STATE_RECORDING);
         rec_session_result_t result;
@@ -253,5 +259,6 @@ void app_main(void)
 
         upload_pass(start_epoch + (time_t)APP_RECORD_PERIOD_SEC - lead_sec -
                     UPLOAD_GUARD_SEC);
+        timing_trace_print();   /* 本輪結束：一次印出整輪時序 (APP_TIMING_TRACE) */
     }
 }

@@ -30,7 +30,7 @@ CONFIG_FATFS_MAX_LFN=64
 
 CONFIG_CAMERA_CORE1=y
 CONFIG_CAMERA_TASK_STACK_SIZE=4096
-CONFIG_CAMERA_DMA_BUFFER_SIZE_MAX=32768
+CONFIG_CAMERA_DMA_BUFFER_SIZE_MAX=16384
 
 # Upload-oriented network profile: large TX side, small RX side (the node only
 # receives TCP ACKs and short JSON replies). All of these live in internal RAM.

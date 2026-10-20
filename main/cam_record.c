@@ -78,6 +78,7 @@
 
 #include "cam_record.h"
 #include "node_storage.h"
+#include "timing_trace.h"
 
 /* ============================================================================
  * 巨集與常數定義 (Macros and Constants)
@@ -335,6 +336,7 @@ typedef struct {
     camera_fb_t *frame;                 /* 指向官方驅動 PSRAM 中的影格緩衝區指標 */
     uint32_t frame_id;                  /* 本次錄影內的影格流水序號 (0, 1, 2...) */
     int64_t timestamp_us;               /* 該影格採集完成時的系統微秒時戳 */
+    int64_t enqueue_us;                 /* 送進 ready queue 的時間 (timing trace：排隊時間) */
 } ready_frame_t;
 
 /**
@@ -1334,10 +1336,20 @@ static void capture_task(void *argument)
         stats->last_frame_us = timestamp_us;
 
         const uint32_t frame_id = stats->in_window_frames++;
+        if (frame_id == 0U) {
+            timing_trace_mark_at(TT_MARK_CAM_FIRST_FRAME, timestamp_us);
+        }
+        /* timing trace：timestamp = 幀開始 VSYNC，done = 驅動收完整幀，received = fb_get 返回 */
+        const int64_t done_us = cam_get_frame_done_us(frame);
+        if (done_us > 0) {
+            timing_trace_stat(TT_STAT_CAM_READOUT, done_us - timestamp_us, frame_id);
+            timing_trace_stat(TT_STAT_CAM_DELIVER, received_us - done_us, frame_id);
+        }
         const ready_frame_t ready_frame = {
             .frame = frame,
             .frame_id = frame_id,
             .timestamp_us = timestamp_us,
+            .enqueue_us = esp_timer_get_time(),
         };
 
         /* 將影格指標推入 FreeRTOS 佇列 (非阻塞呼叫) */
@@ -1358,6 +1370,7 @@ static void capture_task(void *argument)
 
         /* 成功排隊：此緩衝區所有權暫時轉移給 writer_task */
         stats->enqueued_frames++;
+        timing_trace_stat(TT_STAT_CAM_ENQUEUE, ready_frame.enqueue_us - received_us, frame_id);
         const uint32_t ready = uxQueueMessagesWaiting(s_ready_queue);
         if (ready > stats->peak_ready_slots) {
             stats->peak_ready_slots = ready;               /* 紀錄佇列最高水位 */
@@ -1365,6 +1378,8 @@ static void capture_task(void *argument)
     }
 
     stats->capture_end_us = esp_timer_get_time();
+    timing_trace_mark_at(TT_MARK_CAM_CAPTURE_DONE, stats->capture_end_us);
+    timing_trace_gauge_set(TT_GAUGE_CAM_READY_PEAK, stats->peak_ready_slots);
     xEventGroupSetBits(s_record_events, CAPTURE_DONE_BIT);  /* 通知系統：擷取任務已結束 */
     vTaskDelete(NULL);                                      /* 自我刪除任務 */
 }
@@ -1388,13 +1403,17 @@ static void writer_task(void *argument)
                           pdMS_TO_TICKS(RECORD_QUEUE_WAIT_MS)) == pdTRUE) {
             if (stats->writer_result == ESP_OK) {
                 const int64_t frame_write_start_us = esp_timer_get_time();
-                
+                timing_trace_stat(TT_STAT_CAM_QUEUE_WAIT,
+                                  frame_write_start_us - ready_frame.enqueue_us,
+                                  ready_frame.frame_id);
+
                 /* 呼叫分段寫入函式寫入 SD 卡 */
                 const esp_err_t err = write_frame_to_sd(
                     s_recording.fd, ready_frame.frame->buf,
                     &stats->max_sd_chunk_us);
                 
                 const int64_t frame_write_us = esp_timer_get_time() - frame_write_start_us;
+                timing_trace_stat(TT_STAT_CAM_SD_WRITE, frame_write_us, ready_frame.frame_id);
                 if (frame_write_us > stats->max_sd_frame_us) {
                     stats->max_sd_frame_us = frame_write_us;/* 紀錄單幀最長寫入耗時 */
                 }
@@ -1423,6 +1442,9 @@ static void writer_task(void *argument)
             /* 【關鍵零拷貝節點】：寫入完成後，正式歸還緩衝區供硬體下一輪使用 */
             if (ready_frame.frame != NULL) {
                 esp_camera_fb_return(ready_frame.frame);
+                timing_trace_stat(TT_STAT_CAM_FB_HELD,
+                                  esp_timer_get_time() - ready_frame.timestamp_us,
+                                  ready_frame.frame_id);
             }
             continue;
         }
@@ -1445,6 +1467,7 @@ static void writer_task(void *argument)
     }
 
     stats->writer_end_us = esp_timer_get_time();
+    timing_trace_mark_at(TT_MARK_CAM_WRITER_DONE, stats->writer_end_us);
     xEventGroupSetBits(s_record_events, WRITER_DONE_BIT);   /* 通知系統：寫入任務已結束 */
     vTaskDelete(NULL);                                      /* 自我刪除任務 */
 }
@@ -1505,6 +1528,11 @@ esp_err_t cam_record_start(int64_t trigger_us)
     s_recording.trigger_us = trigger_us;
     s_recording.deadline_us = trigger_us +
                               (int64_t)RECORD_DURATION_SECONDS * 1000000LL;
+
+#if APP_TIMING_TRACE
+    /* 相機仍暫停 (cam_task 閒置)，可安全清空驅動的 DMA 時序統計 */
+    cam_dma_timing_start();
+#endif
 
     /* SD 檔案準備完成後才恢復 VSYNC，避免預配置期間累積舊影格。 */
     esp_err_t err = cam_record_resume();
@@ -1580,6 +1608,26 @@ esp_err_t cam_record_finish(cam_record_result_t *result)
         if (pause_err != ESP_OK) {
             ESP_LOGE(TAG, "Camera stop failed: %s", esp_err_to_name(pause_err));
         }
+#if APP_TIMING_TRACE
+        /* 相機已暫停 (cam_task 閒置)：取出驅動累計的 DMA 時序統計 */
+        cam_dma_timing_t dma_timing;
+        cam_dma_timing_stop(&dma_timing);
+        timing_trace_stat_import(TT_STAT_CAM_DMA_EOF_INTERVAL, dma_timing.eof_interval.count,
+                                 dma_timing.eof_interval.sum_us, dma_timing.eof_interval.min_us,
+                                 dma_timing.eof_interval.max_us);
+        timing_trace_stat_import(TT_STAT_CAM_DMA_EOF_TO_TASK, dma_timing.eof_isr_to_task.count,
+                                 dma_timing.eof_isr_to_task.sum_us, dma_timing.eof_isr_to_task.min_us,
+                                 dma_timing.eof_isr_to_task.max_us);
+        timing_trace_stat_import(TT_STAT_CAM_DMA_COPY, dma_timing.eof_copy.count,
+                                 dma_timing.eof_copy.sum_us, dma_timing.eof_copy.min_us,
+                                 dma_timing.eof_copy.max_us);
+        timing_trace_stat_import(TT_STAT_CAM_DMA_VSYNC_TO_TASK, dma_timing.vsync_isr_to_task.count,
+                                 dma_timing.vsync_isr_to_task.sum_us, dma_timing.vsync_isr_to_task.min_us,
+                                 dma_timing.vsync_isr_to_task.max_us);
+        timing_trace_gauge_set(TT_GAUGE_CAM_DMA_EVENTQ_PEAK, dma_timing.event_queue_peak);
+        timing_trace_gauge_set(TT_GAUGE_CAM_DMA_EVENTQ_SIZE, dma_timing.event_queue_size);
+        timing_trace_gauge_set(TT_GAUGE_CAM_DMA_HALF_BYTES, dma_timing.half_buffer_bytes);
+#endif
 
         /* 7. 輸出完整效能報告與統計日誌 */
         const int64_t timestamp_span_us =

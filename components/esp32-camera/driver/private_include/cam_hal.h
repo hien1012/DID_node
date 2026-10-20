@@ -64,6 +64,33 @@ bool cam_get_available_frames(void);
 void cam_set_psram_mode(bool enable);
 bool cam_get_psram_mode(void);
 
+/*
+ * DMA 層時序統計 (本地修改，debug)。由 cam_task 累計，只在 start 到 stop 之間記錄。
+ * start / stop 只能在相機暫停時呼叫 (cam_task 閒置)，因此不需要鎖。
+ */
+typedef struct {
+    uint32_t count;
+    int64_t sum_us;
+    int64_t min_us;
+    int64_t max_us;
+} cam_timing_stat_t;
+
+typedef struct {
+    cam_timing_stat_t eof_interval;     /* 同一幀內相鄰兩次 EOF 中斷的間隔 (= 填滿一個 half buffer 的時間) */
+    cam_timing_stat_t eof_isr_to_task;  /* EOF 中斷 → cam_task 收到事件 */
+    cam_timing_stat_t eof_copy;         /* cam_task 收到 EOF → 從 DMA buffer 取出 Y 寫進 PSRAM fb 完成 */
+    cam_timing_stat_t vsync_isr_to_task;/* VSYNC 中斷 → cam_task 收到事件 */
+    uint32_t event_queue_peak;          /* cam_task 取事件時 queue 內最多有幾個 (含取出的那個) */
+    uint32_t event_queue_size;          /* event_queue 容量 */
+    uint32_t half_buffer_bytes;         /* 每次 EOF 的資料量 (YUV422，取 Y 前) */
+} cam_dma_timing_t;
+
+void cam_dma_timing_start(void);
+void cam_dma_timing_stop(cam_dma_timing_t *out);
+
+/* fb 收完整幀的時間 (cam_task 處理結尾 VSYNC 時)；fb 不屬於驅動時回傳 0 */
+int64_t cam_get_frame_done_us(const camera_fb_t *fb);
+
 #ifdef __cplusplus
 }
 #endif

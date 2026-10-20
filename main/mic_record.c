@@ -7,7 +7,7 @@
  *
  * 管線：
  *   mic_capture (Core 1, 優先權 7)：I2S DMA 緩衝只有約 256 ms，因此優先權高於相機擷取。
- *   mic_writer  (Core 0, 優先權 5)：套用增益，累積 16 KB 後整塊寫入預先配置好的 WAV。
+ *   mic_writer  (Core 0, 優先權 5)：套用增益，累積 8 KB 後整塊寫入預先配置好的 WAV。
  *   兩者之間有 16 個 1024-sample block (約 1 秒)，吸收 SD 卡寫入延遲。
  */
 #include "mic_record.h"
@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include "esp_check.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -26,6 +27,7 @@
 #include "freertos/task.h"
 
 #include "board_pins.h"
+#include "timing_trace.h"
 
 #if MIC_INTERFACE_I2S
 #include "driver/i2s_std.h"
@@ -54,13 +56,17 @@
 #define READ_SAMPLES            1024U   /* 每次讀取 64 ms */
 #define READ_TIMEOUT_MS         200
 
+/* timing trace：一個 DMA 描述元的資料量 (mono，每個 frame 一個 sample) 與完成時間環形緩衝 */
+#define DMA_DESC_BYTES          ((uint32_t)DMA_FRAME_NUM * RAW_BYTES_PER_SAMPLE)
+#define DMA_TIME_RING           16U     /* > 描述元數 + 每次讀取的描述元數，積壓滿也不會被覆蓋 */
+
 /* PCM 增益倍數 (沿用舊版設定) */
 #define PCM_GAIN                30
 
 /* --- capture -> writer block pool --- */
 #define AUDIO_BLOCK_SAMPLES     1024U
 #define AUDIO_BLOCK_COUNT       16U
-#define WRITE_BUFFER_BYTES      (16U * 1024U)   /* 每次 SD 寫入大小，為 512 的倍數 */
+#define WRITE_BUFFER_BYTES      (8U * 1024U)    /* 每次 SD 寫入大小，為 512 的倍數 (256 ms PCM) */
 
 #define CAPTURE_TASK_STACK_BYTES 4096U
 #define WRITER_TASK_STACK_BYTES  4096U
@@ -99,9 +105,14 @@ typedef struct __attribute__((packed)) {
 } wav_header_t;
 
 _Static_assert(sizeof(wav_header_t) == WAV_HEADER_BYTES, "WAV header is 44 bytes");
+_Static_assert(((READ_SAMPLES * RAW_BYTES_PER_SAMPLE) % DMA_DESC_BYTES) == 0U,
+               "Each read must consume whole DMA descriptors (timing trace)");
+_Static_assert(DMA_TIME_RING >= DMA_DESC_NUM + (READ_SAMPLES * RAW_BYTES_PER_SAMPLE) / DMA_DESC_BYTES,
+               "DMA time ring must cover a full backlog plus one read");
 
 typedef struct {
     size_t  sample_count;
+    int64_t queued_us;      /* 填滿送進 full queue 的時間 (timing trace：排隊時間) */
     int16_t samples[AUDIO_BLOCK_SAMPLES];
 } audio_block_t;
 
@@ -112,6 +123,7 @@ typedef struct {
     int64_t writer_end_us;
     uint32_t samples_captured;
     uint32_t samples_written;
+    uint32_t overflows_recording;   /* 收滿 sample 那一刻的 overflow 數 (之後的是時脈停止前的空窗) */
     esp_err_t capture_result;
     esp_err_t writer_result;
     esp_err_t start_error;
@@ -125,6 +137,15 @@ static bool s_initialized = false;
 static volatile uint32_t s_overflow_count = 0;
 static mic_session_t s_session;
 
+/*
+ * timing trace：I2S DMA 描述元完成時間。序號從時脈啟動起算 (i2s_channel_enable 會清空 driver 的 msg queue)。
+ * s_dma_done_seq / s_dma_done_us / s_dma_drop_count 由中斷寫入；s_dma_bytes_read 只有 mic_capture 寫。
+ */
+static volatile uint32_t s_dma_done_seq = 0;
+static volatile uint32_t s_dma_drop_count = 0;
+static volatile int64_t s_dma_done_us[DMA_TIME_RING];
+static uint32_t s_dma_bytes_read = 0;
+
 static StaticQueue_t s_free_queue_control;
 static StaticQueue_t s_full_queue_control;
 static uint8_t s_free_queue_storage[AUDIO_BLOCK_COUNT * sizeof(audio_block_t *)];
@@ -134,7 +155,7 @@ static QueueHandle_t s_full_blocks = NULL;
 static StaticEventGroup_t s_events_control;
 static EventGroupHandle_t s_events = NULL;
 
-static audio_block_t s_blocks[AUDIO_BLOCK_COUNT];
+static audio_block_t *s_blocks = NULL;     /* PSRAM：只有 CPU 存取，不走 DMA，省下內部 RAM */
 static WORD_ALIGNED_ATTR uint8_t s_read_buffer[READ_SAMPLES * RAW_BYTES_PER_SAMPLE];
 static WORD_ALIGNED_ATTR uint8_t s_write_buffer[WRITE_BUFFER_BYTES];
 
@@ -187,6 +208,19 @@ static bool IRAM_ATTR i2s_rx_overflow_callback(i2s_chan_handle_t handle,
 {
     (void)handle; (void)event; (void)user_ctx;
     s_overflow_count++;
+    s_dma_drop_count++;     /* driver 丟掉最舊的描述元 (timing trace 對序號用) */
+    return false;
+}
+
+/* 每個 DMA 描述元填滿時呼叫 (每 32 ms)：記下完成時間 */
+static bool IRAM_ATTR i2s_rx_done_callback(i2s_chan_handle_t handle,
+                                           i2s_event_data_t *event,
+                                           void *user_ctx)
+{
+    (void)handle; (void)event; (void)user_ctx;
+    const uint32_t seq = s_dma_done_seq;
+    s_dma_done_us[seq % DMA_TIME_RING] = esp_timer_get_time();
+    s_dma_done_seq = seq + 1U;
     return false;
 }
 
@@ -241,7 +275,7 @@ static esp_err_t i2s_init(void)
                         TAG, "i2s_channel_init_pdm_rx_mode failed");
 #endif
     const i2s_event_callbacks_t cbs = {
-        .on_recv       = NULL,
+        .on_recv       = i2s_rx_done_callback,
         .on_recv_q_ovf = i2s_rx_overflow_callback,
         .on_sent       = NULL,
         .on_send_q_ovf = NULL,
@@ -263,6 +297,12 @@ static esp_err_t set_clock_enabled(bool enable)
     static bool s_clock_enabled = false;
     if (enable == s_clock_enabled) {
         return ESP_OK;
+    }
+    if (enable) {
+        /* 通道停止中、沒有中斷：重設 timing trace 的描述元序號 */
+        s_dma_done_seq = 0;
+        s_dma_drop_count = 0;
+        s_dma_bytes_read = 0;
     }
     esp_err_t err = enable ? i2s_channel_enable(s_rx_handle)
                            : i2s_channel_disable(s_rx_handle);
@@ -287,6 +327,41 @@ static inline int16_t raw_to_pcm(size_t index)
 #endif
 }
 
+/*
+ * timing trace：一次 i2s_channel_read 返回後統計 DMA 層。
+ * driver 的 msg queue 依完成順序存放描述元；被讀走 (pop) 或 overflow 丟棄 (drop) 都從最舊的開始，
+ * 所以「第 k 個被移出的描述元」就是「第 k 個完成的描述元」。
+ * 這次讀到的描述元序號 = [移出總數(讀之前), 移出總數(讀之後) − 1]。
+ * overflow 與讀取交錯時序號會差一兩個，只在 overflow 期間不準。
+ */
+static void trace_dma_read(uint32_t popped_before, int64_t returned_us, uint32_t read_index)
+{
+    const uint32_t done = s_dma_done_seq;
+    const uint32_t drops = s_dma_drop_count;
+    const uint32_t removed = s_dma_bytes_read / DMA_DESC_BYTES + drops;
+    if (removed == 0U || removed > done) {
+        return;
+    }
+    const uint32_t last = removed - 1U;
+    if (done - last > DMA_TIME_RING) {
+        return;     /* 完成時間已被環形緩衝覆蓋 */
+    }
+    /* 這次讀取交出的最後一個描述元：完成 → 交給 mic_capture 的延遲。
+     * read 有等待時約等於中斷到 task 的喚醒延遲；有積壓時就是資料在 DMA 裡放了多久 */
+    timing_trace_stat(TT_STAT_MIC_DMA_TO_READ,
+                      returned_us - s_dma_done_us[last % DMA_TIME_RING], read_index);
+    for (uint32_t k = popped_before + drops; k <= last; ++k) {
+        if (k == 0U || done - (k - 1U) > DMA_TIME_RING) {
+            continue;
+        }
+        timing_trace_stat(TT_STAT_MIC_DMA_INTERVAL,
+                          s_dma_done_us[k % DMA_TIME_RING] -
+                              s_dma_done_us[(k - 1U) % DMA_TIME_RING],
+                          k);
+    }
+    timing_trace_gauge_max(TT_GAUGE_MIC_DMA_BACKLOG_PEAK, done - removed);
+}
+
 /* ==========================================================
  *  Capture Task
  * ========================================================== */
@@ -295,6 +370,8 @@ static void capture_task(void *arg)
     (void)arg;
     size_t bytes_read = 0;
     audio_block_t *blk = NULL;
+    uint32_t read_index = 0;    /* timing trace：觸發點後第幾次讀取 */
+    uint32_t block_index = 0;   /* timing trace：觸發點後第幾個 block */
 
     /* 觸發點之前持續讀取並丟棄，讓 DMA 中只剩觸發點之後的資料 */
     int64_t now_us = esp_timer_get_time();
@@ -306,40 +383,64 @@ static void capture_task(void *arg)
             s_session.capture_result = err;
             goto finish;
         }
+        s_dma_bytes_read += (uint32_t)bytes_read;
         now_us = esp_timer_get_time();
     }
     s_overflow_count = 0;
     s_session.first_sample_us = now_us;
+    timing_trace_mark_at(TT_MARK_MIC_FIRST_SAMPLE, now_us);
 
     xQueueReceive(s_free_blocks, &blk, portMAX_DELAY);
     blk->sample_count = 0;
 
     while (s_session.samples_captured < MIC_TARGET_SAMPLES) {
+        const uint32_t popped_before = s_dma_bytes_read / DMA_DESC_BYTES;
+        const int64_t read_start_us = esp_timer_get_time();
         esp_err_t err = i2s_channel_read(s_rx_handle, s_read_buffer,
                                          sizeof(s_read_buffer), &bytes_read,
                                          READ_TIMEOUT_MS);
+        const int64_t read_done_us = esp_timer_get_time();
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "i2s_channel_read failed: %s", esp_err_to_name(err));
             s_session.capture_result = err;
             break;
         }
+        s_dma_bytes_read += (uint32_t)bytes_read;
+        trace_dma_read(popped_before, read_done_us, read_index);
+        timing_trace_stat(TT_STAT_MIC_READ_BLOCKED, read_done_us - read_start_us, read_index);
 
+        int64_t free_wait_us = 0;   /* 這次轉換中等空 block 的時間，從 convert 扣掉 */
         const size_t count = bytes_read / RAW_BYTES_PER_SAMPLE;
         for (size_t i = 0; i < count &&
                            s_session.samples_captured < MIC_TARGET_SAMPLES; ++i) {
             blk->samples[blk->sample_count++] = raw_to_pcm(i);
             s_session.samples_captured++;
             if (blk->sample_count >= AUDIO_BLOCK_SAMPLES) {
+                blk->queued_us = esp_timer_get_time();
                 xQueueSend(s_full_blocks, &blk, portMAX_DELAY);
+                timing_trace_gauge_max(TT_GAUGE_MIC_FULLQ_PEAK,
+                                       (uint32_t)uxQueueMessagesWaiting(s_full_blocks));
+                const int64_t wait_start_us = esp_timer_get_time();
                 xQueueReceive(s_free_blocks, &blk, portMAX_DELAY);
+                const int64_t waited_us = esp_timer_get_time() - wait_start_us;
+                free_wait_us += waited_us;
+                timing_trace_stat(TT_STAT_MIC_FREE_WAIT, waited_us, block_index);
+                block_index++;
                 blk->sample_count = 0;
             }
         }
+        timing_trace_stat(TT_STAT_MIC_CONVERT,
+                          esp_timer_get_time() - read_done_us - free_wait_us, read_index);
+        read_index++;
     }
 
     if (blk && blk->sample_count > 0) {
+        blk->queued_us = esp_timer_get_time();
         xQueueSend(s_full_blocks, &blk, portMAX_DELAY);
     }
+    /* 收滿：之後到 finish 停止時脈前沒有人讀 I2S，這段的 overflow 不影響檔案 */
+    s_session.overflows_recording = s_overflow_count;
+    timing_trace_mark(TT_MARK_MIC_CAPTURE_DONE);
 
 finish:
     blk = NULL;     /* sentinel：通知 writer_task 結束 */
@@ -361,6 +462,8 @@ static void writer_task(void *arg)
     fill_wav_header(&hdr, 0);
     memcpy(s_write_buffer, &hdr, sizeof(hdr));
     size_t fill = sizeof(hdr);
+    uint32_t block_index = 0;   /* timing trace：第幾個 block */
+    uint32_t write_index = 0;   /* timing trace：第幾次 SD 寫入 */
 
     for (;;) {
         audio_block_t *blk = NULL;
@@ -368,6 +471,9 @@ static void writer_task(void *arg)
         if (blk == NULL) {
             break;
         }
+        const int64_t take_us = esp_timer_get_time();
+        timing_trace_stat(TT_STAT_MIC_QUEUE_WAIT, take_us - blk->queued_us, block_index);
+        int64_t sd_us = 0;          /* 這個 block 內 SD 寫入的時間，從 gain 扣掉 */
 
         for (size_t i = 0; i < blk->sample_count; ++i) {
             const int32_t gained = (int32_t)blk->samples[i] * PCM_GAIN;
@@ -377,14 +483,21 @@ static void writer_task(void *arg)
             memcpy(s_write_buffer + fill, &pcm, sizeof(pcm));
             fill += sizeof(pcm);
             if (fill == WRITE_BUFFER_BYTES) {
+                const int64_t write_start_us = esp_timer_get_time();
                 if (s_session.writer_result == ESP_OK &&
                     write_all(fd, s_write_buffer, fill) != ESP_OK) {
                     ESP_LOGE(TAG, "WAV write failed: errno=%d", errno);
                     s_session.writer_result = ESP_FAIL;
                 }
+                const int64_t write_us = esp_timer_get_time() - write_start_us;
+                sd_us += write_us;
+                timing_trace_stat(TT_STAT_MIC_SD_WRITE, write_us, write_index);
+                write_index++;
                 fill = 0;
             }
         }
+        timing_trace_stat(TT_STAT_MIC_GAIN, esp_timer_get_time() - take_us - sd_us, block_index);
+        block_index++;
         s_session.samples_written += (uint32_t)blk->sample_count;
         blk->sample_count = 0;
         xQueueSend(s_free_blocks, &blk, portMAX_DELAY);
@@ -409,6 +522,7 @@ static void writer_task(void *arg)
     }
 
     s_session.writer_end_us = esp_timer_get_time();
+    timing_trace_mark_at(TT_MARK_MIC_WRITER_DONE, s_session.writer_end_us);
     xEventGroupSetBits(s_events, WRITER_DONE_BIT);
     vTaskDelete(NULL);
 }
@@ -428,6 +542,14 @@ esp_err_t mic_record_init(void)
                                        s_full_queue_storage, &s_full_queue_control);
     s_events = xEventGroupCreateStatic(&s_events_control);
     if (!s_free_blocks || !s_full_blocks || !s_events) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    s_blocks = heap_caps_malloc(AUDIO_BLOCK_COUNT * sizeof(audio_block_t),
+                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_blocks == NULL) {
+        ESP_LOGE(TAG, "Audio block pool (%u B) PSRAM allocation failed",
+                 (unsigned)(AUDIO_BLOCK_COUNT * sizeof(audio_block_t)));
         return ESP_ERR_NO_MEM;
     }
 
@@ -570,6 +692,13 @@ esp_err_t mic_record_finish(mic_record_result_t *result)
 
     /* 錄音結束 (兩個任務都已退出)：停止時脈直到下一次錄音 */
     (void)set_clock_enabled(false);
+    if (s_session.started) {
+        /* overflow 拆成兩段：錄音中 (真的掉資料) / 收滿到時脈停止 (沒人讀，不影響檔案) */
+        const uint32_t overflows_total = s_overflow_count;
+        timing_trace_gauge_set(TT_GAUGE_MIC_OVF_RECORDING, s_session.overflows_recording);
+        timing_trace_gauge_set(TT_GAUGE_MIC_OVF_TAIL,
+                               overflows_total - s_session.overflows_recording);
+    }
     s_session.prepared = false;
     s_session.started = false;
     return err;

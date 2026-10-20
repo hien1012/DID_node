@@ -14,6 +14,7 @@ idf_component_register(
         "device_identity.c"
         "status_led.c"
         "net_bench.c"
+        "timing_trace.c"
     INCLUDE_DIRS "."
     REQUIRES
         driver

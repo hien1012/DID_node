@@ -24,6 +24,7 @@
 #include "device_identity.h"
 #include "mic_record.h"
 #include "node_storage.h"
+#include "timing_trace.h"
 #include "wifi_manager.h"
 
 #define UPLOAD_BUFFER_SIZE      (16U * 1024U)
@@ -74,6 +75,8 @@ static StaticQueue_t s_free_queue_storage;
 static StaticQueue_t s_full_queue_storage;
 static uint8_t s_free_queue_items[UPLOAD_BUFFER_COUNT * sizeof(uint8_t)];
 static uint8_t s_full_queue_items[(UPLOAD_BUFFER_COUNT + 1U) * sizeof(upload_chunk_t)];
+
+static uint32_t s_file_index = 0;       /* timing trace：本輪上傳第幾個檔案 */
 
 static time_t s_offsets_epoch = 0;
 static int64_t s_camera_offset_us = 0;
@@ -267,7 +270,9 @@ static esp_err_t send_file(const node_pending_file_t *pending, int *status_out)
     }
     set_media_headers(client, pending);
 
+    const int64_t open_start_us = esp_timer_get_time();
     esp_err_t err = esp_http_client_open(client, (int)file_size);
+    timing_trace_stat(TT_STAT_UP_OPEN, esp_timer_get_time() - open_start_us, s_file_index);
     if (err != ESP_OK) {
         close(fd);
         esp_http_client_cleanup(client);
@@ -332,6 +337,7 @@ static esp_err_t send_file(const node_pending_file_t *pending, int *status_out)
         (void)xQueueSend(s_free_queue, &chunk.index, portMAX_DELAY);
     }
     close(fd);
+    timing_trace_stat(TT_STAT_UP_BODY, esp_timer_get_time() - started_us, s_file_index);
     const int64_t sd_read_us = s_job.sd_read_us;
     const int64_t max_sd_read_us = s_job.max_sd_read_us;
 
@@ -353,6 +359,7 @@ static esp_err_t send_file(const node_pending_file_t *pending, int *status_out)
         }
     }
     const int64_t ack_wait_us = esp_timer_get_time() - ack_start_us;
+    timing_trace_stat(TT_STAT_UP_ACK, ack_wait_us, s_file_index);
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
     *status_out = status;
@@ -390,7 +397,10 @@ static esp_err_t send_file(const node_pending_file_t *pending, int *status_out)
                  (unsigned)file_size, elapsed_us / 1000,
                  (unsigned)(measured / 1000U));
     }
-    return node_storage_delete_uploaded(pending->path);
+    const int64_t delete_start_us = esp_timer_get_time();
+    const esp_err_t delete_err = node_storage_delete_uploaded(pending->path);
+    timing_trace_stat(TT_STAT_UP_DELETE, esp_timer_get_time() - delete_start_us, s_file_index);
+    return delete_err;
 }
 
 /* 每個檔案上傳期間持有共用 I/O 緩衝；send_file 結束時 reader 已停 (收到結束訊息) */
@@ -416,9 +426,11 @@ esp_err_t node_upload_process_pending(time_t deadline_epoch,
     memset(summary, 0, sizeof(*summary));
     summary->last_error = ESP_OK;
 
-    while (true) {
+    for (s_file_index = 0; ; ++s_file_index) {
         node_pending_file_t pending;
+        const int64_t scan_start_us = esp_timer_get_time();
         esp_err_t err = node_storage_get_next_pending(&pending);
+        timing_trace_stat(TT_STAT_UP_SCAN, esp_timer_get_time() - scan_start_us, s_file_index);
         if (err == ESP_ERR_NOT_FOUND) {
             return ESP_OK;
         }

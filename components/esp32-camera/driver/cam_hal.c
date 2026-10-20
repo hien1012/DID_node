@@ -66,6 +66,23 @@ static cam_obj_t *cam_obj = NULL;
 static volatile bool g_psram_dma_mode = CAMERA_PSRAM_DMA_ENABLED;
 static portMUX_TYPE g_psram_dma_lock = portMUX_INITIALIZER_UNLOCKED;
 
+/* DMA 層時序統計 (本地修改，debug)：只有 cam_task 寫入；start/stop 在相機暫停時呼叫 */
+static bool s_timing_enabled = false;
+static cam_dma_timing_t s_timing;
+static int64_t s_last_eof_isr_us = 0;
+
+static void timing_add(cam_timing_stat_t *stat, int64_t us)
+{
+    if (stat->count == 0 || us < stat->min_us) {
+        stat->min_us = us;
+    }
+    if (stat->count == 0 || us > stat->max_us) {
+        stat->max_us = us;
+    }
+    stat->sum_us += us;
+    stat->count++;
+}
+
 /* At top of cam_hal.c – one switch for noisy ISR prints */
 #ifndef CAM_LOG_SPAM_EVERY_FRAME
 #define CAM_LOG_SPAM_EVERY_FRAME 1   /* set to 1 to restore old behaviour */
@@ -251,7 +268,12 @@ static bool cam_start_frame(int * frame_pos)
 
 void IRAM_ATTR ll_cam_send_event(cam_obj_t *cam, cam_event_t cam_event, BaseType_t * HPTaskAwoken)
 {
-    if (xQueueSendFromISR(cam->event_queue, (void *)&cam_event, HPTaskAwoken) != pdTRUE) { //將vsync/eof事件存到queue中。
+    /* esp_timer_get_time 位於 IRAM (esp_timer_impl_get_time 的別名)，可在 ISR 呼叫 */
+    const cam_event_msg_t msg = {
+        .type = cam_event,
+        .isr_us = esp_timer_get_time(),
+    };
+    if (xQueueSendFromISR(cam->event_queue, (void *)&msg, HPTaskAwoken) != pdTRUE) { //將vsync/eof事件存到queue中。
         ll_cam_stop(cam);
         cam->state = CAM_STATE_IDLE;
 #if CAM_LOG_SPAM_EVERY_FRAME
@@ -270,11 +292,23 @@ static void cam_task(void *arg)
     int cnt = 0;
     int frame_pos = 0;
     cam_obj->state = CAM_STATE_IDLE;
-    cam_event_t cam_event = 0;
+    cam_event_msg_t msg = {0};
     xQueueReset(cam_obj->event_queue);
 
     while (1) {
-        xQueueReceive(cam_obj->event_queue, (void *)&cam_event, portMAX_DELAY);
+        xQueueReceive(cam_obj->event_queue, (void *)&msg, portMAX_DELAY);
+        const cam_event_t cam_event = msg.type;
+        /* 時序統計：中斷送出 → 本 task 取到事件的延遲，以及 queue 積壓深度 */
+        const int64_t recv_us = s_timing_enabled ? esp_timer_get_time() : 0;
+        if (s_timing_enabled && cam_event != CAM_PAUSE_EVENT) {
+            const uint32_t pending = (uint32_t)uxQueueMessagesWaiting(cam_obj->event_queue) + 1U;
+            if (pending > s_timing.event_queue_peak) {
+                s_timing.event_queue_peak = pending;
+            }
+            timing_add(cam_event == CAM_VSYNC_EVENT ? &s_timing.vsync_isr_to_task
+                                                    : &s_timing.eof_isr_to_task,
+                       recv_us - msg.isr_us);
+        }
         if (cam_event == CAM_PAUSE_EVENT) {
             /* The caller has disabled VSYNC and DMA. Recycle the partial frame
              * and every completed frame before acknowledging a clean stop. */
@@ -314,7 +348,12 @@ static void cam_task(void *arg)
                 size_t pixels_per_dma = (cam_obj->dma_half_buffer_size * cam_obj->fb_bytes_per_pixel) / (cam_obj->dma_bytes_per_item * cam_obj->in_bytes_per_pixel);
 
                 if (cam_event == CAM_IN_SUC_EOF_EVENT) {                                     // DMA滿了 (3行)
-                    if(!cam_obj->psram_mode){                                                // 非dma psram模式 (非s3系列)
+                    /* 同一幀內相鄰 EOF 的間隔；每幀第一個 EOF 前面是 VSYNC，不算 */
+                    if (s_timing_enabled && cnt > 0) {
+                        timing_add(&s_timing.eof_interval, msg.isr_us - s_last_eof_isr_us);
+                    }
+                    s_last_eof_isr_us = msg.isr_us;
+                    if(!cam_obj->psram_mode){                                               // 非dma psram模式 (非s3系列)
                         if (cam_obj->fb_size < (frame_buffer_event->len + pixels_per_dma)) { // 檢查 frame buffer 是否還有足夠空間
                             //ESP_CAMERA_ETS_PRINTF(DRAM_STR("cam_hal: FB-OVF\r\n"));
                             //printf("frame buffer 不足夠空間\n");
@@ -337,6 +376,9 @@ static void cam_task(void *arg)
                             &frame_buffer_event->buf[frame_buffer_event->len],
                             &cam_obj->dma_buffer[(cnt % cam_obj->dma_half_buffer_cnt) * cam_obj->dma_half_buffer_size],
                             cam_obj->dma_half_buffer_size);
+                        if (s_timing_enabled) {
+                            timing_add(&s_timing.eof_copy, esp_timer_get_time() - recv_us);
+                        }
                     } else {
                         // stop if the next DMA copy would exceed the framebuffer slot
                         // size, since we're called only after the copy occurs
@@ -435,7 +477,8 @@ static void cam_task(void *arg)
                             }
                         }
                         //send frame
-                        if(!cam_obj->frames[frame_pos].en && xQueueSend(cam_obj->frame_buffer_queue, (void *)&frame_buffer_event, 0) != pdTRUE) {
+                        cam_obj->frames[frame_pos].done_us = esp_timer_get_time();
+                        if(!cam_obj->frames[frame_pos].en &&xQueueSend(cam_obj->frame_buffer_queue, (void *)&frame_buffer_event, 0) != pdTRUE) {
                             //pop frame buffer from the queue
                             camera_fb_t * fb2 = NULL;
                             if(xQueueReceive(cam_obj->frame_buffer_queue, &fb2, 0) == pdTRUE) {
@@ -640,7 +683,7 @@ esp_err_t cam_config(const camera_config_t *config, framesize_t frame_size, uint
         queue_size = 5;
     }
     printf("[queue_size = %d]\n", queue_size);
-    cam_obj->event_queue = xQueueCreate(queue_size, sizeof(cam_event_t));
+    cam_obj->event_queue = xQueueCreate(queue_size, sizeof(cam_event_msg_t));
     CAM_CHECK_GOTO(cam_obj->event_queue != NULL, "event_queue create failed", err);
 
     size_t frame_buffer_queue_len = cam_obj->frame_cnt;
@@ -730,7 +773,10 @@ esp_err_t cam_stop(void)
     /* Put the stop command ahead of queued EOF/VSYNC events. The camera task
      * owns its state and frame queues, so only that task may reset them. */
     (void)xSemaphoreTake(cam_obj->pause_ack, 0);
-    cam_event_t command = CAM_PAUSE_EVENT;
+    const cam_event_msg_t command = {
+        .type = CAM_PAUSE_EVENT,
+        .isr_us = 0,
+    };
     const TickType_t timeout = pdMS_TO_TICKS(1000);
     if (xQueueSendToFront(cam_obj->event_queue, &command, timeout) != pdTRUE ||
         xSemaphoreTake(cam_obj->pause_ack, timeout) != pdTRUE) {
@@ -878,4 +924,38 @@ void cam_set_psram_mode(bool enable)
 bool cam_get_psram_mode(void)
 {
     return g_psram_dma_mode;
+}
+
+void cam_dma_timing_start(void)
+{
+    memset(&s_timing, 0, sizeof(s_timing));
+    s_last_eof_isr_us = 0;
+    if (cam_obj != NULL) {
+        s_timing.event_queue_size =
+            (uint32_t)(uxQueueMessagesWaiting(cam_obj->event_queue) +
+                       uxQueueSpacesAvailable(cam_obj->event_queue));
+        s_timing.half_buffer_bytes = cam_obj->dma_half_buffer_size;
+    }
+    s_timing_enabled = true;
+}
+
+void cam_dma_timing_stop(cam_dma_timing_t *out)
+{
+    s_timing_enabled = false;
+    if (out != NULL) {
+        *out = s_timing;
+    }
+}
+
+int64_t cam_get_frame_done_us(const camera_fb_t *fb)
+{
+    if (cam_obj == NULL || fb == NULL) {
+        return 0;
+    }
+    for (int x = 0; x < cam_obj->frame_cnt; x++) {
+        if (&cam_obj->frames[x].fb == fb) {
+            return cam_obj->frames[x].done_us;
+        }
+    }
+    return 0;
 }

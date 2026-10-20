@@ -9,6 +9,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "timing_trace.h"
+
 /* Minimum distance between start() and the trigger, so both capture tasks are
  * running and the camera has resumed before the window opens. */
 #define SESSION_START_MARGIN_US  300000LL
@@ -51,12 +53,15 @@ esp_err_t rec_session_run(time_t start_epoch, rec_session_result_t *result)
         /* 錄影之間 XCLK 是停止的；提早在準備階段恢復，讓感測器在觸發點前穩定。
          * mic 的 I2S 時脈由 mic_record_prepare/finish 自行開關。 */
         (void)cam_record_set_xclk_output(true);
+        timing_trace_mark(TT_MARK_XCLK_ON);
         result->camera_prepare_error = cam_record_prepare(start_epoch);
         camera_prepared = result->camera_prepare_error == ESP_OK;
+        timing_trace_mark(TT_MARK_CAM_PREPARED);
     }
     if (s_mic_ready) {
         result->mic_prepare_error = mic_record_prepare(start_epoch);
         mic_prepared = result->mic_prepare_error == ESP_OK;
+        timing_trace_mark(TT_MARK_MIC_PREPARED);
     }
     ESP_LOGI(TAG, "Prepared in %" PRId64 " ms: camera=%s mic=%s",
              (esp_timer_get_time() - prepare_started_us) / 1000,
@@ -77,22 +82,27 @@ esp_err_t rec_session_run(time_t start_epoch, rec_session_result_t *result)
     if (wait_us > 0) {
         vTaskDelay(pdMS_TO_TICKS(wait_us / 1000));
     }
+    timing_trace_mark(TT_MARK_WAIT_DONE);
+    timing_trace_mark_at(TT_MARK_TRIGGER, trigger_us);
     if (camera_prepared) {
         esp_err_t err = cam_record_start(trigger_us);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Camera start failed: %s", esp_err_to_name(err));
         }
+        timing_trace_mark(TT_MARK_CAM_STARTED);
     }
     if (mic_prepared) {
         esp_err_t err = mic_record_start(trigger_us);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "Mic start failed: %s", esp_err_to_name(err));
         }
+        timing_trace_mark(TT_MARK_MIC_STARTED);
     }
 
     /* 4. 等待兩邊結束，各自檢核後移到 done/ 或 broken/ */
     if (camera_prepared) {
         (void)cam_record_finish(&result->camera);
+        timing_trace_mark(TT_MARK_CAM_FINISHED);
     } else {
         result->camera.error = s_camera_ready ? result->camera_prepare_error
                                               : ESP_ERR_INVALID_STATE;
@@ -100,9 +110,11 @@ esp_err_t rec_session_run(time_t start_epoch, rec_session_result_t *result)
     if (s_camera_ready) {
         /* 相機已暫停：停止 XCLK 直到下一次錄影，避免干擾接下來的上傳 */
         (void)cam_record_set_xclk_output(false);
+        timing_trace_mark(TT_MARK_XCLK_OFF);
     }
     if (mic_prepared) {
         (void)mic_record_finish(&result->mic);
+        timing_trace_mark(TT_MARK_MIC_FINISHED);
     } else {
         result->mic.error = s_mic_ready ? result->mic_prepare_error
                                         : ESP_ERR_INVALID_STATE;

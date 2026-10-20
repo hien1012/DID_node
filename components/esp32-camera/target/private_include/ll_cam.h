@@ -81,6 +81,13 @@ typedef enum {
     CAM_PAUSE_EVENT
 } cam_event_t;
 
+/* event_queue 的元素：事件種類 + ISR 送出時的 esp_timer 時間 (用來量中斷到 cam_task 的延遲)。
+ * CAM_PAUSE_EVENT 由 task 送出，isr_us = 0。 */
+typedef struct {
+    cam_event_t type;
+    int64_t isr_us;
+} cam_event_msg_t;
+
 typedef enum {
     CAM_STATE_IDLE = 0,
     CAM_STATE_READ_BUF = 1,
@@ -92,6 +99,7 @@ typedef struct {
     //for RGB/YUV modes
     lldesc_t *dma;
     size_t fb_offset;
+    int64_t done_us;    /* cam_task 收完整幀 (結尾 VSYNC)、送進 frame_buffer_queue 的時間 */
 } cam_frame_t;
 
 typedef struct {
