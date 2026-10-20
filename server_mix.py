@@ -1,5 +1,5 @@
-
 """Receiving server for the ESP32-S3 camera + microphone node.
+
 Every session produces one GRAY8 RAW video and one WAV recording that share a
 session ID; both are stored side by side:
 
@@ -15,12 +15,25 @@ Endpoints
     GET  /sessions        recent sessions with their video/audio files
     GET  /uploads         recent uploaded files
 
-Run:  python server_mix.py   (listens on 0.0.0.0:5000)
+Every received RAW is checked in the background (the ACK is not delayed):
+per frame row_jump / col_jump as in tools/raw_view.py --stats. A frame whose
+larger jump exceeds the smaller one by FIELD_MIX_JUMP_RATIO (default 1.5) is
+suspect: byte-phase slips give col_jump >> row_jump (gray U/V bands), noisy
+rows give row_jump >> col_jump (streaks); a clean frame is about 1.1. Results
+go to the video_checks table and suspect files print a WARNING line.
+
+Run:  python server_mix.py           (listens on 0.0.0.0:5000)
+      python server_mix.py --sheet   also save a contact sheet of every RAW to
+                                     <date dir>/sheets/<receive time>.png
+Video checks need numpy + opencv-python; without them uploads still work.
 """
 
+import argparse
 import hashlib
+import importlib.util
 import json
 import os
+import queue
 import re
 import sqlite3
 import tempfile
@@ -46,6 +59,12 @@ MAX_UPLOAD_BYTES = 256 * 1024 * 1024
 # (about 1-2 min per session), so this must cover a whole session.
 OFFLINE_AFTER_S = 300
 OFFLINE_CHECK_PERIOD_S = 30
+# Video check (docs/debug_sdcard.md #33-#35): clean frames have col/row jump
+# about 1.1; gray-band frames 1.9-13; streak frames row/col 3+.
+JUMP_RATIO = float(os.environ.get("FIELD_MIX_JUMP_RATIO", "1.5"))
+# Below this both jumps are noise (dark or flat frame): never suspect.
+JUMP_MIN = 1.0
+RAW_VIEW_PATH = Path(__file__).resolve().parent / "tools" / "raw_view.py"
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
@@ -101,6 +120,22 @@ def initialize_database() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_heartbeats_device
                 ON heartbeats(device_id, id);
+            CREATE TABLE IF NOT EXISTS video_checks (
+                capture_id TEXT PRIMARY KEY,
+                device_id TEXT NOT NULL,
+                recorded_at INTEGER NOT NULL,
+                received_at TEXT NOT NULL,
+                checked_at TEXT NOT NULL,
+                frames INTEGER NOT NULL,
+                suspect_frames INTEGER NOT NULL,
+                suspect_list TEXT NOT NULL,
+                max_ratio REAL NOT NULL,
+                median_row_jump REAL NOT NULL,
+                median_col_jump REAL NOT NULL,
+                sheet_path TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_video_checks_device_time
+                ON video_checks(device_id, recorded_at);
             """
         )
 
@@ -257,6 +292,18 @@ def save_upload(
             f"[{received_at}] {media_type:5s} saved: device={common['device_id']} "
             f"session={common['session_id']} bytes={received_size} path={target_path}"
         )
+        if media_type == "video" and not duplicate:
+            video_checker.submit(
+                {
+                    "capture_id": capture_id,
+                    "device_id": common["device_id"],
+                    "recorded_at": common["recorded_at"],
+                    "received_at": received_at,
+                    "path": target_path,
+                    "width": metadata["width"],
+                    "height": metadata["height"],
+                }
+            )
         return jsonify(
             {
                 "status": "ok",
@@ -500,9 +547,127 @@ class OfflineWatch:
                         )
 
 
+def frame_is_suspect(row_jump: float, col_jump: float) -> bool:
+    low, high = sorted((row_jump, col_jump))
+    return high >= JUMP_MIN and high > low * JUMP_RATIO
+
+
+class VideoChecker:
+    """Checks received RAW files on one background thread, so neither the ACK
+    nor the next upload waits for numpy/OpenCV."""
+
+    def __init__(self) -> None:
+        self._queue: queue.Queue = queue.Queue()
+        self._raw_view = None
+        self.save_sheets = False
+
+    def start(self, save_sheets: bool) -> None:
+        try:
+            spec = importlib.util.spec_from_file_location("raw_view", RAW_VIEW_PATH)
+            raw_view = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(raw_view)   # imports numpy and cv2
+        except (ImportError, OSError) as exc:
+            print(f"[{now_text()}] WARNING video check disabled: {exc} "
+                  f"(needs {RAW_VIEW_PATH.name}, numpy and opencv-python)")
+            return
+        self._raw_view = raw_view
+        self.save_sheets = save_sheets
+        threading.Thread(target=self._run, daemon=True).start()
+        print(f"[{now_text()}] video check on: suspect if jump ratio > {JUMP_RATIO}"
+              f"{', contact sheets on' if save_sheets else ''}")
+
+    def submit(self, job: dict) -> None:
+        if self._raw_view is not None:
+            self._queue.put(job)
+
+    def _run(self) -> None:
+        while True:
+            job = self._queue.get()
+            try:
+                self._check(job)
+            except Exception as exc:   # one bad file must not stop the checker
+                print(f"[{now_text()}] WARNING video check failed for "
+                      f"{job['capture_id']}: {exc}")
+
+    def _check(self, job: dict) -> None:
+        raw_view = self._raw_view
+        np = raw_view.np
+        frames = raw_view.load_frames(job["path"], job["width"], job["height"])
+        if len(frames) == 0:
+            return
+
+        # Same numbers as raw_view.py --stats.
+        jumps = []
+        for frame in frames:
+            f = frame.astype(np.int16)
+            jumps.append((float(np.abs(np.diff(f, axis=0)).mean()),
+                          float(np.abs(np.diff(f, axis=1)).mean())))
+        suspect = [index for index, (row_jump, col_jump) in enumerate(jumps)
+                   if frame_is_suspect(row_jump, col_jump)]
+        max_ratio = max(max(r, c) / max(min(r, c), 0.01) for r, c in jumps)
+        median_row = float(np.median([r for r, _ in jumps]))
+        median_col = float(np.median([c for _, c in jumps]))
+
+        sheet_path = None
+        if self.save_sheets:
+            stamp = datetime.fromisoformat(job["received_at"]).strftime("%Y_%m_%d_%H%M%S")
+            sheet_dir = job["path"].parent / "sheets"
+            sheet_dir.mkdir(exist_ok=True)
+            sheet_path = sheet_dir / f"{stamp}.png"
+            counter = 1
+            while sheet_path.exists():
+                sheet_path = sheet_dir / f"{stamp}_{counter}.png"
+                counter += 1
+            raw_view.cv2.imwrite(str(sheet_path), raw_view.contact_sheet(frames))
+
+        with database() as connection:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO video_checks
+                    (capture_id, device_id, recorded_at, received_at, checked_at,
+                     frames, suspect_frames, suspect_list, max_ratio,
+                     median_row_jump, median_col_jump, sheet_path)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job["capture_id"],
+                    job["device_id"],
+                    job["recorded_at"],
+                    job["received_at"],
+                    now_text(),
+                    len(frames),
+                    len(suspect),
+                    json.dumps(suspect),
+                    round(max_ratio, 2),
+                    round(median_row, 2),
+                    round(median_col, 2),
+                    str(sheet_path) if sheet_path else None,
+                ),
+            )
+
+        sheet_note = f" sheet={sheet_path}" if sheet_path else ""
+        if suspect:
+            shown = ",".join(str(index) for index in suspect[:20])
+            more = f",...(+{len(suspect) - 20})" if len(suspect) > 20 else ""
+            print(f"[{now_text()}] WARNING video check {job['capture_id']}: "
+                  f"{len(suspect)}/{len(frames)} suspect frames [{shown}{more}] "
+                  f"max_ratio={max_ratio:.1f} median row/col={median_row:.1f}/{median_col:.1f}"
+                  f"{sheet_note}")
+        else:
+            print(f"[{now_text()}] video check {job['capture_id']}: ok "
+                  f"({len(frames)} frames, max_ratio={max_ratio:.1f}){sheet_note}")
+
+
 offline_watch = OfflineWatch()
+video_checker = VideoChecker()
 initialize_database()
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Receiving server for the DID field node.")
+    parser.add_argument("--sheet", action="store_true",
+                        help="save a contact sheet PNG of every received RAW, "
+                             "named by its receive time, in <date dir>/sheets/")
+    args = parser.parse_args()
     threading.Thread(target=offline_watch.run, daemon=True).start()
+    video_checker.start(save_sheets=args.sheet)
     app.run(host="0.0.0.0", port=5000, threaded=True)

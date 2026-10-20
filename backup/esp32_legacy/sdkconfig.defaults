@@ -1,4 +1,0 @@
-CONFIG_FATFS_LFN_HEAP=y
-CONFIG_FATFS_MAX_LFN=64
-# main task runs Wi-Fi bench / camera stream / HTTP upload
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144

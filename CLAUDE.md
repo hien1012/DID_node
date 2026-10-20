@@ -6,7 +6,7 @@
 - 板子：ESP32-S3-DevKitC-1 v1.0，WROOM-1 N16R8（16 MB flash、8 MB **Octal** PSRAM），杜邦線接線，USB 供電，不休眠。
 - ESP-IDF 5.1.2，esp32-camera 2.1.7（本地修改版）。
 - 規劃與決策：`docs/esp32s3_node_plan.md`；heartbeat 與 Wi-Fi 斷線處理：`docs/heartbeat.md`。
-- 舊 ESP32（TTGO T8）audio/camera 韌體封存於 `backup/esp32_legacy/`（獨立專案，可自行 build；平常不要改）。
+- 舊 ESP32（TTGO T8）audio/camera 韌體在 **`esp32-legacy` 分支**（本機 worktree：`C:\Users\hien\ESP_project\esp32_node`），與本分支平行開發；本分支不再保留副本（2026-10-20 起）。
 
 ## Build（使用者自己 build）
 - **Claude 不要執行 build、flash、monitor**（2026-10-11 起）。改完 code 後告訴使用者改了哪些檔案、哪幾行，由使用者在 VS Code build 並回報 log。
