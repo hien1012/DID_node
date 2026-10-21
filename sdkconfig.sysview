@@ -1,0 +1,34 @@
+CONFIG_APPTRACE_DEST_JTAG=y
+CONFIG_APPTRACE_SV_ENABLE=y
+CONFIG_APPTRACE_SV_DEST_JTAG=y
+CONFIG_APPTRACE_SV_MAX_TASKS=32
+
+# NOTE: keep this file ASCII only. IDF 5.1 kconfgen reads it with the Windows
+# locale codec (cp950), so UTF-8 comments break the cmake configure step.
+
+# Task scheduling only: drop events when the trace buffer is full
+# (SystemView shows an overflow) instead of making tasks wait for JTAG.
+CONFIG_APPTRACE_SV_BUF_WAIT_TMO=0
+
+# Pending buffer (default 0): holds events while both 16 KB TRAX blocks are busy
+# instead of dropping them. Absorbs bursts only, not a sustained overrun.
+# Must stay below 16384: on a block switch it is pumped into the empty block
+# and a larger backlog would be split across blocks. Static internal RAM.
+CONFIG_APPTRACE_PENDING_DATA_SIZE_MAX=8192
+
+# ISR events on (enter / exit / exit-to-scheduler are a matched set; keep all
+# three together). With them off, ISR time is billed to the interrupted context.
+# Turning them off cut the data rate enough for the 16 KB camera DMA to survive.
+CONFIG_APPTRACE_SV_EVT_ISR_ENTER_ENABLE=y
+CONFIG_APPTRACE_SV_EVT_ISR_EXIT_ENABLE=y
+CONFIG_APPTRACE_SV_EVT_ISR_TO_SCHED_ENABLE=y
+
+# Camera DMA ping-pong: 32 KB -> 2 x 15360 B halves (12 lines each).
+# cam_task budget per half 2.35 ms -> 4.70 ms at 392 us/line, and half the
+# EOF interrupts / queue events (400/s -> 200/s). Trace build only: costs
+# ~15 KB more internal DMA RAM on top of the 32 KB trace memory reservation.
+CONFIG_CAMERA_DMA_BUFFER_SIZE_MAX=32768
+
+# FreeRTOS software timer callbacks: not used in this project.
+# CONFIG_APPTRACE_SV_EVT_TIMER_ENTER_ENABLE is not set
+# CONFIG_APPTRACE_SV_EVT_TIMER_EXIT_ENABLE is not set

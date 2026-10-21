@@ -17,7 +17,7 @@
 /* Camera and microphone record together for this long, once per period.
  * The first session starts right after the boot checks; the next ones start
  * one period after the previous start. */
-#define APP_RECORD_DURATION_SEC    10U
+#define APP_RECORD_DURATION_SEC    20U
 #define APP_RECORD_PERIOD_SEC      (5U * 60U)
 
 /* Debug: 0 = never initialize the microphone (no I2S clock, no WAV), so each
@@ -41,7 +41,7 @@
 /* Debug: per-round timing trace (timing_trace.c). Timestamps every stage of
  * prepare → record → upload in memory and prints one ====start==== ...
  * ====end==== block after the upload pass. 0 = compiled out. */
-#define APP_TIMING_TRACE           1
+#define APP_TIMING_TRACE           0
 
 /* Debug: stream frames straight to the PC instead of recording (cam_stream.c).
  * Run `python tools/cam_stream_view.py` on the PC first. While 1, the node

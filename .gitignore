@@ -90,3 +90,5 @@ managed_components/
 sheet.png
 backup/
 backup/esp32_legacy/
+task*
+boot1.SVDat
