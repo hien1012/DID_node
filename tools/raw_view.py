@@ -9,13 +9,15 @@ Usage:
     python tools/raw_view.py FILE.raw --stats            per-frame diagnostics
     python tools/raw_view.py FILE.raw --png 0 150 299    export frames as PNG
     python tools/raw_view.py FILE.raw --mp4 out.mp4      whole file as video
-    python tools/raw_view.py FILE.raw --sheet sheet.png  contact sheet (every Nth frame)
+    python tools/raw_view.py FILE.raw --sheet sheet.png  contact sheet (up to 20 evenly spaced frames)
 
 Needs numpy + opencv-python (pip install numpy opencv-python).
 """
 
 import argparse
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 import cv2
@@ -48,16 +50,91 @@ def print_stats(frames: np.ndarray) -> None:
         previous = f
 
 
-def contact_sheet(frames: np.ndarray, columns: int = 5, rows: int = 4) -> np.ndarray:
-    picks = np.linspace(0, len(frames) - 1, columns * rows).astype(int)
-    tiles = []
-    for index in picks:
-        tile = cv2.resize(frames[index], (320, 240), interpolation=cv2.INTER_AREA)
+def sheet_indices(frame_count: int, columns: int, rows: int) -> np.ndarray:
+    """Include the first/last frame; short clips leave empty cells, without repeats."""
+    if min(frame_count, columns, rows) <= 0:
+        raise ValueError("frame count, columns and rows must be positive")
+    return np.linspace(0, frame_count - 1, min(frame_count, columns * rows)).astype(int)
+
+
+def _draw_sheet(indexed_frames, columns: int, rows: int) -> np.ndarray:
+    # Allocate one canvas rather than retaining all tiles and concatenation copies.
+    sheet = np.zeros((rows * 240, columns * 320, 3), dtype=np.uint8)
+    for slot, (index, frame) in enumerate(indexed_frames):
+        tile = cv2.resize(frame, (320, 240), interpolation=cv2.INTER_AREA)
         tile = cv2.cvtColor(tile, cv2.COLOR_GRAY2BGR)
         cv2.putText(tile, str(index), (6, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-        tiles.append(tile)
-    lines = [np.hstack(tiles[r * columns:(r + 1) * columns]) for r in range(rows)]
-    return np.vstack(lines)
+        row, column = divmod(slot, columns)
+        sheet[row * 240:(row + 1) * 240, column * 320:(column + 1) * 320] = tile
+    return sheet
+
+
+def contact_sheet(frames: np.ndarray, columns: int = 5, rows: int = 4) -> np.ndarray:
+    picks = sheet_indices(len(frames), columns, rows)
+    return _draw_sheet(((int(index), frames[index]) for index in picks), columns, rows)
+
+
+def save_contact_sheet(
+    raw_path: Path,
+    output_path: Path,
+    *,
+    width: int = 640,
+    height: int = 480,
+    expected_frames: int | None = None,
+    columns: int = 5,
+    rows: int = 4,
+) -> Path:
+    """Seek/read only selected GRAY8 frames and atomically publish a PNG.
+
+    Shared by the CLI and server worker. Pixel operations stay in NumPy/OpenCV;
+    a sheet-only invocation does not load the complete recording into RAM.
+    """
+    if min(width, height) <= 0:
+        raise ValueError("width and height must be positive")
+    raw_path, output_path = Path(raw_path), Path(output_path)
+    if raw_path.resolve() == output_path.resolve():
+        raise ValueError("sheet output must differ from the RAW input")
+    frame_bytes = width * height
+    with raw_path.open("rb") as source:
+        file_bytes = os.fstat(source.fileno()).st_size
+        frame_count, remainder = divmod(file_bytes, frame_bytes)
+        if remainder:
+            raise ValueError("RAW contains an incomplete frame")
+        if expected_frames is not None and frame_count != expected_frames:
+            raise ValueError("RAW frame count differs from upload metadata")
+        picks = sheet_indices(frame_count, columns, rows)
+
+        def selected_frames():
+            for index in picks:
+                source.seek(int(index) * frame_bytes)
+                data = source.read(frame_bytes)
+                if len(data) != frame_bytes:
+                    raise ValueError("RAW was truncated while generating the sheet")
+                yield int(index), np.frombuffer(data, dtype=np.uint8).reshape(height, width)
+
+        sheet = _draw_sheet(selected_frames(), columns, rows)
+
+    # imencode + Python file I/O also supports Unicode Windows paths. Publish
+    # only a complete image; a failed retry leaves any existing PNG intact.
+    encoded_ok, encoded = cv2.imencode(".png", sheet)
+    if not encoded_ok:
+        raise OSError("PNG encoding failed")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=output_path.parent, prefix=".sheet-", suffix=".tmp", delete=False
+        ) as output:
+            temp_path = Path(output.name)
+            output.write(encoded.tobytes())
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temp_path, output_path)
+        temp_path = None
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+    return output_path
 
 
 def main() -> None:
@@ -73,9 +150,14 @@ def main() -> None:
     parser.add_argument("--sheet", type=Path)
     args = parser.parse_args()
 
-    frames = load_frames(args.raw, args.width, args.height)
-    print(f"{args.raw.name}: {len(frames)} frames {args.width}x{args.height} "
-          f"({len(frames) / args.fps:.1f} s at {args.fps:g} fps)")
+    if min(args.width, args.height, args.fps) <= 0:
+        parser.error("width, height and fps must be positive")
+    # Stats/frame export/video need every frame; a sheet needs at most 20.
+    need_all_frames = args.stats or args.png is not None or args.mp4 is not None
+    frames = load_frames(args.raw, args.width, args.height) if need_all_frames else None
+    count = args.raw.stat().st_size // (args.width * args.height)
+    print(f"{args.raw.name}: {count} frames {args.width}x{args.height} "
+          f"({count / args.fps:.1f} s at {args.fps:g} fps)")
 
     if args.stats:
         print_stats(frames)
@@ -85,7 +167,7 @@ def main() -> None:
             cv2.imwrite(str(out), frames[index])
             print(f"wrote {out}")
     if args.sheet:
-        cv2.imwrite(str(args.sheet), contact_sheet(frames))
+        save_contact_sheet(args.raw, args.sheet, width=args.width, height=args.height)
         print(f"wrote {args.sheet}")
     if args.mp4:
         writer = cv2.VideoWriter(str(args.mp4), cv2.VideoWriter_fourcc(*"mp4v"),

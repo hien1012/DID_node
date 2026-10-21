@@ -6,6 +6,9 @@ session ID; both are stored side by side:
     <DATA_ROOT>/<device_id>/<YYYY-MM-DD>/<YYYY_MM_DD_HHMMSS>.raw
     <DATA_ROOT>/<device_id>/<YYYY-MM-DD>/<YYYY_MM_DD_HHMMSS>.wav
 
+Successful RAW uploads also receive a background-generated .sheet.png preview.
+SQLite sheet_jobs tracks pending/processing/ready/failed; no PNG work delays ACK.
+
 Endpoints
     GET  /time            {"epoch": <unix seconds>} used by the node at boot
     POST /upload/video    raw body + X-* headers, JSON ACK
@@ -27,11 +30,14 @@ import sqlite3
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
 
 from flask import Flask, jsonify, request
+
+from tools.raw_sheet_worker import RawSheetWorker
 
 
 TAIPEI_TZ = timezone(timedelta(hours=8))
@@ -67,10 +73,16 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def database() -> sqlite3.Connection:
+@contextmanager
+def database() -> Iterator[sqlite3.Connection]:
     connection = sqlite3.connect(DATABASE_PATH, timeout=30)
     connection.row_factory = sqlite3.Row
-    return connection
+    try:
+        with connection:
+            yield connection
+    finally:
+        # Explicit close matters with concurrent upload/preview requests on Windows.
+        connection.close()
 
 
 def initialize_database() -> None:
@@ -95,6 +107,14 @@ def initialize_database() -> None:
                 ON uploads(session_id);
             CREATE INDEX IF NOT EXISTS idx_uploads_device_time
                 ON uploads(device_id, recorded_at);
+            CREATE TABLE IF NOT EXISTS sheet_jobs (
+                capture_id TEXT PRIMARY KEY REFERENCES uploads(capture_id),
+                status TEXT NOT NULL CHECK(status IN ('pending', 'processing', 'ready', 'failed')),
+                sheet_path TEXT,
+                last_error TEXT,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_sheet_jobs_status ON sheet_jobs(status);
             CREATE TABLE IF NOT EXISTS heartbeats (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 device_id TEXT NOT NULL,
@@ -107,6 +127,22 @@ def initialize_database() -> None:
                 ON heartbeats(device_id, id);
             """
         )
+
+
+def queue_contact_sheet(connection: sqlite3.Connection, capture_id: str) -> None:
+    """Record the job in the upload transaction; retries do not duplicate work."""
+    connection.execute(
+        "INSERT OR IGNORE INTO sheet_jobs (capture_id, status, updated_at) "
+        "VALUES (?, 'pending', ?)",
+        (capture_id, now_text()),
+    )
+
+
+@app.before_request
+def start_sheet_worker() -> None:
+    # Also supports importing app from a single-process WSGI server. The start
+    # guard is shared across Flask request threads; rendering never runs here.
+    sheet_worker.start()
 
 
 def error(message: str, status_code: int):
@@ -167,6 +203,10 @@ def save_upload(
             and existing["file_bytes"] == expected_size
             and existing["media_type"] == media_type
         ):
+            if media_type == "video":
+                with database() as connection:
+                    queue_contact_sheet(connection, capture_id)
+                sheet_worker.notify()
             return jsonify(
                 {
                     "status": "ok",
@@ -255,7 +295,11 @@ def save_upload(
                     json.dumps(metadata, ensure_ascii=False, separators=(",", ":")),
                 ),
             )
+            if media_type == "video":
+                queue_contact_sheet(connection, capture_id)
 
+        if media_type == "video":
+            sheet_worker.notify()
         offline_watch.note_seen(common["device_id"], int(time.time()))
         print(
             f"[{received_at}] {media_type:5s} saved: device={common['device_id']} "
@@ -455,10 +499,12 @@ def uploads():
     with database() as connection:
         rows = connection.execute(
             """
-            SELECT capture_id, session_id, device_id, media_type, recorded_at,
-                   received_at, file_path, file_bytes, sha256, start_offset_us,
-                   metadata_json
-            FROM uploads ORDER BY received_at DESC LIMIT ?
+            SELECT u.capture_id, u.session_id, u.device_id, u.media_type, u.recorded_at,
+                   u.received_at, u.file_path, u.file_bytes, u.sha256, u.start_offset_us,
+                   u.metadata_json, j.status AS sheet_status, j.sheet_path,
+                   j.last_error AS sheet_error
+            FROM uploads u LEFT JOIN sheet_jobs j ON j.capture_id = u.capture_id
+            ORDER BY u.received_at DESC LIMIT ?
             """,
             (limit,),
         ).fetchall()
@@ -506,7 +552,9 @@ class OfflineWatch:
 
 offline_watch = OfflineWatch()
 initialize_database()
+sheet_worker = RawSheetWorker(database, now_text, app.logger)
 
 if __name__ == "__main__":
+    sheet_worker.start()
     threading.Thread(target=offline_watch.run, daemon=True).start()
     app.run(host="0.0.0.0", port=5000, threaded=True)
