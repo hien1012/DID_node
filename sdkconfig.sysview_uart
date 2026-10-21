@@ -1,0 +1,72 @@
+# SystemView over UART0 (the board's COM port). Trace build only:
+#   idf.py -B build\svu -D SDKCONFIG=build\svu\sdkconfig -D "SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.sysview_uart" build
+#
+# NOTE: keep this file ASCII only. IDF 5.1 kconfgen reads it with the Windows
+# locale codec (cp950), so UTF-8 comments break the cmake configure step.
+#
+# Why not JTAG (sdkconfig.sysview): OpenOCD reads the TRAX trace memory over
+# USB-Serial-JTAG, and on ESP32-S3 that read path returns corrupted blocks
+# under heavy DMA load ("Incomplete block sz 3, wr 216"), which ends the
+# capture. The UART path never touches TRAX; when it is too slow it drops
+# events (logs "Buffer overflow") instead of corrupting the stream.
+
+# Console -> native USB port (USB-Serial-JTAG, GPIO19/20). UART0 now carries
+# binary SystemView data, and apptrace only offers UART0 when the console is
+# not on it. Logs: idf.py -p <USB port> monitor. Flashing still goes through
+# the COM port (ROM download mode is independent of this setting).
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+# DISABLED (2026-10-22): halt-on-panic did not reveal anything; the board
+# stopped after "Starting app cpu" with it on as well. Kept off so this file
+# matches the build that recorded fine (only the overflow problem).
+# CONFIG_ESP_SYSTEM_PANIC_PRINT_HALT=y
+
+CONFIG_APPTRACE_DEST_UART0=y
+CONFIG_APPTRACE_UART_TX_GPIO=43
+CONFIG_APPTRACE_UART_RX_GPIO=44
+# ~200 KB/s. 80 MHz APB / 2 M is an exact divider. The board's USB-UART bridge
+# must support it (this board: WCH CH343, up to 6 Mbaud). Lower to 921600 if
+# SystemView shows garbage.
+CONFIG_APPTRACE_UART_BAUDRATE=2000000
+# The apptrace UART TX task sends once, then vTaskDelay(10) (port_uart.c).
+# At FREERTOS_HZ=100 that is 100 ms with the UART idle once the 4 KB driver
+# buffer drains (~20 ms), which capped real throughput near ~100 KB/s and
+# overflowed the ring buffer while recording. At 1000 Hz the sleep is 10 ms,
+# shorter than the 4 KB drain time, so the UART stays busy at the full baud.
+# Cost: 1000 tick ISRs/s per core (more trace events), and pdMS_TO_TICKS()
+# below 10 ms no longer rounds to 0. Trace build only.
+# DISABLED (2026-10-22): with 1000 Hz the board stopped after
+# "Starting app cpu" (no app log, earlier a silent RTC_SW_SYS_RST loop).
+# Re-enabled only after the cause is known.
+# CONFIG_FREERTOS_HZ=1000
+# 32768 is the Kconfig maximum; allocated from internal heap at boot
+# (the JTAG build reserved 32 KB of internal DRAM for TRAX instead).
+CONFIG_APPTRACE_UART_TX_BUFF_SIZE=32768
+# Default 1 shares the CPU with main (1) and loses to upload_reader (2), so the
+# ring buffer would overflow while uploading. 3 = above those, below the
+# writers (5) and the capture tasks (6/7) that the trace is meant to observe.
+CONFIG_APPTRACE_UART_TASK_PRIO=3
+
+CONFIG_APPTRACE_SV_ENABLE=y
+CONFIG_APPTRACE_SV_DEST_UART=y
+# UART mode traces a single core. CPU1 = camera_init, camera_capture,
+# mic_capture, cam_task, upload_reader. The apptrace UART driver is installed
+# from CPU0, so its ISR does not land on the traced core.
+CONFIG_APPTRACE_SV_DEST_CPU_1=y
+CONFIG_APPTRACE_SV_MAX_TASKS=32
+CONFIG_APPTRACE_SV_BUF_WAIT_TMO=0
+
+# ISR events on (enter / exit / exit-to-scheduler are a matched set; keep all
+# three together). With them off, ISR time is billed to the interrupted context.
+CONFIG_APPTRACE_SV_EVT_ISR_ENTER_ENABLE=y
+CONFIG_APPTRACE_SV_EVT_ISR_EXIT_ENABLE=y
+CONFIG_APPTRACE_SV_EVT_ISR_TO_SCHED_ENABLE=y
+
+# FreeRTOS software timer callbacks: not used in this project.
+# CONFIG_APPTRACE_SV_EVT_TIMER_ENTER_ENABLE is not set
+# CONFIG_APPTRACE_SV_EVT_TIMER_EXIT_ENABLE is not set
+
+# Same camera DMA as the JTAG trace build: 2 x 15360 B halves, cam_task budget
+# 4.70 ms per half instead of 2.35 ms. SV_ENABLE still wraps every non-shared
+# ISR in a global spinlock, so keep the margin. Try 16384 once this works.
+CONFIG_CAMERA_DMA_BUFFER_SIZE_MAX=32768
