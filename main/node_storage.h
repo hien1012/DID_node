@@ -63,7 +63,7 @@ esp_err_t node_storage_get_free_bytes(uint64_t *free_bytes_out);
 const char *node_storage_media_name(node_media_t media);
 
 /*
- * 錄影 (cam sd_writer 暫存區) 與上傳 (讀檔雙緩衝) 共用的 32 KB 內部 DMA 緩衝。
+ * 錄影 (cam_writer 暫存區) 與上傳 (讀檔雙緩衝) 共用的 32 KB 內部 DMA 緩衝。
  * 兩者不會同時進行，所以共用一塊省下約 32 KB 內部 RAM (debug_sdcard #24)。
  * 4-byte 對齊、位於內部 RAM，SDMMC 可直接 DMA。同一時間只能有一個持有者；
  * 已被持有時 acquire 回傳 NULL。

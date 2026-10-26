@@ -4,7 +4,8 @@
  * ESP32-S3-DevKitC-1 v1.0 (WROOM-1 N16R8) wired with jumper cables.
  *
  * Do not use: GPIO26-32 (flash), GPIO33-37 (octal PSRAM),
- * GPIO0/3/45/46 (strapping), GPIO19/20 (native USB/JTAG port),
+ * GPIO0/3/45/46 (strapping; 3 and 46 serve only as post-boot LA outputs below),
+ * GPIO19/20 (native USB/JTAG port),
  * GPIO43/44 (UART0 = the board's COM port: flashing and the main console).
  *
  * Every peripheral is routed through the GPIO matrix, so pins can be moved
@@ -15,7 +16,7 @@
 /* --- Camera (8-bit DVP, ESP32-S3-EYE layout) --- */
 /* 3.3 V module only. OV2640 with its own 12 MHz oscillator leaves XCLK
  * unconnected (see USE_OV2640_ONBOARD_XVCLK in cam_record.c). */
-#define CAM_PIN_PWDN   21
+#define CAM_PIN_PWDN   -1   /* not wired on this build (GPIO21 is the LA probe below) */
 #define CAM_PIN_RESET  -1
 #define CAM_PIN_XCLK   15
 #define CAM_PIN_SIOD   4
@@ -60,3 +61,27 @@
 
 /* --- On-board WS2812 RGB LED --- */
 #define BOARD_PIN_RGB_LED 48
+
+/*
+ * --- Logic analyzer probes (debug, APP_LA_PROBE_ENABLE in app_config.h) ---
+ * Driven from the FreeRTOS task-switch hook (la_task_trace.h). Spare pins only;
+ * not GPIO14 (next to PCLK, see the mic clock note above). Passive LA taps need
+ * no pin: VSYNC = 6, SD CMD = 38.
+ *
+ * Task pins: high while the bound task runs. Binding follows the phase
+ * (la_probe_set_phase):      recording        upload
+ */
+#define LA_PIN_TASK0      41   /* cam_task         wifi          */
+#define LA_PIN_TASK1      42   /* cam_writer       main (HTTP)   */
+#define LA_PIN_TASK2      21   /* mic_capture      upload_reader */
+#define LA_PIN_TASK3      48   /* mic_writer       tiT (lwIP)    */
+/* GPIO48 is also the on-board RGB LED data line: status_led_off() only blanks
+ * it at boot, after that it is a plain output (the LED may light up randomly
+ * while probing). */
+
+/* High while that core runs its IDLE task (la_task_trace.h). Strapping pins,
+ * used only as outputs after boot: GPIO3 (JTAG source select, ignored unless the
+ * STRAP_JTAG_SEL eFuse is burned) and GPIO46 (boot mode / ROM log, pulled down).
+ * The LA inputs must not drive them during reset. */
+#define LA_PIN_IDLE_CPU0  3
+#define LA_PIN_IDLE_CPU1  46

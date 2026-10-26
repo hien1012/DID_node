@@ -38,7 +38,7 @@ SD 寫入約 1.57 MB/s，1-bit 40 MHz 實際約 2–3 MB/s，**餘量不大**，
 | mic_capture | 1 | 7 | I2S DMA → audio block（DMA 只緩衝約 256 ms） |
 | camera_capture | 1 | 6 | 取 fb，只傳指標 |
 | cam_task（驅動） | 1 | 驅動預設 | LCD_CAM DMA → 取出 Y → PSRAM fb |
-| sd_writer / mic_writer | 0 | 5 | 各自寫入自己的預配置檔案（FATFS 鎖序列化存取） |
+| cam_writer / mic_writer | 0 | 5 | 各自寫入自己的預配置檔案（FATFS 鎖序列化存取） |
 | heartbeat | – | 4 | 每分鐘 heartbeat + Wi-Fi watchdog |
 | main（app_main） | 0 | 1 | 排程：準備 → 錄製 → 上傳 |
 

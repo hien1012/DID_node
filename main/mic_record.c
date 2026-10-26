@@ -363,9 +363,18 @@ static void trace_dma_read(uint32_t popped_before, int64_t returned_us, uint32_t
 }
 
 /* ==========================================================
- *  Capture Task
+ *  mic_capture 任務：I2S DMA → PCM block
+ *  運行於：CPU Core 1，優先權 7 (錄製中最高)；每次錄音由 mic_record_start() 建立，結束後自刪。
+ *  職責：
+ *   1. 觸發點之前持續 i2s_channel_read() 並丟棄，讓 DMA 只留觸發點之後的資料。
+ *   2. 每次讀 READ_SAMPLES (64 ms)。I2S 驅動的 DMA 環只有約 256 ms，沒及時讀
+ *      會覆蓋最舊的資料，所以優先權最高、迴圈裡不做檔案操作。
+ *   3. raw_to_pcm() 把原始 slot (標準 I2S 為 32-bit，PDM 已是 16-bit) 轉成 16-bit PCM，填進從 s_free_blocks 取得的 block；
+ *      填滿 AUDIO_BLOCK_SAMPLES 就送進 s_full_blocks，再取下一個空 block。
+ *   4. 收滿 MIC_TARGET_SAMPLES 後送出最後半滿的 block，記下錄製期間的 overflow 次數，
+ *      再送 NULL sentinel 通知 mic_writer 結束，設 CAPTURE_DONE_BIT。
  * ========================================================== */
-static void capture_task(void *arg)
+static void mic_capture(void *arg)
 {
     (void)arg;
     size_t bytes_read = 0;
@@ -443,16 +452,25 @@ static void capture_task(void *arg)
     timing_trace_mark(TT_MARK_MIC_CAPTURE_DONE);
 
 finish:
-    blk = NULL;     /* sentinel：通知 writer_task 結束 */
+    blk = NULL;     /* sentinel：通知 mic_writer 結束 */
     xQueueSend(s_full_blocks, &blk, portMAX_DELAY);
     xEventGroupSetBits(s_events, CAPTURE_DONE_BIT);
     vTaskDelete(NULL);
 }
 
 /* ==========================================================
- *  Writer Task
+ *  mic_writer 任務：PCM block → WAV 檔
+ *  運行於：CPU Core 0，優先權 5；每次錄音由 mic_record_start() 建立，結束後自刪。
+ *  職責：
+ *   1. 先在寫入緩衝放佔位 WAV header (大小 0)。
+ *   2. 從 s_full_blocks 取 block，每個 sample 乘 PCM_GAIN 並飽和到 int16，
+ *      累積到 WRITE_BUFFER_BYTES (8 KB，512 的倍數) 才整塊 write() 進預配置的 WAV，
+ *      處理完把 block 還回 s_free_blocks 給 mic_capture 重用。
+ *   3. 收到 NULL sentinel：寫出剩餘資料，回寫實際大小的 header，ftruncate 多餘的
+ *      預配置空間、fsync，設 WRITER_DONE_BIT。
+ *  16 個 block (約 1 秒) 的池讓 SD 偶發延遲不會擋住 mic_capture。
  * ========================================================== */
-static void writer_task(void *arg)
+static void mic_writer(void *arg)
 {
     (void)arg;
     const int fd = s_session.storage.fd;
@@ -578,7 +596,7 @@ esp_err_t mic_record_prepare(time_t recorded_at_epoch)
     xEventGroupClearBits(s_events, CAPTURE_DONE_BIT | WRITER_DONE_BIT);
 
     /* 觸發點前約 8 秒啟動時脈：麥克風喚醒需要時間 (INMP441 約數百 ms)，
-     * 啟動到觸發點之間的資料由 capture_task 讀出丟棄 */
+     * 啟動到觸發點之間的資料由 mic_capture 讀出丟棄 */
     esp_err_t err = set_clock_enabled(true);
     if (err != ESP_OK) {
         return err;
@@ -604,7 +622,7 @@ esp_err_t mic_record_start(int64_t trigger_us)
     }
     s_session.trigger_us = trigger_us;
 
-    if (xTaskCreatePinnedToCore(writer_task, "mic_writer", WRITER_TASK_STACK_BYTES,
+    if (xTaskCreatePinnedToCore(mic_writer, "mic_writer", WRITER_TASK_STACK_BYTES,
                                 NULL, WRITER_TASK_PRIORITY, NULL,
                                 WRITER_TASK_CORE) != pdPASS) {
         s_session.start_error = ESP_ERR_NO_MEM;
@@ -612,7 +630,7 @@ esp_err_t mic_record_start(int64_t trigger_us)
     }
     s_session.started = true;
 
-    if (xTaskCreatePinnedToCore(capture_task, "mic_capture", CAPTURE_TASK_STACK_BYTES,
+    if (xTaskCreatePinnedToCore(mic_capture, "mic_capture", CAPTURE_TASK_STACK_BYTES,
                                 NULL, CAPTURE_TASK_PRIORITY, NULL,
                                 CAPTURE_TASK_CORE) != pdPASS) {
         s_session.capture_result = ESP_ERR_NO_MEM;

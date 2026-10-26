@@ -10,10 +10,6 @@ CONFIG_APPTRACE_SV_MAX_TASKS=32
 # (SystemView shows an overflow) instead of making tasks wait for JTAG.
 CONFIG_APPTRACE_SV_BUF_WAIT_TMO=0
 
-# Pending buffer (default 0): holds events while both 16 KB TRAX blocks are busy
-# instead of dropping them. Absorbs bursts only, not a sustained overrun.
-# Must stay below 16384: on a block switch it is pumped into the empty block
-# and a larger backlog would be split across blocks. Static internal RAM.
 CONFIG_APPTRACE_PENDING_DATA_SIZE_MAX=8192
 
 # ISR events on (enter / exit / exit-to-scheduler are a matched set; keep all

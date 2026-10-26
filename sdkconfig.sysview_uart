@@ -1,4 +1,5 @@
-# SystemView over UART0 (the board's COM port). Trace build only:
+# SystemView over UART1 (GPIO41 TX / GPIO42 RX) to an external 3.3 V USB-UART
+# adapter. Trace build only:
 #   idf.py -B build\svu -D SDKCONFIG=build\svu\sdkconfig -D "SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.sysview_uart" build
 #
 # NOTE: keep this file ASCII only. IDF 5.1 kconfgen reads it with the Windows
@@ -9,35 +10,37 @@
 # under heavy DMA load ("Incomplete block sz 3, wr 216"), which ends the
 # capture. The UART path never touches TRAX; when it is too slow it drops
 # events (logs "Buffer overflow") instead of corrupting the stream.
-
-# Console -> native USB port (USB-Serial-JTAG, GPIO19/20). UART0 now carries
-# binary SystemView data, and apptrace only offers UART0 when the console is
-# not on it. Logs: idf.py -p <USB port> monitor. Flashing still goes through
-# the COM port (ROM download mode is independent of this setting).
-CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
-CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
-# DISABLED (2026-10-22): halt-on-panic did not reveal anything; the board
-# stopped after "Starting app cpu" with it on as well. Kept off so this file
-# matches the build that recorded fine (only the overflow problem).
-# CONFIG_ESP_SYSTEM_PANIC_PRINT_HALT=y
-
-CONFIG_APPTRACE_DEST_UART0=y
-CONFIG_APPTRACE_UART_TX_GPIO=43
-CONFIG_APPTRACE_UART_RX_GPIO=44
-# ~200 KB/s. 80 MHz APB / 2 M is an exact divider. The board's USB-UART bridge
-# must support it (this board: WCH CH343, up to 6 Mbaud). Lower to 921600 if
-# SystemView shows garbage.
-CONFIG_APPTRACE_UART_BAUDRATE=2000000
+#
+# Why UART1 and not UART0 (the board's COM port): UART0 needs the console moved
+# to USB-Serial-JTAG, and that build (2026-10-22) ended up in a silent boot
+# loop / hang right after "Starting app cpu", cause not found. With UART1 the
+# console stays exactly as in the production firmware (UART0 primary, USB
+# secondary), so logs and flashing keep using the COM port.
+#
+# Wiring: GPIO41 -> adapter RX, GPIO42 <- adapter TX, GND <-> GND. No VCC wire
+# (the board is powered over USB). RX is required: SystemView sends its start
+# command to the target. Not GPIO14: it sits next to PCLK (13) and a clock-like
+# signal there corrupted the video before (debug_sdcard #32-#33).
+CONFIG_APPTRACE_DEST_UART1=y
+CONFIG_APPTRACE_UART_TX_GPIO=41
+CONFIG_APPTRACE_UART_RX_GPIO=42
+# ~92 KB/s. The adapter in use is a Prolific PL2303 (USB REV_0300 = PL2303HX
+# family, Prolific driver 3.3.2.105 from 2008): at 2000000 it returned nothing
+# to a START probe (2026-10-23). 2 M is not in the PL2303 standard rate table;
+# 921600 is supported by every PL2303 and costs little here, since with
+# FREERTOS_HZ=100 the apptrace TX task already caps throughput near
+# 100-130 KB/s. Try 1228800 / 2457600 / 3000000 (PL2303 table rates) only
+# after this works, and set the same rate in SystemView.
+CONFIG_APPTRACE_UART_BAUDRATE=921600
 # The apptrace UART TX task sends once, then vTaskDelay(10) (port_uart.c).
 # At FREERTOS_HZ=100 that is 100 ms with the UART idle once the 4 KB driver
 # buffer drains (~20 ms), which capped real throughput near ~100 KB/s and
 # overflowed the ring buffer while recording. At 1000 Hz the sleep is 10 ms,
 # shorter than the 4 KB drain time, so the UART stays busy at the full baud.
 # Cost: 1000 tick ISRs/s per core (more trace events), and pdMS_TO_TICKS()
-# below 10 ms no longer rounds to 0. Trace build only.
-# DISABLED (2026-10-22): with 1000 Hz the board stopped after
-# "Starting app cpu" (no app log, earlier a silent RTC_SW_SYS_RST loop).
-# Re-enabled only after the cause is known.
+# below 10 ms no longer rounds to 0 (main/ uses >= 50 ms only).
+# Off for the first UART1 run (one change at a time). The UART0 boot problem
+# also happened at 100 Hz, so 1000 Hz was not its cause; enable next.
 # CONFIG_FREERTOS_HZ=1000
 # 32768 is the Kconfig maximum; allocated from internal heap at boot
 # (the JTAG build reserved 32 KB of internal DRAM for TRAX instead).

@@ -24,7 +24,7 @@ typedef enum {
     TT_MARK_CAM_PREPARED,       /* cam_record_prepare 返回：取得 I/O 緩衝 + 建立並預配置 .raw */
     TT_MARK_MIC_PREPARED,       /* mic_record_prepare 返回：I2S 時脈啟動 + 建立並預配置 .wav */
     TT_MARK_WAIT_DONE,          /* 空等到 trigger − 300 ms */
-    TT_MARK_CAM_STARTED,        /* cam_record_start 返回：恢復 VSYNC + 建立 sd_writer / camera_capture */
+    TT_MARK_CAM_STARTED,        /* cam_record_start 返回：恢復 VSYNC + 建立 cam_writer / camera_capture */
     TT_MARK_MIC_STARTED,        /* mic_record_start 返回：建立 mic_writer / mic_capture */
     TT_MARK_TRIGGER,            /* 觸發點 (0 點)，cam / mic 共用 */
     TT_MARK_MIC_FIRST_SAMPLE,   /* mic 丟完觸發前資料，開始收第一個 sample */
@@ -32,7 +32,7 @@ typedef enum {
     TT_MARK_MIC_CAPTURE_DONE,   /* mic_capture 收滿 sample 數 */
     TT_MARK_MIC_WRITER_DONE,    /* mic_writer 寫完尾段 + 回寫 header + ftruncate + fsync */
     TT_MARK_CAM_CAPTURE_DONE,   /* camera_capture 收到 deadline 之後的幀而結束 */
-    TT_MARK_CAM_WRITER_DONE,    /* sd_writer 清空 ready queue + ftruncate + fsync */
+    TT_MARK_CAM_WRITER_DONE,    /* cam_writer 清空 ready queue + ftruncate + fsync */
     TT_MARK_CAM_FINISHED,       /* cam_record_finish 返回：暫停相機 + 統計 log + rename 到 done/ */
     TT_MARK_XCLK_OFF,           /* 相機 XCLK 停止 */
     TT_MARK_MIC_FINISHED,       /* mic_record_finish 返回：rename 到 done/ + I2S 時脈停止 */
@@ -53,8 +53,8 @@ typedef enum {
     TT_STAT_CAM_READOUT,                /* 幀開始 VSYNC → 驅動收完整幀 (感測器送出一幀的時間) */
     TT_STAT_CAM_DELIVER,                /* 驅動收完整幀 → camera_capture 的 fb_get 返回 */
     TT_STAT_CAM_ENQUEUE,                /* fb_get 返回 → 檢查完成、送進 ready queue */
-    TT_STAT_CAM_QUEUE_WAIT,             /* 送進 ready queue → sd_writer 取出 (排隊時間) */
-    TT_STAT_CAM_SD_WRITE,               /* sd_writer 取出 → 300 KB 寫進 SD 完成 */
+    TT_STAT_CAM_QUEUE_WAIT,             /* 送進 ready queue → cam_writer 取出 (排隊時間) */
+    TT_STAT_CAM_SD_WRITE,               /* cam_writer 取出 → 300 KB 寫進 SD 完成 */
     TT_STAT_CAM_FB_HELD,                /* 幀開始 VSYNC → fb_return (這個 fb 被佔用的總時間) */
     /* --- mic DMA 層 (序號 = DMA 描述元序號，從觸發點起算) --- */
     TT_STAT_MIC_DMA_INTERVAL,           /* 相鄰兩個 I2S DMA 描述元完成的間隔 (應 = 32 ms) */

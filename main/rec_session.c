@@ -9,6 +9,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "la_probe.h"
 #include "timing_trace.h"
 
 /* Minimum distance between start() and the trigger, so both capture tasks are
@@ -98,6 +99,8 @@ esp_err_t rec_session_run(time_t start_epoch, rec_session_result_t *result)
         }
         timing_trace_mark(TT_MARK_MIC_STARTED);
     }
+    /* debug：LA task 腳改看錄製的 4 個 task (此時都已建立) */
+    la_probe_set_phase(LA_PHASE_RECORD);
 
     /* 4. 等待兩邊結束，各自檢核後移到 done/ 或 broken/ */
     if (camera_prepared) {
@@ -119,6 +122,8 @@ esp_err_t rec_session_run(time_t start_epoch, rec_session_result_t *result)
         result->mic.error = s_mic_ready ? result->mic_prepare_error
                                         : ESP_ERR_INVALID_STATE;
     }
+    /* 錄製 task 已自刪：解除綁定，避免其 TCB 記憶體被重用時誤判 */
+    la_probe_set_phase(LA_PHASE_NONE);
 
     ESP_LOGI(TAG, "Session %lld done: camera=%s (%u frames, first +%" PRId64
              " ms) mic=%s (%u samples, first +%" PRId64 " ms)",

@@ -14,6 +14,7 @@
 #include "cam_record.h"
 #include "cam_stream.h"
 #include "device_identity.h"
+#include "la_probe.h"
 #include "mic_record.h"
 #include "net_bench.h"
 #include "node_health.h"
@@ -165,6 +166,11 @@ void app_main(void)
 {
     ESP_ERROR_CHECK(init_nvs());
     (void)status_led_off();
+    /* debug：LA 量測腳 (APP_LA_PROBE_ENABLE=0 時不做事)。在 status_led_off() 之後：
+     * GPIO48 同時是 RGB LED 資料線，先讓 LED 熄滅再交給量測腳。 */
+    if (la_probe_init() != ESP_OK) {
+        ESP_LOGW(TAG, "LA probes unavailable");
+    }
     ESP_ERROR_CHECK(device_identity_init(APP_DEVICE_ID_PREFIX));
     ESP_LOGI(TAG, "Device ID: %s", device_identity_get());
     time_sync_configure_timezone();

@@ -59,7 +59,7 @@
 #define CAM_STREAM_SD_LOAD_PHASE_FRAMES  20U      /* 每 20 幀切換負載開／關 */
 #define CAM_STREAM_SD_LOAD_LOG_EVERY     25U
 #define CAM_STREAM_SD_LOAD_TASK_STACK    4096U
-#define CAM_STREAM_SD_LOAD_TASK_PRIORITY 5U       /* 與錄影的 sd_writer 相同 */
+#define CAM_STREAM_SD_LOAD_TASK_PRIORITY 5U       /* 與錄影的 cam_writer 相同 */
 
 #if APP_CAM_STREAM_ENABLE
 static const char *TAG = "CAM_STREAM";
@@ -69,7 +69,7 @@ static volatile bool s_sd_load_on = false;
 
 #if APP_CAM_STREAM_SD_LOAD
 /*
- * 錄影時 sd_writer 的寫法：write() 32 KB 一段，從內部 DMA 緩衝直接寫，每 200 ms
+ * 錄影時 cam_writer 的寫法：write() 32 KB 一段，從內部 DMA 緩衝直接寫，每 200 ms
  * 一幀 (307200 B)。內容用亂數，讓 DAT0 像寫真實影像時一樣頻繁切換。
  */
 static void sd_load_task(void *argument)
@@ -143,7 +143,7 @@ static esp_err_t start_sd_load(void)
     if (buffer == NULL) {
         return ESP_ERR_NO_MEM;
     }
-    const BaseType_t core = 0;      /* 與錄影的 sd_writer 相同 (Core 0；單核也有效) */
+    const BaseType_t core = 0;      /* 與錄影的 cam_writer 相同 (Core 0；單核也有效) */
     if (xTaskCreatePinnedToCore(sd_load_task, "stream_sd_load", CAM_STREAM_SD_LOAD_TASK_STACK,
                                 buffer, CAM_STREAM_SD_LOAD_TASK_PRIORITY, NULL,
                                 core) != pdPASS) {

@@ -24,7 +24,7 @@ idf.py -B build\s3 build
 ## 檔案職責（main/）
 - `app_main.c`：開機流程（SD → Wi-Fi → 校時 → recorder init）與排程迴圈（準備 → 錄製 → 上傳）。
 - `rec_session.c`：把排程時間換成同一個 `trigger_us`，同步啟動 cam / mic，等兩邊結束。
-- `cam_record.c`：相機 init / 暖機 / 開機 FPS 測試，capture → 零拷貝 queue → sd_writer；感測器暫存器設定。
+- `cam_record.c`：相機 init / 暖機 / 開機 FPS 測試，capture → 零拷貝 queue → cam_writer；感測器暫存器設定。
 - `mic_record.c`：I2S0（標準 I2S 或 PDM）→ block queue → mic_writer → 預配置 WAV。
 - 兩個 recorder 都是 `prepare(epoch)` / `start(trigger_us)` / `finish(result)` 三段式；finish 內做品質檢核。
 - `node_storage.c`：SD 1-bit 掛載；`undone/` → `done/`（待上傳）或 `broken/`（`<stem>_broken.ext`）；
@@ -44,7 +44,7 @@ idf.py -B build\s3 build
 | camera_init | 6 | 8192 | 1 | 一次性：`cam_record_init()`，notify 後自刪 |
 | mic_capture | 7 | 4096 | 1 | 每次錄製建立；I2S DMA 只緩衝約 256 ms，所以最高 |
 | camera_capture | 6 | 4096 | 1 | 每次錄製建立；取 fb，只送指標 |
-| sd_writer / mic_writer | 5 | 4096 | 0 | 每次錄製建立；寫各自的預配置檔案 |
+| cam_writer / mic_writer | 5 | 4096 | 0 | 每次錄製建立；寫各自的預配置檔案 |
 | heartbeat | 4 | 6144 | 不綁 | heartbeat + Wi-Fi 恢復動作 |
 | upload_reader | 2 | 4096 | 1 | 常駐（第一次上傳時建立，static）；讀 SD 與 main 的 HTTP 送出重疊（2 × 16 KB 緩衝） |
 | cam_task（驅動） | 預設 | 4096 | 1 | LCD_CAM DMA → 取 Y → PSRAM fb（`CONFIG_CAMERA_CORE1`） |
@@ -55,8 +55,12 @@ idf.py -B build\s3 build
 - 一次性 init 回報用 task notification；Wi-Fi 狀態用 `wifi_manager` 的 event group；storage / health 各有 mutex。
 
 ## GPIO（詳見 `board_pins.h`）
-- CAM：XCLK 15、SIOD 4、SIOC 5、D0..D7 = 11,9,8,10,12,18,17,16、VSYNC 6、HREF 7、PCLK 13、PWDN 21。
-- MIC：CLK 47、WS 1、DIN 2。SD：CLK 40、CMD 38、D0 39。RGB LED（WS2812）：48。空閒：14、41、42。
+- CAM：XCLK 15、SIOD 4、SIOC 5、D0..D7 = 11,9,8,10,12,18,17,16、VSYNC 6、HREF 7、PCLK 13、PWDN 未接（-1）。
+- MIC：CLK 47、WS 1、DIN 2。SD：CLK 40、CMD 38、D0 39。RGB LED（WS2812）：48。空閒：14。
+- LA 量測腳（debug，`APP_LA_PROBE_ENABLE`，`la_probe.h` / `la_task_trace.h`；頂層 CMakeLists 以 `-include` 注入 freertos 的
+  `traceTASK_SWITCHED_IN/OUT`）：3 / 46 = CPU0 / CPU1 在 IDLE；task 腳 41 / 42 / 21 / 48 = 綁定的 task 正在執行，
+  錄製時 cam_task / cam_writer / mic_capture / mic_writer，上傳時 wifi / main / upload_reader / tiT（`la_probe_set_phase`）。
+  3、46 是 strapping 腳、48 兼 RGB LED，都只在開機後當輸出。與 `sdkconfig.sysview_uart`（UART1 用 41/42）互斥。
 - **GPIO14 不要放時脈訊號**：它緊鄰 PCLK（13），I2S BCLK 放在 14 時耦合進 PCLK，錄影全部損壞（debug_sdcard #32–#33）。時脈類訊號放右側排針。
 - 禁用：26–37（flash / Octal PSRAM）、0/3/45/46（strapping）、19/20（原生 USB/JTAG 口）、43/44（UART0 = 板上 COM 口，燒錄與主要 log）。
 - OV2640 用板載 12 MHz → `USE_OV2640_ONBOARD_XVCLK=1`；OV7670/OV7725 由 S3 輸出 16 MHz → `=0`（預設）。換模組要切。

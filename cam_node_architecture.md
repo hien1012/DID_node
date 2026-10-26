@@ -308,7 +308,7 @@ D:/
 |---|---|---|---|---|
 | `app_main` 主迴圈 | 預設 | 任意 | ESP-IDF 預設 | 主控 |
 | `camera_capture` | **10**（建議提升） | Core 1 | 4 KB | 抓取 DVP 幀 |
-| `sd_writer` | 5 | Core 0 | 4 KB | 寫 RAW 至 SD |
+| `cam_writer` | 5 | Core 0 | 4 KB | 寫 RAW 至 SD |
 | `cam_heartbeat` | 4 | 任意 | 6 KB | 永久，每 1 分鐘 |
 
 > [!NOTE]

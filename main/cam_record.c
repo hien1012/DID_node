@@ -1,11 +1,5 @@
-/**
- * ============================================================================
- * 專案名稱：ESP32-S3 野外採集節點 (Camera + Mic Node)
- * 檔案名稱：cam_record.c
- * 檔案說明：低階影像擷取 (DVP Camera)、零拷貝佇列管線與 SD 卡連續寫入核心實作
- * ============================================================================
- *
- * 【給客戶與開發團隊的架構摘要說明】
+/*
+ * 【架構摘要說明】
  * ----------------------------------------------------------------------------
  * 1. 系統目標：
  *    在 ESP32-S3 上，以極高穩定度達成 640x480 (VGA) 解析度、
@@ -19,9 +13,9 @@
  *      便於做精確的記憶體預分配與即時 SD 卡扇區寫入，最後再由伺服器轉為 MP4。
  * 
  * 3. 雙核心並行與零拷貝 (Zero-Copy) 管線設計：
- *    - 核心 1 (Core 1) [高優先權 6]：專注運行 capture_task，負責從相機 DMA 接收影格，
- *      僅傳遞指標進入 FreeRTOS 佇列，絕對不複製像素資料，確保不遺漏任何硬體訊號。
- *    - 核心 0 (Core 0) [低優先權 5]：專注運行 writer_task，負責將佇列中的影像寫入 SD 卡。
+ *    - 核心 1 (Core 1) [高優先權 6]：專注運行 camera_capture，從相機驅動取得完成的影格
+ *      (像素已由驅動的 cam_task 從 DMA 搬進 PSRAM)，僅傳遞指標進入 FreeRTOS 佇列，不複製像素資料。
+ *    - 核心 0 (Core 0) [低優先權 5]：專注運行 cam_writer，負責將佇列中的影像寫入 SD 卡。
  *      寫入完成後才呼叫 esp_camera_fb_return() 將緩衝區釋放回硬體，避免記憶體碎裂。
  * 
  * 4. 關鍵記憶體限制與解決方案：
@@ -128,7 +122,7 @@
 /*
  * --- 佇列容量與錄影規格 ---
  * 總共有 8 個 framebuffer，其中：
- * - 1 個正在被 writer_task 寫入 SD 卡
+ * - 1 個正在被 cam_writer 寫入 SD 卡
  * - 1 個為相機硬體 DMA 正在接收的活躍緩衝區
  * - 1 個為下一個 VSYNC 預備的備用緩衝區
  * 因此佇列最多只能排隊容納 8 - 3 = 5 個已完成的影格指標，避免底層相機硬體無可用緩衝區。
@@ -147,10 +141,10 @@
 #define RECORD_MIN_VALID_FRAMES       (RECORD_EXPECTED_FRAMES - 1U)
 
 /* --- FreeRTOS 任務堆疊與優先權設定 --- */
-#define CAPTURE_TASK_STACK_BYTES      4096U                 /* capture_task 堆疊大小：4 KB */
-#define WRITER_TASK_STACK_BYTES       4096U                 /* writer_task 堆疊大小：4 KB */
-#define CAPTURE_TASK_PRIORITY         6U                    /* capture_task 優先權 (優先權較高，確保硬體影格及時提取) */
-#define WRITER_TASK_PRIORITY          5U                    /* writer_task 優先權 (優先權略低，順應 SD 卡寫入速度) */
+#define CAPTURE_TASK_STACK_BYTES      4096U                 /* camera_capture 堆疊大小：4 KB */
+#define WRITER_TASK_STACK_BYTES       4096U                 /* cam_writer 堆疊大小：4 KB */
+#define CAPTURE_TASK_PRIORITY         6U                    /* camera_capture 優先權 (優先權較高，確保硬體影格及時提取) */
+#define WRITER_TASK_PRIORITY          5U                    /* cam_writer 優先權 (優先權略低，順應 SD 卡寫入速度) */
 
 /* CPU 核心綁定 (SMP 對稱多核心架構) */
 #if CONFIG_FREERTOS_UNICORE
@@ -330,7 +324,7 @@ typedef struct {
 
 /**
  * @brief 零拷貝queue元素結構體 (Ready Frame)
- * 在 capture_task 與 writer_task 之間傳遞，僅傳遞指標與中繼資料，不複製 300KB 的像素資料。
+ * 在 camera_capture 與 cam_writer 之間傳遞，僅傳遞指標與中繼資料，不複製 300KB 的像素資料。
  */
 typedef struct {
     camera_fb_t *frame;                 /* 指向官方驅動 PSRAM 中的影格緩衝區指標 */
@@ -459,7 +453,7 @@ static camera_config_t s_camera_config = {
     /*
      * 緩衝區數量與位置：
      * 配置 8 個緩衝區於外部 PSRAM 中。
-     * writer_task 在完成 SD 寫入前會一直持有該緩衝區指標，
+     * cam_writer 在完成 SD 寫入前會一直持有該緩衝區指標，
      * 寫入完畢後呼叫 return，使硬體能循環重用這 8 個緩衝區。
      */
     .fb_count = CAMERA_FRAME_BUFFERS,
@@ -870,7 +864,7 @@ static esp_err_t write_frame_to_sd(int fd, const uint8_t *pixels, int64_t *max_c
 
         /* PSRAM -> 內部 SRAM 記憶體複製 */
         memcpy(s_sd_dma_buffer, pixels + offset, chunk);
-        
+
         /* 內部 SRAM -> SD 卡寫入 (透過 SDMMC DMA) */
         const int64_t start_us = esp_timer_get_time();
         const esp_err_t err = write_all(fd, s_sd_dma_buffer, chunk);
@@ -1259,13 +1253,19 @@ static esp_err_t run_startup_fps_test(void)
  * ============================================================================ */
 
 /**
- * @brief 影像擷取任務 (Capture Task)
- * 運行於：CPU Core 1，高優先權 (Priority 6)
+ * @brief camera_capture 任務：管理影格指標，不搬像素
+ * 運行於：CPU Core 1，優先權 6；每次錄影由 cam_record_start() 建立，結束後自刪。
  * 職責：
- * 從相機驅動讀取影格，嚴格審核時戳與格式，並封裝成 ready_frame_t 丟入佇列。
- * 本任務絕對不執行阻塞的檔案操作，確保相機硬體 FIFO 隨時能被及時清空。
+ *  1. esp_camera_fb_get() 等驅動交出一張完成的 fb。像素已由驅動的 cam_task
+ *     (LCD_CAM DMA → 取 Y → PSRAM) 搬好，這裡只從驅動的 frame queue 拿到指標。
+ *  2. 檢查時戳 (遞增、不在未來) 與大小，不合格的直接歸還並記錄錯誤。
+ *  3. 觸發點之前的幀視為過期丟棄；時戳到達 deadline 的那一幀歸還後結束迴圈。
+ *  4. 合格的幀包成 ready_frame_t (指標 + frame_id + 時戳) 非阻塞送進 s_ready_queue，
+ *     fb 所有權交給 cam_writer；佇列滿 (SD 跟不上) 就丟這一幀並歸還。
+ *  5. 結束時設 CAPTURE_DONE_BIT，讓 cam_writer 清空佇列後收尾。
+ * 不做任何檔案操作，避免阻塞而讓驅動的 fb 用完。
  */
-static void capture_task(void *argument)
+static void camera_capture(void *argument)
 {
     (void)argument;
     recording_stats_t *stats = &s_recording.stats;
@@ -1352,7 +1352,7 @@ static void capture_task(void *argument)
             .enqueue_us = esp_timer_get_time(),
         };
 
-        /* 將影格指標推入 FreeRTOS 佇列 (非阻塞呼叫) */
+        /* 將影格指標推入 FreeRTOS queue (非阻塞呼叫) */
         if (xQueueSend(s_ready_queue, &ready_frame, 0) != pdTRUE) {
             /* 若佇列已滿 (代表 SD 卡寫入不及)，被迫放棄此影格 (Drop) 並歸還硬體 */
             stats->pool_overflows++;
@@ -1368,7 +1368,7 @@ static void capture_task(void *argument)
             continue;
         }
 
-        /* 成功排隊：此緩衝區所有權暫時轉移給 writer_task */
+        /* 成功排隊：此緩衝區所有權暫時轉移給 cam_writer */
         stats->enqueued_frames++;
         timing_trace_stat(TT_STAT_CAM_ENQUEUE, ready_frame.enqueue_us - received_us, frame_id);
         const uint32_t ready = uxQueueMessagesWaiting(s_ready_queue);
@@ -1385,13 +1385,18 @@ static void capture_task(void *argument)
 }
 
 /**
- * @brief SD 卡寫入任務 (Writer Task)
- * 運行於：CPU Core 0，優先權 (Priority 5)
+ * @brief cam_writer 任務：把影格寫進 SD 卡
+ * 運行於：CPU Core 0，優先權 5；每次錄影由 cam_record_start() 建立，結束後自刪。
  * 職責：
- * 從佇列取出 ready_frame_t，將 300KB 資料分段透過 DMA 寫入 SD 卡。
- * 寫入完成後，負責呼叫 esp_camera_fb_return() 將緩衝區釋放回相機驅動。
+ *  1. 從 s_ready_queue 取出 ready_frame_t (逾時 RECORD_QUEUE_WAIT_MS，用來檢查是否該結束)。
+ *  2. write_frame_to_sd()：300 KB 分段從 PSRAM memcpy 到內部 RAM 暫存區，
+ *     再 write() 進預先配置的 RAW 檔 (SDMMC DMA 不能直接讀 PSRAM)。
+ *  3. 寫完才 esp_camera_fb_return() 把 fb 還給驅動 (零拷貝：fb 一直被持有到這裡)。
+ *  4. camera_capture 已結束 (CAPTURE_DONE_BIT) 且佇列清空 → 依實際幀數 ftruncate
+ *     多餘的預配置空間、fsync，設 WRITER_DONE_BIT。
+ * 這裡的時間主要在等 SD 卡 (write 內輪詢卡片忙碌)，CPU 實際運算不多。
  */
-static void writer_task(void *argument)
+static void cam_writer(void *argument)
 {
     (void)argument;
     recording_stats_t *stats = &s_recording.stats;
@@ -1449,7 +1454,7 @@ static void writer_task(void *argument)
             continue;
         }
 
-        /* 當 capture_task 已完成且佇列中的影格已全部清空寫畢時，退出迴圈 */
+        /* 當 camera_capture 已完成且佇列中的影格已全部清空寫畢時，退出迴圈 */
         if ((xEventGroupGetBits(s_record_events) & CAPTURE_DONE_BIT) != 0 &&
             uxQueueMessagesWaiting(s_ready_queue) == 0U) {
             break;
@@ -1516,7 +1521,7 @@ esp_err_t cam_record_prepare(time_t recorded_at_epoch)
 
 /**
  * @brief 在指定的 esp_timer 時間點開始錄影 (立即返回)
- * 說明：trigger_us 可以稍晚於現在；觸發點之前的影格由 capture_task 視為過期丟棄。
+ * 說明：trigger_us 可以稍晚於現在；觸發點之前的影格由 camera_capture 視為過期丟棄。
  */
 esp_err_t cam_record_start(int64_t trigger_us)
 {
@@ -1551,7 +1556,7 @@ esp_err_t cam_record_start(int64_t trigger_us)
              (unsigned)FRAME_QUEUE_CAPACITY);
 
     /* 4. 在 CPU 0 啟動 SD 卡寫入任務 */
-    if (xTaskCreatePinnedToCore(writer_task, "sd_writer",
+    if (xTaskCreatePinnedToCore(cam_writer, "cam_writer",
                                 WRITER_TASK_STACK_BYTES, NULL,
                                 WRITER_TASK_PRIORITY, NULL,
                                 WRITER_TASK_CORE) != pdPASS) {
@@ -1561,7 +1566,7 @@ esp_err_t cam_record_start(int64_t trigger_us)
     s_recording.started = true;
 
     /* 5. 在 CPU 1 啟動相機擷取任務 */
-    if (xTaskCreatePinnedToCore(capture_task, "camera_capture",
+    if (xTaskCreatePinnedToCore(camera_capture, "camera_capture",
                                 CAPTURE_TASK_STACK_BYTES, NULL,
                                 CAPTURE_TASK_PRIORITY, NULL,
                                 CAPTURE_TASK_CORE) != pdPASS) {
@@ -1718,7 +1723,7 @@ esp_err_t cam_record_finish(cam_record_result_t *result)
     strlcpy(result->file_path, result_path, sizeof(result->file_path));
     (void)node_storage_get_file_size(result_path, &result->file_bytes);
 
-    /* writer_task 已結束 (WRITER_DONE)，暫存區不再使用，交還給上傳 */
+    /* cam_writer 已結束 (WRITER_DONE)，暫存區不再使用，交還給上傳 */
     release_sd_dma_buffer();
     s_recording.prepared = false;
     s_recording.started = false;

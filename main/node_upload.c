@@ -22,6 +22,7 @@
 #include "app_config.h"
 #include "cam_record.h"
 #include "device_identity.h"
+#include "la_probe.h"
 #include "mic_record.h"
 #include "node_storage.h"
 #include "timing_trace.h"
@@ -218,6 +219,8 @@ static esp_err_t send_file(const node_pending_file_t *pending, int *status_out)
         return ESP_ERR_INVALID_SIZE;
     }
     ESP_RETURN_ON_ERROR(ensure_reader_task(), TAG, "upload reader task");
+    /* debug：LA task 腳改看上傳的 4 個 task (upload_reader 到這裡才保證已建立) */
+    la_probe_set_phase(LA_PHASE_UPLOAD);
 
     /*
      * 用 open()/read() 而不是 fopen()/fread()：stdio 的 128 B 緩衝讓 FATFS 只能
@@ -412,6 +415,7 @@ static esp_err_t upload_one_file(const node_pending_file_t *pending, int *status
         return ESP_ERR_INVALID_STATE;
     }
     const esp_err_t err = send_file(pending, status_out);
+    la_probe_set_phase(LA_PHASE_NONE);
     node_storage_io_buffer_release(s_io_buffer);
     s_io_buffer = NULL;
     return err;
