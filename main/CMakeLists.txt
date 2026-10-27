@@ -16,6 +16,7 @@ idf_component_register(
         "net_bench.c"
         "timing_trace.c"
         "la_probe.c"
+        "la_isr_trace.S"
         "sysview_uart_guard.c"
     INCLUDE_DIRS "."
     REQUIRES
@@ -39,6 +40,20 @@ idf_component_register(
 # UART driver from ISRs, which panics while the cache is disabled).
 if(CONFIG_APPTRACE_SV_DEST_UART)
     target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=SEGGER_RTT_ReadNoLock")
+endif()
+
+# LA ISR probes (la_isr_trace.S): wrap the FreeRTOS interrupt entry/exit so ISR
+# time drops the idle / task pins. Same condition as la_task_trace.h:
+# APP_LA_PROBE_ENABLE 1 in app_config.h (read here; editing the file re-runs
+# CMake, and la_probe.c fails the build if the two sides disagree) and no SystemView.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_LIST_DIR}/app_config.h")
+file(STRINGS "${CMAKE_CURRENT_LIST_DIR}/app_config.h" la_probe_on
+    REGEX "^#define[ \t]+APP_LA_PROBE_ENABLE[ \t]+1")
+if(la_probe_on AND NOT CONFIG_APPTRACE_SV_ENABLE)
+    target_link_libraries(${COMPONENT_LIB} INTERFACE
+        "-Wl,--wrap=_frxt_int_enter" "-Wl,--wrap=_frxt_int_exit")
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE LA_ISR_WRAP=1)
 endif()
 
 # cam_record.c calls the bundled camera HAL pause/resume API.

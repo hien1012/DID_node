@@ -2,7 +2,8 @@
 
 /*
  * Debug：邏輯分析儀量測腳 (APP_LA_PROBE_ENABLE)，腳位在 board_pins.h 的 LA_PIN_*。
- * 腳位的高低由 FreeRTOS 切換 task 時更新 (la_task_trace.h)；這裡只負責初始化，
+ * 腳位的高低由 FreeRTOS 切換 task 時 (la_task_trace.h) 與中斷進出時 (la_isr_trace.S，
+ * ISR 期間該核心的腳拉低) 更新；這裡只負責初始化，
  * 以及依階段決定 LA_PIN_TASK0..3 對應哪些 task。關閉時兩個函式都不做事。
  */
 #include "esp_err.h"

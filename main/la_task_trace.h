@@ -11,7 +11,9 @@
  * 展開，那裡看得到 pxCurrentTCB[] 與 static 的 xIdleTaskHandle[]。
  * traceTASK_SWITCHED_OUT 不用 (見 la_probe_core_pin 的說明)。
  *
- * 限制：沒有 ISR hook，task (含 IDLE) 執行期間被中斷的時間仍算在該 task。
+ * ISR：la_isr_trace.S 包住中斷進出 (_frxt_int_enter/_exit)，最外層中斷期間把該核心的
+ * idle 腳與 task 腳拉低，離開時依 la_probe_core_idle / la_probe_core_pin 恢復，
+ * 所以兩種腳的高電位都不含 ISR 時間 (level 4/5 高優先權中斷除外)。
  * 只寫 GPIO W1TS/W1TC 暫存器，不呼叫函式 (排程器內、可能在 cache 關閉時執行)。
  */
 #include "app_config.h"
@@ -41,6 +43,10 @@ __attribute__((weak)) void *volatile la_probe_task_tcb[LA_TASK_SLOT_COUNT];
  * 只有該核心的切換 hook 與 la_probe_set_phase() (critical section 內) 會寫入。
  */
 __attribute__((weak)) volatile uint8_t la_probe_core_pin[2];
+
+/* 每顆核心目前是否在跑 IDLE (1/0)。xIdleTaskHandle[] 是 tasks.c 的 static，
+ * la_isr_trace.S 離開中斷時看這個決定要不要把 idle 腳拉回高。只有切換 hook 寫入。 */
+__attribute__((weak)) volatile uint8_t la_probe_core_idle[2];
 
 /* pin < 32 用 GPIO_OUT_*，32..48 用 GPIO_OUT1_* */
 #define LA_PIN_SET(pin, level)                                                             \
@@ -76,8 +82,10 @@ static inline __attribute__((always_inline)) uint32_t la_task_pin_of(const void 
         const uint32_t la_idle_pin = la_core ? LA_PIN_IDLE_CPU1 : LA_PIN_IDLE_CPU0;        \
         if (pxCurrentTCB[la_core] == xIdleTaskHandle[la_core]) {                           \
             LA_PIN_SET(la_idle_pin, 1);                                                    \
+            la_probe_core_idle[la_core] = 1;                                               \
         } else {                                                                           \
             LA_PIN_SET(la_idle_pin, 0);                                                    \
+            la_probe_core_idle[la_core] = 0;                                               \
         }                                                                                  \
         const uint32_t la_new = la_task_pin_of(pxCurrentTCB[la_core]);                     \
         const uint32_t la_old = la_probe_core_pin[la_core];                                \

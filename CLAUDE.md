@@ -60,6 +60,8 @@ idf.py -B build\s3 build
 - LA 量測腳（debug，`APP_LA_PROBE_ENABLE`，`la_probe.h` / `la_task_trace.h`；頂層 CMakeLists 以 `-include` 注入 freertos 的
   `traceTASK_SWITCHED_IN/OUT`）：3 / 46 = CPU0 / CPU1 在 IDLE；task 腳 41 / 42 / 21 / 48 = 綁定的 task 正在執行，
   錄製時 cam_task / cam_writer / mic_capture / mic_writer，上傳時 wifi / main / upload_reader / tiT（`la_probe_set_phase`）。
+  ISR 期間該核心的 idle / task 腳拉低：`la_isr_trace.S` 以 `-Wl,--wrap=_frxt_int_enter/_exit` 包中斷進出
+  （main/CMakeLists 讀 `app_config.h` 決定、定義 `LA_ISR_WRAP`；level 4/5 中斷不算）。
   3、46 是 strapping 腳、48 兼 RGB LED，都只在開機後當輸出。與 `sdkconfig.sysview_uart`（UART1 用 41/42）互斥。
 - **GPIO14 不要放時脈訊號**：它緊鄰 PCLK（13），I2S BCLK 放在 14 時耦合進 PCLK，錄影全部損壞（debug_sdcard #32–#33）。時脈類訊號放右側排針。
 - 禁用：26–37（flash / Octal PSRAM）、0/3/45/46（strapping）、19/20（原生 USB/JTAG 口）、43/44（UART0 = 板上 COM 口，燒錄與主要 log）。

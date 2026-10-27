@@ -64,7 +64,8 @@
 
 /*
  * --- Logic analyzer probes (debug, APP_LA_PROBE_ENABLE in app_config.h) ---
- * Driven from the FreeRTOS task-switch hook (la_task_trace.h). Spare pins only;
+ * Driven from the FreeRTOS task-switch hook (la_task_trace.h) and the interrupt
+ * entry/exit wrappers (la_isr_trace.S: low while that core is in an ISR). Spare pins only;
  * not GPIO14 (next to PCLK, see the mic clock note above). Passive LA taps need
  * no pin: VSYNC = 6, SD CMD = 38.
  *

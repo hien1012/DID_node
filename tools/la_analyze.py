@@ -12,8 +12,12 @@ Default channel order (= board_pins.h LA_PIN_* wired to D0..D6):
     D4 idle0   3   CPU0 in IDLE
     D5 idle1  46   CPU1 in IDLE
     D6 vsync   6   camera VSYNC (active low on this sensor setup)
-Task pins mean "this task is on the CPU" (ISR time included). Which task a pin
-shows depends on the phase: recording while VSYNC runs, upload afterwards.
+Task pins mean "this task is on the CPU", idle pins "this core runs IDLE"; both
+go low while their core is in a level 1-3 ISR (main/la_isr_trace.S), so ISR time
+counts as busy but not as any task, and a task's run is split into several
+pulses by the ISRs inside it (pulse count / width stats are per piece).
+Which task a pin shows depends on the phase: recording while VSYNC runs, upload
+afterwards.
 
 Reports:
   * phases, found automatically: task pins are only bound while recording or

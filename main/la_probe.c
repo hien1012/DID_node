@@ -1,5 +1,11 @@
 #include "la_probe.h"
 
+/* main/CMakeLists.txt 讀 app_config.h 決定要不要包中斷進出 (la_isr_trace.S)，
+ * 這裡確認它與 la_task_trace.h 的條件一致 */
+#if (APP_LA_PROBE_ENABLE && !CONFIG_APPTRACE_SV_ENABLE) != defined(LA_ISR_WRAP)
+#error "LA_ISR_WRAP does not match APP_LA_PROBE_ENABLE: check the regex in main/CMakeLists.txt"
+#endif
+
 #if APP_LA_PROBE_ENABLE
 
 /* 必須在 FreeRTOS 標頭之前：它定義 traceTASK_SWITCHED_IN/OUT，FreeRTOS.h 才不會
