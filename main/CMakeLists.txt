@@ -17,6 +17,7 @@ idf_component_register(
         "timing_trace.c"
         "la_probe.c"
         "la_isr_trace.S"
+        "isr_profile.c"
         "sysview_uart_guard.c"
     INCLUDE_DIRS "."
     REQUIRES
@@ -54,6 +55,18 @@ if(la_probe_on AND NOT CONFIG_APPTRACE_SV_ENABLE)
     target_link_libraries(${COMPONENT_LIB} INTERFACE
         "-Wl,--wrap=_frxt_int_enter" "-Wl,--wrap=_frxt_int_exit")
     target_compile_definitions(${COMPONENT_LIB} PRIVATE LA_ISR_WRAP=1)
+endif()
+
+# C ISR profiler (isr_profile.c): wrap esp_intr_alloc_intrstatus and
+# xt_set_interrupt_handler when APP_ISR_PROFILE_ENABLE is 1 in app_config.h.
+file(STRINGS "${CMAKE_CURRENT_LIST_DIR}/app_config.h" isr_profile_on
+    REGEX "^#define[ \t]+APP_ISR_PROFILE_ENABLE[ \t]+1")
+if(isr_profile_on)
+    target_link_libraries(${COMPONENT_LIB} INTERFACE
+        "-Wl,--wrap=esp_intr_alloc"
+        "-Wl,--wrap=esp_intr_alloc_intrstatus"
+        "-Wl,--wrap=xt_set_interrupt_handler")
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE ISR_PROFILE_WRAP=1)
 endif()
 
 # cam_record.c calls the bundled camera HAL pause/resume API.

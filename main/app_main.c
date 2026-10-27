@@ -14,6 +14,7 @@
 #include "cam_record.h"
 #include "cam_stream.h"
 #include "device_identity.h"
+#include "isr_profile.h"
 #include "la_probe.h"
 #include "mic_record.h"
 #include "net_bench.h"
@@ -146,7 +147,9 @@ static void upload_pass(time_t deadline_epoch)
     net_bench_log_heap("before upload");
     node_upload_summary_t summary = {0};
     timing_trace_mark(TT_MARK_UPLOAD_START);
+    isr_profile_reset();
     (void)node_upload_process_pending(deadline_epoch, &summary);
+    isr_profile_print("UPLOAD");
     timing_trace_mark(TT_MARK_UPLOAD_END);
     node_health_note_upload(&summary);
     net_bench_log_heap("after upload");   /* min = 上傳期間內部 RAM 的最低點 */

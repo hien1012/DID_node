@@ -33,7 +33,7 @@
 
 /* Debug: network throughput test at boot (net_bench.c). Run `iperf -s -i 1`
  * (iperf2) on the PC first. Set to 0 when done; it costs a few seconds per boot. */
-#define APP_NET_BENCH_ENABLE       1
+#define APP_NET_BENCH_ENABLE       0
 #define APP_NET_BENCH_HOST         "10.10.10.7"
 #define APP_NET_BENCH_PORT         5001
 #define APP_NET_BENCH_BYTES        (8U * 1024U * 1024U)
@@ -45,7 +45,12 @@
 
 /* Debug: drive LA_PIN_* (board_pins.h) high while each recording step runs,
  * for a logic analyzer (la_probe.h). One register write per edge. 0 = compiled out. */
-#define APP_LA_PROBE_ENABLE        1
+#define APP_LA_PROBE_ENABLE        0
+
+/* Debug: wrap the C ISR dispatchers (esp_intr_alloc_intrstatus +
+ * xt_set_interrupt_handler) to measure per-ISR count, duration and CPU load %
+ * on each core during recording and upload (isr_profile.h). 0 = compiled out. */
+#define APP_ISR_PROFILE_ENABLE     1
 
 /* Debug: stream frames straight to the PC instead of recording (cam_stream.c).
  * Run `python tools/cam_stream_view.py` on the PC first. While 1, the node
