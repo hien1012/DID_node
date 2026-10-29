@@ -52,6 +52,7 @@ static esp_err_t init_camera_recorder(void)
                                 CAMERA_INIT_TASK_STACK_BYTES, &context,
                                 CAMERA_INIT_TASK_PRIORITY, NULL,
                                 camera_core) != pdPASS) {
+        ESP_LOGE(TAG,"pin to core 1 failed");
         return ESP_ERR_NO_MEM;
     }
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
@@ -181,6 +182,7 @@ void app_main(void)
         TickType_t cycle_started = xTaskGetTickCount();
 
         cam_record_result_t record_result = {0};
+        cam_health_set_state(CAM_HEALTH_STATE_RECORDING);
         esp_err_t err = cam_record_once(&record_result);
         /* 早期失敗路徑也要停相機；正常路徑已在 cam_record_once() 停止。 */
         ESP_ERROR_CHECK(cam_record_pause());
@@ -195,6 +197,7 @@ void app_main(void)
                      esp_err_to_name(record_result.error));
         }
 
+        cam_health_set_state(CAM_HEALTH_STATE_UPLOADING);
         if (wifi_manager_wait_connected(pdMS_TO_TICKS(15000)) == ESP_OK) {
             cam_upload_summary_t summary = {0};
             err = cam_upload_process_pending(&summary);
@@ -205,6 +208,7 @@ void app_main(void)
         } else {
             ESP_LOGW(TAG, "Camera upload deferred: Wi-Fi unavailable");
         }
+        cam_health_set_state(CAM_HEALTH_STATE_IDLE);
 
         TickType_t elapsed = xTaskGetTickCount() - cycle_started;
         TickType_t period = pdMS_TO_TICKS(CAM_RECORD_PERIOD_MS);

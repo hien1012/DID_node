@@ -27,6 +27,7 @@ esp_err_t cam_storage_get_file_size(const char *path, size_t *size_out);
 esp_err_t cam_storage_get_next_done(char *path, size_t path_size,
                                     time_t *recorded_at_epoch);
 esp_err_t cam_storage_count_done(size_t *count_out);
+esp_err_t cam_storage_count_undone(size_t *count_out);
 esp_err_t cam_storage_delete_done(const char *path);
 esp_err_t cam_storage_get_free_bytes(uint64_t *free_bytes_out);
 void cam_storage_deinit(void);

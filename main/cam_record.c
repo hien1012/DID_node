@@ -108,7 +108,7 @@
 #endif
 
 /* --- 錄影與影格率驗證參數 --- */
-#define CAMERA_WARMUP_FRAMES    10U                         /* 開機暖機幀數：丟棄前 10 幀，讓感測器自動曝光/白平衡穩定 */
+#define CAMERA_WARMUP_FRAMES    50U                         /* 開機暖機幀數：丟棄前 50 幀，讓感測器自動曝光/白平衡穩定 */
 #define CAMERA_FRAME_BUFFERS    8U                          /* 配置於外部 PSRAM 的影格緩衝區數量 (總計 8 * 300KB ≈ 2.4MB) */
 #define TEST_DURATION_SECONDS   5U                         /* 開機硬體資格測試時間：10 秒 */
 #define TARGET_FPS              CAM_TARGET_FPS              /* 目標影格率：每秒 5 幀 */
@@ -396,6 +396,21 @@ static bool s_initialized = false;
 static bool s_camera_paused = false;
 static bool s_xclk_stopped = false;          /* XCLK (LEDC) 是否已在暫停期間停止輸出 */
 static int64_t s_xclk_started_us = 0;        /* 最近一次恢復 XCLK 的時間，用來等待感測器穩定 */
+
+/*
+ * 錄影兩個 task 用靜態 stack/TCB、開機建立一次後常駐，每次錄影以 task notification 喚醒。
+ * 原本每次錄影 xTaskCreate 要向 heap 要 2 × ~4.4 KB 連續內部 RAM，heap 碎片化後會
+ * ESP_ERR_NO_MEM；常駐也避免重用同一份 static TCB 時，上一輪 task 尚未被 idle 回收。
+ */
+static StaticTask_t s_capture_task_tcb;
+static StaticTask_t s_writer_task_tcb;
+static StackType_t s_capture_task_stack[CAPTURE_TASK_STACK_BYTES];
+static StackType_t s_writer_task_stack[WRITER_TASK_STACK_BYTES];
+static TaskHandle_t s_capture_task = NULL;
+static TaskHandle_t s_writer_task = NULL;
+
+static void capture_task(void *argument);
+static void writer_task(void *argument);
 
 /* 靜態記憶體配置的 FreeRTOS queue 用來儲存frame buffer的地址 (避免動態 malloc 造成記憶體碎裂) */
 static StaticQueue_t s_ready_queue_control;
@@ -868,6 +883,24 @@ static esp_err_t init_record_pipeline(void)
         return ESP_ERR_NO_MEM;                              // 回報 記憶體空間不足
     }
 
+    /* 常駐 task 只建立一次；deinit 後重新 init 時沿用（它們只在收到 notification 時讀全域狀態） */
+    if (s_writer_task == NULL) {
+        s_writer_task = xTaskCreateStaticPinnedToCore(
+            writer_task, "sd_writer", WRITER_TASK_STACK_BYTES, NULL,
+            WRITER_TASK_PRIORITY, s_writer_task_stack, &s_writer_task_tcb,
+            WRITER_TASK_CORE);
+    }
+    if (s_capture_task == NULL) {
+        s_capture_task = xTaskCreateStaticPinnedToCore(
+            capture_task, "camera_capture", CAPTURE_TASK_STACK_BYTES, NULL,
+            CAPTURE_TASK_PRIORITY, s_capture_task_stack, &s_capture_task_tcb,
+            CAPTURE_TASK_CORE);
+    }
+    if (s_writer_task == NULL || s_capture_task == NULL) {
+        release_record_pipeline();
+        return ESP_ERR_NO_MEM;
+    }
+
     ESP_LOGI(TAG,                                           // 建立成功 -> 印出配置的大小
              "Zero-copy recording ready: camera_fb=%u, ready_queue=%u, "
              "SD staging=%u bytes internal DMA RAM",
@@ -1316,15 +1349,12 @@ static esp_err_t run_startup_fps_test(void)
  * ============================================================================ */
 
 /**
- * @brief 影像擷取任務 (Capture Task)
- * 運行於：CPU Core 1，高優先權 (Priority 6)
- * 職責：
+ * @brief 單次錄影的影像擷取迴圈（由 capture_task 呼叫）
  * 從相機驅動讀取影格，嚴格審核時戳與格式，並封裝成 ready_frame_t 丟入佇列。
- * 本任務絕對不執行阻塞的檔案操作，確保相機硬體 FIFO 隨時能被及時清空。
+ * 本迴圈絕對不執行阻塞的檔案操作，確保相機硬體 FIFO 隨時能被及時清空。
  */
-static void capture_task(void *argument)
+static void capture_frames(void)
 {
-    (void)argument;
     recording_stats_t *stats = &s_recording.stats;
     int64_t previous_seen_us = 0;
 
@@ -1422,22 +1452,30 @@ static void capture_task(void *argument)
             stats->peak_ready_slots = ready;               /* 紀錄佇列最高水位 */
         }
     }
-
-    stats->capture_end_us = esp_timer_get_time();
-    xEventGroupSetBits(s_record_events, CAPTURE_DONE_BIT);  /* 通知系統：擷取任務已結束 */
-    vTaskDelete(NULL);                                      /* 自我刪除任務 */
 }
 
 /**
- * @brief SD 卡寫入任務 (Writer Task)
- * 運行於：CPU Core 0，優先權 (Priority 5)
- * 職責：
+ * @brief 影像擷取任務 (Capture Task)
+ * 運行於：CPU Core 1，高優先權 (Priority 6)；常駐，每次錄影由 cam_record_once() notify 一次。
+ */
+static void capture_task(void *argument)
+{
+    (void)argument;
+    for (;;) {
+        (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        capture_frames();
+        s_recording.stats.capture_end_us = esp_timer_get_time();
+        xEventGroupSetBits(s_record_events, CAPTURE_DONE_BIT);  /* 通知系統：本次擷取已結束 */
+    }
+}
+
+/**
+ * @brief 單次錄影的 SD 寫入迴圈（由 writer_task 呼叫）
  * 從佇列取出 ready_frame_t，將 300KB 資料分段透過 DMA 寫入 SD 卡。
  * 寫入完成後，負責呼叫 esp_camera_fb_return() 將緩衝區釋放回相機驅動。
  */
-static void writer_task(void *argument)
+static void write_frames(void)
 {
-    (void)argument;
     recording_stats_t *stats = &s_recording.stats;
 
     for (;;) {
@@ -1498,10 +1536,21 @@ static void writer_task(void *argument)
         ESP_LOGE(TAG, "RAW finalize failed: errno=%d (%s)",
                  errno, strerror(errno));
     }
+}
 
-    stats->writer_end_us = esp_timer_get_time();
-    xEventGroupSetBits(s_record_events, WRITER_DONE_BIT);   /* 通知系統：寫入任務已結束 */
-    vTaskDelete(NULL);                                      /* 自我刪除任務 */
+/**
+ * @brief SD 卡寫入任務 (Writer Task)
+ * 運行於：CPU Core 0，優先權 (Priority 5)；常駐，每次錄影由 cam_record_once() notify 一次。
+ */
+static void writer_task(void *argument)
+{
+    (void)argument;
+    for (;;) {
+        (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        write_frames();
+        s_recording.stats.writer_end_us = esp_timer_get_time();
+        xEventGroupSetBits(s_record_events, WRITER_DONE_BIT);   /* 通知系統：本次寫入已結束 */
+    }
 }
 
 /**
@@ -1575,28 +1624,15 @@ esp_err_t cam_record_once(cam_record_result_t *result)
              (unsigned)CAMERA_FRAME_BUFFERS,
              (unsigned)FRAME_QUEUE_CAPACITY);
 
-    /* 4. 在 CPU 0 啟動 SD 卡寫入任務 */
-    if (xTaskCreatePinnedToCore(writer_task, "sd_writer",
-                                WRITER_TASK_STACK_BYTES, NULL,
-                                WRITER_TASK_PRIORITY, NULL,
-                                WRITER_TASK_CORE) != pdPASS) {
-        (void)ftruncate(s_recording.fd, 0);
-        err = ESP_ERR_NO_MEM;
-        (void)cam_storage_finish_recording(&s_recording.storage, false);
-        strlcpy(result->file_path, s_recording.storage.undone_path,
-                sizeof(result->file_path));
-        result->error = err;
-        return err;
-    }
+    /* 追蹤內部 RAM 碎片化（ESP_ERR_NO_MEM 的根因），不受 APP_NET_BENCH_ENABLE 影響 */
+    ESP_LOGI(TAG, "Internal RAM: free=%u largest=%u min=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
 
-    /* 5. 在 CPU 1 啟動相機擷取任務 */
-    if (xTaskCreatePinnedToCore(capture_task, "camera_capture",
-                                CAPTURE_TASK_STACK_BYTES, NULL,
-                                CAPTURE_TASK_PRIORITY, NULL,
-                                CAPTURE_TASK_CORE) != pdPASS) {
-        s_recording.stats.capture_result = ESP_ERR_NO_MEM;
-        xEventGroupSetBits(s_record_events, CAPTURE_DONE_BIT);
-    }
+    /* 4./5. 喚醒常駐的 SD 寫入任務 (CPU 0) 與相機擷取任務 (CPU 1)；不再於錄影時配置記憶體 */
+    xTaskNotifyGive(s_writer_task);
+    xTaskNotifyGive(s_capture_task);
 
     /* 6. 阻塞等待兩大任務雙雙回報完成 (CAPTURE_DONE & WRITER_DONE) */
     xEventGroupWaitBits(s_record_events,

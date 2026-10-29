@@ -30,11 +30,27 @@ typedef struct {
     uint32_t last_saved_frames;
     uint32_t last_dropped_frames;
     uint32_t last_frame_gaps;
+    cam_health_state_id_t state;
 } cam_health_state_t;
 
 static const char *TAG = "CAM_HEALTH";
 static SemaphoreHandle_t s_mutex = NULL;
 static cam_health_state_t s_state;
+
+static const char *state_name(cam_health_state_id_t state)
+{
+    switch (state) {
+    case CAM_HEALTH_STATE_IDLE:
+        return "idle";
+    case CAM_HEALTH_STATE_RECORDING:
+        return "recording";
+    case CAM_HEALTH_STATE_UPLOADING:
+        return "uploading";
+    case CAM_HEALTH_STATE_BOOTING:
+    default:
+        return "booting";
+    }
+}
 
 static esp_err_t send_heartbeat(void)
 {
@@ -45,9 +61,16 @@ static esp_err_t send_heartbeat(void)
     }
 
     size_t pending_files = 0;
+    size_t broken_files = 0;
     uint64_t sd_free_bytes = 0;
     (void)cam_storage_count_done(&pending_files);
+    (void)cam_storage_count_undone(&broken_files);
     (void)cam_storage_get_free_bytes(&sd_free_bytes);
+    /* 錄影中的檔案也暫放在 cam_undone，不算 broken */
+    if (snapshot.state == CAM_HEALTH_STATE_RECORDING && broken_files > 0U) {
+        --broken_files;
+    }
+    const int rssi = wifi_manager_get_rssi();
 
     cJSON *root = cJSON_CreateObject();
     if (!root) {
@@ -58,8 +81,9 @@ static esp_err_t send_heartbeat(void)
     cJSON_AddNumberToObject(root, "reported_at", (double)time(NULL));
     cJSON_AddNumberToObject(root, "uptime_seconds",
                             (double)(esp_timer_get_time() / 1000000));
+    cJSON_AddStringToObject(root, "state", state_name(snapshot.state));
     cJSON_AddBoolToObject(root, "wifi_connected", wifi_manager_is_connected());
-    cJSON_AddNumberToObject(root, "wifi_rssi", wifi_manager_get_rssi());
+    cJSON_AddNumberToObject(root, "wifi_rssi", rssi);
     cJSON_AddNumberToObject(root, "free_heap_bytes", esp_get_free_heap_size());
     cJSON_AddNumberToObject(
         root, "free_psram_bytes",
@@ -77,6 +101,19 @@ static esp_err_t send_heartbeat(void)
     cJSON_AddNumberToObject(root, "last_dropped_frames", snapshot.last_dropped_frames);
     cJSON_AddNumberToObject(root, "last_frame_gaps", snapshot.last_frame_gaps);
     cJSON_AddNumberToObject(root, "reset_reason", esp_reset_reason());
+
+    /* server_mix.py 的 console 摘要讀 v1 巢狀欄位；上面的平面欄位保留給既有分析工具 */
+    cJSON *wifi = cJSON_AddObjectToObject(root, "wifi");
+    if (wifi) {
+        cJSON_AddNumberToObject(wifi, "rssi", rssi);
+    }
+    cJSON *storage = cJSON_AddObjectToObject(root, "storage");
+    if (storage) {
+        cJSON_AddNumberToObject(storage, "free_mb",
+                                (double)(sd_free_bytes / (1024U * 1024U)));
+        cJSON_AddNumberToObject(storage, "pending_files", (double)pending_files);
+        cJSON_AddNumberToObject(storage, "broken_files", (double)broken_files);
+    }
 
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -137,12 +174,22 @@ esp_err_t cam_health_monitor_start(void)
         return ESP_ERR_NO_MEM;
     }
     memset(&s_state, 0, sizeof(s_state));
+    s_state.state = CAM_HEALTH_STATE_BOOTING;
     if (xTaskCreate(heartbeat_task, "cam_heartbeat", 6144, NULL, 4, NULL) != pdPASS) {
         vSemaphoreDelete(s_mutex);
         s_mutex = NULL;
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
+}
+
+void cam_health_set_state(cam_health_state_id_t state)
+{
+    if (!s_mutex || xSemaphoreTake(s_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        return;
+    }
+    s_state.state = state;
+    xSemaphoreGive(s_mutex);
 }
 
 void cam_health_note_recording(const cam_record_result_t *result)

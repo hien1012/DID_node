@@ -357,7 +357,7 @@ esp_err_t cam_storage_get_next_done(char *path, size_t path_size,
     return err;
 }
 
-esp_err_t cam_storage_count_done(size_t *count_out)
+static esp_err_t count_recordings(const char *directory_path, size_t *count_out)
 {
     if (!count_out) {
         return ESP_ERR_INVALID_ARG;
@@ -368,7 +368,7 @@ esp_err_t cam_storage_count_done(size_t *count_out)
     if (xSemaphoreTake(s_storage_mutex, portMAX_DELAY) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
     }
-    DIR *directory = opendir(CAM_STORAGE_DONE_DIR);
+    DIR *directory = opendir(directory_path);
     if (!directory) {
         xSemaphoreGive(s_storage_mutex);
         return ESP_FAIL;
@@ -385,6 +385,17 @@ esp_err_t cam_storage_count_done(size_t *count_out)
     *count_out = count;
     xSemaphoreGive(s_storage_mutex);
     return ESP_OK;
+}
+
+esp_err_t cam_storage_count_done(size_t *count_out)
+{
+    return count_recordings(CAM_STORAGE_DONE_DIR, count_out);
+}
+
+/* 失敗的錄影留在 cam_undone（不會上傳），heartbeat 回報為 broken_files */
+esp_err_t cam_storage_count_undone(size_t *count_out)
+{
+    return count_recordings(CAM_STORAGE_UNDONE_DIR, count_out);
 }
 
 esp_err_t cam_storage_delete_done(const char *path)
