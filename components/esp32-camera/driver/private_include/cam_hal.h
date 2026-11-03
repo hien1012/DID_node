@@ -91,6 +91,9 @@ void cam_dma_timing_stop(cam_dma_timing_t *out);
 /* fb 收完整幀的時間 (cam_task 處理結尾 VSYNC 時)；fb 不屬於驅動時回傳 0 */
 int64_t cam_get_frame_done_us(const camera_fb_t *fb);
 
+/* 開機以來長度不符（FB-SIZE）而被丟棄的幀數，只增不減；呼叫端自行相減取區間值 */
+uint32_t cam_get_incomplete_frames(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -14,7 +14,9 @@
   "wifi":    { "rssi": -58, "disconnects": 2, "restarts": 0, "last_reason": 201, "heartbeat_fail_streak": 0 },
   "storage": { "free_mb": 28000, "pending_files": 0, "broken_files": 1 },
   "memory":  { "heap_free_kb": 180, "psram_free_kb": 5600 },
-  "last_recording": { "at": 1760000400, "camera": "ok", "frames": 300, "dropped": 0, "mic": "ok", "samples": 960000 },
+  "last_recording": { "at": 1760000400, "camera": "ok", "camera_fault": "none", "frames": 100, "dropped": 0, "mic": "ok", "samples": 320000 },
+  "last_fault": "none",
+  "faults": { "frame_drop": 1, "fb_incomplete": 0, "frame_gap": 0, "capture": 0, "storage": 0, "other": 0 },
   "last_upload":    { "at": 1760000520, "uploaded": 2, "failed": 0, "rejected": 0, "deferred": false }
 }
 ```
@@ -31,8 +33,10 @@
 | `wifi.last_reason` | 最後一次斷線原因碼（`wifi_err_reason_t`，例如 201 = 找不到 AP） |
 | `wifi.heartbeat_fail_streak` | 連續幾次 heartbeat 沒有收到任何 HTTP 回應 |
 | `storage.pending_files` | `done/` 中等待上傳的檔案數；持續增加代表上傳跟不上或斷線 |
-| `storage.broken_files` | `broken/` 中損壞或不合格的檔案數 |
-| `last_recording` | 最近一次錄製；`camera` / `mic` 為 `ok`、`broken` 或 `disabled`（開機初始化失敗）。尚未錄製時為 `null` |
+| `storage.broken_files` | `broken/` 中的檔案數：損壞的 WAV 與被 server 拒收的檔案。損壞的影片直接刪除，不算在這裡（看 `faults`） |
+| `last_recording` | 最近一次錄製；`camera` / `mic` 為 `ok`、`broken` 或 `disabled`（開機初始化失敗）。`camera_fault` 是該次相機失敗類別（成功為 `none`）。尚未錄製時為 `null` |
+| `last_fault` | 最近一次相機錄影的失敗類別，成功為 `none` |
+| `faults` | 開機以來相機錄影失敗次數，依類別累計、只增不減（重開機歸零，看 `uptime_s`）。類別依序判定、取第一個符合的：`capture`（取幀逾時 / 時戳錯誤 / 影格大小不對）→ `storage`（建檔、預配置、寫入、搬檔失敗）→ `frame_drop`（佇列滿丟幀，SD 卡頓）→ `fb_incomplete`（時戳斷層或幀數不足，且驅動有長度不符的幀）/ `frame_gap`（同上但驅動沒有）→ `other` |
 | `last_upload` | 最近一次上傳；`deferred` = 為了趕下一次錄製而延後；尚未上傳時為 `null` |
 
 ## Wi-Fi 斷線檢查與應對

@@ -66,6 +66,10 @@ static cam_obj_t *cam_obj = NULL;
 static volatile bool g_psram_dma_mode = CAMERA_PSRAM_DMA_ENABLED;
 static portMUX_TYPE g_psram_dma_lock = portMUX_INITIALIZER_UNLOCKED;
 
+/* 長度不符而丟棄的幀數（只有 cam_task 寫入）；取代 FB-SIZE 的 ets_printf，
+ * 避免同步 UART 輸出拖慢 cam_task、漏掉更多 DMA 事件 */
+static volatile uint32_t g_incomplete_frames = 0;
+
 /* DMA 層時序統計 (本地修改，debug)：只有 cam_task 寫入；start/stop 在相機暫停時呼叫 */
 static bool s_timing_enabled = false;
 static cam_dma_timing_t s_timing;
@@ -473,7 +477,7 @@ static void cam_task(void *arg)
                         } else if (!cam_obj->jpeg_mode) {
                             if (frame_buffer_event->len != cam_obj->fb_size) {
                                 cam_obj->frames[frame_pos].en = 1;
-                                ESP_CAMERA_ETS_PRINTF(DRAM_STR("cam_hal: FB-SIZE: %u != %u, cnt == %d\r\n"), frame_buffer_event->len, (unsigned) cam_obj->fb_size, cnt);
+                                g_incomplete_frames++;
                             }
                         }
                         //send frame
@@ -945,6 +949,11 @@ void cam_dma_timing_stop(cam_dma_timing_t *out)
     if (out != NULL) {
         *out = s_timing;
     }
+}
+
+uint32_t cam_get_incomplete_frames(void)
+{
+    return g_incomplete_frames;
 }
 
 int64_t cam_get_frame_done_us(const camera_fb_t *fb)

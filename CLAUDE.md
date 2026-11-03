@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 ## 專案概要
-- 野外採集節點：**ESP32-S3** 開機測試完立即開始、之後每 10 分鐘同時錄 60 秒 cam（640x480 GRAY8 RAW 5 fps）
+- 野外採集節點：**ESP32-S3** 在 epoch 為週期倍數的時間點（`APP_RECORD_PERIOD_SEC`，5 分 → 每小時 :00、:05…）同時錄 cam（640x480 GRAY8 RAW 5 fps）
   與 mic（16 kHz mono WAV）→ 寫 SD → 錄完立即 HTTP 上傳到 `server_mix.py`（使用者 PC，同一 LAN）。
 - 板子：ESP32-S3-DevKitC-1 v1.0，WROOM-1 N16R8（16 MB flash、8 MB **Octal** PSRAM），杜邦線接線，USB 供電，不休眠。
 - ESP-IDF 5.1.2，esp32-camera 2.1.7（本地修改版）。
@@ -27,8 +27,10 @@ idf.py -B build\s3 build
 - `cam_record.c`：相機 init / 暖機 / 開機 FPS 測試，capture → 零拷貝 queue → cam_writer；感測器暫存器設定。
 - `mic_record.c`：I2S0（標準 I2S 或 PDM）→ block queue → mic_writer → 預配置 WAV。
 - 兩個 recorder 都是 `prepare(epoch)` / `start(trigger_us)` / `finish(result)` 三段式；finish 內做品質檢核。
+  cam 是嚴格檢核（丟 1 幀、斷層、擷取錯誤都算失敗），失敗歸一類 `cam_record_fault_t`，heartbeat 回報開機以來各類次數。
 - `node_storage.c`：SD 1-bit 掛載；`undone/` → `done/`（待上傳）或 `broken/`（`<stem>_broken.ext`）；
-  檔名 `YYYY_MM_DD_HHMMSS.raw|.wav`；開機時 `undone/` 殘檔視為 broken。
+  **壞掉的影片直接刪除不進 `broken/`**（mic 仍進 `broken/`）；
+  檔名 `YYYY_MM_DD_HHMMSS.raw|.wav`；開機時 `undone/` 殘檔視為 broken（影片同樣刪除）。
 - `node_upload.c`：上傳 `done/`（舊的先），ACK 驗證後刪除；4xx 永久拒收移到 `broken/`；有 deadline 不擋下次錄製。
 - `node_health.c`：每分鐘 heartbeat，兼 Wi-Fi watchdog。`wifi_manager.c`：重連 backoff、強制重連、driver 重啟。
 - `cam_stream.c`（debug）：`APP_CAM_STREAM_ENABLE=1` 時取代錄影，拍一幀→停 XCLK→TCP 送 PC（`tools/cam_stream_view.py`），可加背景寫 SD A/B。

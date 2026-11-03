@@ -50,6 +50,8 @@ typedef struct {
     time_t last_upload_at;
     node_upload_summary_t last_upload;
     uint32_t heartbeat_fail_streak;
+    cam_record_fault_t last_camera_fault;
+    uint32_t camera_faults[CAM_RECORD_FAULT_COUNT];   /* 開機以來各類錄影失敗次數，只增不減 */
 } health_state_t;
 
 static const char *TAG = "HEALTH";
@@ -141,6 +143,8 @@ static char *build_heartbeat_json(const health_state_t *snapshot)
         cJSON_AddStringToObject(recording, "camera",
                                 recording_status(session->camera_enabled,
                                                  session->camera.success));
+        cJSON_AddStringToObject(recording, "camera_fault",
+                                cam_record_fault_name(session->camera.fault));
         cJSON_AddNumberToObject(recording, "frames", session->camera.saved_frames);
         cJSON_AddNumberToObject(recording, "dropped", session->camera.dropped_frames);
         cJSON_AddStringToObject(recording, "mic",
@@ -149,6 +153,15 @@ static char *build_heartbeat_json(const health_state_t *snapshot)
         cJSON_AddNumberToObject(recording, "samples", session->mic.samples);
     } else {
         cJSON_AddNullToObject(root, "last_recording");
+    }
+
+    /* 相機錄影失敗分類：開機以來累計 (uptime_s 變小 = 重開機歸零)，統計交給 server */
+    cJSON_AddStringToObject(root, "last_fault",
+                            cam_record_fault_name(snapshot->last_camera_fault));
+    cJSON *faults = cJSON_AddObjectToObject(root, "faults");
+    for (int i = CAM_RECORD_FAULT_NONE + 1; i < CAM_RECORD_FAULT_COUNT; ++i) {
+        cJSON_AddNumberToObject(faults, cam_record_fault_name((cam_record_fault_t)i),
+                                snapshot->camera_faults[i]);
     }
 
     if (snapshot->has_upload) {
@@ -294,6 +307,14 @@ void node_health_note_session(const rec_session_result_t *result)
     }
     s_state.has_recording = true;
     s_state.last_session = *result;
+    if (result->camera_enabled) {
+        const cam_record_fault_t fault =
+            result->camera.success ? CAM_RECORD_FAULT_NONE : result->camera.fault;
+        s_state.last_camera_fault = fault;
+        if (fault > CAM_RECORD_FAULT_NONE && fault < CAM_RECORD_FAULT_COUNT) {
+            ++s_state.camera_faults[fault];
+        }
+    }
     xSemaphoreGive(s_mutex);
 }
 

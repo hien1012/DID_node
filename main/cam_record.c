@@ -107,7 +107,7 @@
 #endif
 
 /* --- 錄影與影格率驗證參數 --- */
-#define CAMERA_WARMUP_FRAMES    10U                         /* 開機暖機幀數：丟棄前 10 幀，讓感測器自動曝光/白平衡穩定 */
+#define CAMERA_WARMUP_FRAMES    100U                         /* 開機暖機幀數：丟棄前 10 幀，讓感測器自動曝光/白平衡穩定 */
 #define CAMERA_FRAME_BUFFERS    8U                          /* 配置於外部 PSRAM 的影格緩衝區數量 (總計 8 * 300KB ≈ 2.4MB) */
 #define TEST_DURATION_SECONDS   10U                         /* 開機硬體資格測試時間：10 秒 */
 #define TARGET_FPS              CAM_TARGET_FPS              /* 目標影格率：每秒 5 幀 */
@@ -134,9 +134,9 @@
 #define RECORD_QUEUE_WAIT_MS          50U                   /* 寫入任務等待佇列影格的逾時時間 (毫秒) */
 
 /*
- * --- 錄影合格標準 (不合格 -> broken/) ---
- * 只看存檔幀數 (以及 SD 寫入錯誤)；掉幀、斷層等只記錄在 log，不判定為損壞。
- * 時間窗 [trigger, trigger+60s) 依觸發相位可能落入 299 或 300 幀，因此容許少 1 幀。
+ * --- 錄影合格標準 (不合格 -> 直接刪除，不留在 SD) ---
+ * 任何擷取錯誤、SD 寫入錯誤、佇列滿丟幀、時戳斷層都判定為損壞 (見 cam_record_finish)。
+ * 時間窗 [trigger, trigger+N s) 依觸發相位可能落入 N*5-1 或 N*5 幀，因此幀數容許少 1 幀。
  */
 #define RECORD_MIN_VALID_FRAMES       (RECORD_EXPECTED_FRAMES - 1U)
 
@@ -169,6 +169,10 @@
 #define OV7725_REG_COM5             0x000EU                 /* 控制暫存器 5：自動影格率調節控制 */
 #define OV7725_REG_CLKRC            0x0011U                 /* 內部時脈控制暫存器 (除頻器) */
 #define OMNIVISION_REG_COM8         0x0013U                 /* 自動曝光/增益/白平衡控制暫存器 */
+#define OV7725_REG_ADVFL            0x002DU                 /* 垂直同步插入虛擬行低位元組 */
+#define OV7725_REG_ADVFH            0x002EU                 /* 垂直同步插入虛擬行高位元組 */
+#define OV7725_REG_DM_LNL           0x0033U                 /* 虛擬列低位元組 */
+#define OV7725_REG_DM_LNH           0x0034U                 /* 虛擬列高位元組 */
 #define OV7725_REG_DSP_CTRL3        0x0066U                 /* DSP 控制暫存器 3 */
 #define OV7725_COM3_SWAP_YUV        0x10U                   /* COM3 第 4 位元：反轉 YUV 輸出順序 (確保第 0 位元組為 Y 亮度訊號) */
 #define OV7725_COM4_PLL_MASK        0xC0U                   /* COM4 PLL 遮罩 */
@@ -176,12 +180,14 @@
 #define OV7725_CLKRC_DIV_MASK       0x3FU                   /* CLKRC 除頻遮罩 */
 #define OV7725_CLKRC_DIVIDER        3U                      /* 除頻值：設定除以 4，將原始時脈減半 */
 #define OMNIVISION_COM8_AUTO_MASK   0x07U                   /* COM8 自動功能遮罩 (AGC, AEC, AWB) */
+#define OMNIVISION_COM8_BANDING_MASK 0x30U                  /* COM8 bit5 banding filter、bit4 AEC 低於 banding 值；OV7670 驅動兩者皆關 */
 
 /* --- OV2640 暫存器與位元遮罩 (第 8 位元編碼 Bank 0 或 Bank 1) --- */
 #define OV2640_DSP_R_BYPASS         0x0005U                 /* DSP 旁路控制暫存器 */
 #define OV2640_DSP_ZMOW             0x005AU                 /* 縮放輸出寬度低位元組 */
 #define OV2640_DSP_ZMOH             0x005BU                 /* 縮放輸出高度低位元組 */
 #define OV2640_DSP_ZMHH             0x005CU                 /* 縮放輸出高階位元組 */
+#define OV2640_SENSOR_COM1          0x0103U                 /* bit7:6 dummy frame 控制 (自動降頻插幀) */
 #define OV2640_SENSOR_CLKRC         0x0111U                 /* 感測器時脈控制暫存器 */
 #define OV2640_SENSOR_COM8          0x0113U                 /* 感測器自動曝光/增益控制 */
 #define OV2640_SENSOR_REG2A         0x012AU                 /* 虛擬行擴展高位暫存器 */
@@ -201,6 +207,8 @@
 #define OV2640_VGA_ZMOH_VALUE       0x78U                   /* VGA 高度縮放暫存器值 */
 #define OV2640_VGA_ZMHH_VALUE       0x00U
 #define OV2640_COM8_AEC_AGC_MASK    0x05U
+#define OV2640_COM8_BANDING_MASK    0x20U                   /* COM8 bit5 banding filter */
+#define OV2640_COM1_DUMMY_FRAME_MASK 0xC0U
 #define OV2640_CTRL1_AWB_MASK       0x08U
 #define OV2640_CLKRC_CLOCK_MASK     0xBFU
 
@@ -376,6 +384,7 @@ typedef struct {
     bool prepared;                      /* prepare() 成功，等待 start()/finish() */
     bool started;                       /* 兩個任務已建立 */
     esp_err_t start_error;              /* start() 失敗原因，finish() 時回報 */
+    uint32_t incomplete_at_start;       /* start() 時驅動 FB-SIZE 計數，finish() 相減得本次數量 */
 } recording_context_t;
 
 /* 結構體與資料長度二度驗證 (確保二進位格式完全對齊 SD 扇區) */
@@ -481,7 +490,8 @@ static const char *sensor_name(uint16_t pid)
 }
 
 /**
- * @brief 設定 OV7725 感測器：鎖定固定 5 FPS 並確保灰階位元組順序
+ * @brief 設定 OV7725 感測器：鎖定固定 5 FPS、確保灰階位元組順序，
+ *        banding filter / 虛擬行比照 OV7670 關閉
  */
 static esp_err_t configure_ov7725(sensor_t *sensor)
 {
@@ -513,29 +523,58 @@ static esp_err_t configure_ov7725(sensor_t *sensor)
                                          OV7725_COM5_AUTO_FPS, 0x00),
                         TAG, "Cannot disable OV7725 automatic frame-rate reduction");
 
+    /* 與 OV7670 一致：驅動預設 COM8=0xFF 開著 banding filter，強光下曝光最低只能到
+     * 一個 banding 單位而過曝；並清除虛擬行，避免影格被拉長 */
+    ESP_RETURN_ON_ERROR(camera_reg_write(sensor, OMNIVISION_REG_COM8,
+                                         OMNIVISION_COM8_BANDING_MASK, 0x00),
+                        TAG, "Cannot disable OV7725 banding filter");
+    ESP_RETURN_ON_ERROR(camera_reg_write(sensor, OV7725_REG_ADVFL, 0xFF, 0x00),
+                        TAG, "Cannot clear OV7725 ADVFL");
+    ESP_RETURN_ON_ERROR(camera_reg_write(sensor, OV7725_REG_ADVFH, 0xFF, 0x00),
+                        TAG, "Cannot clear OV7725 ADVFH");
+    ESP_RETURN_ON_ERROR(camera_reg_write(sensor, OV7725_REG_DM_LNL, 0xFF, 0x00),
+                        TAG, "Cannot clear OV7725 DM_LNL");
+    ESP_RETURN_ON_ERROR(camera_reg_write(sensor, OV7725_REG_DM_LNH, 0xFF, 0x00),
+                        TAG, "Cannot clear OV7725 DM_LNH");
+
     /* 回讀暫存器，確保寫入生效 */
     uint8_t com4 = 0;
     uint8_t com5 = 0;
     uint8_t clkrc = 0;
+    uint8_t com8 = 0, advfl = 0, advfh = 0, dm_lnl = 0, dm_lnh = 0;
     ESP_RETURN_ON_ERROR(camera_reg_read(sensor, OV7725_REG_COM4, 0xFF, &com4),
                         TAG, "Cannot verify OV7725 COM4");
     ESP_RETURN_ON_ERROR(camera_reg_read(sensor, OV7725_REG_COM5, 0xFF, &com5),
                         TAG, "Cannot verify OV7725 COM5");
     ESP_RETURN_ON_ERROR(camera_reg_read(sensor, OV7725_REG_CLKRC, 0xFF, &clkrc),
                         TAG, "Cannot verify OV7725 CLKRC");
+    ESP_RETURN_ON_ERROR(camera_reg_read(sensor, OMNIVISION_REG_COM8, 0xFF, &com8),
+                        TAG, "Cannot verify OV7725 COM8");
+    ESP_RETURN_ON_ERROR(camera_reg_read(sensor, OV7725_REG_ADVFL, 0xFF, &advfl),
+                        TAG, "Cannot verify OV7725 ADVFL");
+    ESP_RETURN_ON_ERROR(camera_reg_read(sensor, OV7725_REG_ADVFH, 0xFF, &advfh),
+                        TAG, "Cannot verify OV7725 ADVFH");
+    ESP_RETURN_ON_ERROR(camera_reg_read(sensor, OV7725_REG_DM_LNL, 0xFF, &dm_lnl),
+                        TAG, "Cannot verify OV7725 DM_LNL");
+    ESP_RETURN_ON_ERROR(camera_reg_read(sensor, OV7725_REG_DM_LNH, 0xFF, &dm_lnh),
+                        TAG, "Cannot verify OV7725 DM_LNH");
 
     if ((com4 & OV7725_COM4_PLL_MASK) != 0 ||
         (clkrc & OV7725_CLKRC_DIV_MASK) != OV7725_CLKRC_DIVIDER ||
-        (com5 & OV7725_COM5_AUTO_FPS) != 0) {
+        (com5 & OV7725_COM5_AUTO_FPS) != 0 ||
+        (com8 & OMNIVISION_COM8_BANDING_MASK) != 0 ||
+        advfl != 0 || advfh != 0 || dm_lnl != 0 || dm_lnh != 0) {
         ESP_LOGE(TAG, "OV7725 clock verification failed: COM4=0x%02X "
-                 "CLKRC=0x%02X COM5=0x%02X", com4, clkrc, com5);
+                 "CLKRC=0x%02X COM5=0x%02X COM8=0x%02X ADVF=%02X%02X "
+                 "DM_LN=%02X%02X",
+                 com4, clkrc, com5, com8, advfh, advfl, dm_lnh, dm_lnl);
         return ESP_ERR_INVALID_STATE;
     }
 
     ESP_LOGI(TAG,
-             "OV7725 GRAY8: COM3=0x%02X DSP_CTRL3=0x%02X; "
+             "OV7725 GRAY8: COM3=0x%02X DSP_CTRL3=0x%02X COM8=0x%02X; "
              "XCLK=%u Hz, calculated=%u.%03u fps",
-             com3, dsp_ctrl3, (unsigned)ESP32_CAMERA_XCLK_HZ,
+             com3, dsp_ctrl3, com8, (unsigned)ESP32_CAMERA_XCLK_HZ,
              (unsigned)(OV7725_CALCULATED_MILLI_FPS / 1000U),
              (unsigned)(OV7725_CALCULATED_MILLI_FPS % 1000U));
     return ESP_OK;
@@ -613,7 +652,8 @@ static esp_err_t configure_ov7670(sensor_t *sensor)
 }
 
 /**
- * @brief 設定 OV2640 感測器：設定 DSP 縮放、DVP 輸出除頻與 5 FPS 時脈樹
+ * @brief 設定 OV2640 感測器：設定 DSP 縮放、DVP 輸出除頻與 5 FPS 時脈樹，
+ *        banding filter / dummy frame 比照 OV7670 關閉
  */
 static esp_err_t configure_ov2640(sensor_t *sensor)
 {
@@ -658,9 +698,19 @@ static esp_err_t configure_ov2640(sensor_t *sensor)
                                          0xFF, 0x00),
                         TAG, "Cannot clear OV2640 FLH");
 
+    /* 與 OV7670 一致：關閉 banding filter（SVGA 表開著，強光下曝光最低卡在約 50 ms），
+     * 並禁止自動插入 dummy frame（等同 OV7670 COM11 夜間降頻） */
+    ESP_RETURN_ON_ERROR(camera_reg_write(sensor, OV2640_SENSOR_COM8,
+                                         OV2640_COM8_BANDING_MASK, 0x00),
+                        TAG, "Cannot disable OV2640 banding filter");
+    ESP_RETURN_ON_ERROR(camera_reg_write(sensor, OV2640_SENSOR_COM1,
+                                         OV2640_COM1_DUMMY_FRAME_MASK, 0x00),
+                        TAG, "Cannot disable OV2640 dummy frames");
+
     /* 回讀暫存器並完整驗證 */
     uint8_t clkrc = 0, dvp_sp = 0, reg2a = 0, frarl = 0;
     uint8_t addvsl = 0, addvsh = 0, fll = 0, flh = 0;
+    uint8_t com8 = 0, com1 = 0;
     uint8_t r_bypass = 0, ctrl0 = 0, image_mode = 0;
     uint8_t zmow = 0, zmoh = 0, zmhh = 0;
     ESP_RETURN_ON_ERROR(camera_reg_read(sensor, OV2640_SENSOR_CLKRC,
@@ -687,6 +737,12 @@ static esp_err_t configure_ov2640(sensor_t *sensor)
     ESP_RETURN_ON_ERROR(camera_reg_read(sensor, OV2640_SENSOR_FLH,
                                          0xFF, &flh),
                         TAG, "Cannot verify OV2640 FLH");
+    ESP_RETURN_ON_ERROR(camera_reg_read(sensor, OV2640_SENSOR_COM8,
+                                         0xFF, &com8),
+                        TAG, "Cannot verify OV2640 COM8");
+    ESP_RETURN_ON_ERROR(camera_reg_read(sensor, OV2640_SENSOR_COM1,
+                                         0xFF, &com1),
+                        TAG, "Cannot verify OV2640 COM1");
     ESP_RETURN_ON_ERROR(camera_reg_read(sensor, OV2640_DSP_R_BYPASS,
                                          0xFF, &r_bypass),
                         TAG, "Cannot verify OV2640 R_BYPASS");
@@ -709,14 +765,18 @@ static esp_err_t configure_ov2640(sensor_t *sensor)
     if (dvp_sp != OV2640_DVP_SP_VALUE ||
         (clkrc & OV2640_CLKRC_CLOCK_MASK) != OV2640_CLKRC_VALUE ||
         (reg2a & OV2640_REG2A_FRARH_MASK) != 0 || frarl != 0 ||
-        addvsl != 0 || addvsh != 0 || fll != 0 || flh != 0) {
+        addvsl != 0 || addvsh != 0 || fll != 0 || flh != 0 ||
+        (com8 & OV2640_COM8_BANDING_MASK) != 0 ||
+        (com1 & OV2640_COM1_DUMMY_FRAME_MASK) != 0) {
         ESP_LOGE(TAG, "OV2640 clock verification failed: CLKRC=0x%02X "
                  "R_DVP_SP=0x%02X "
-                 "FRAR=%01X%02X ADDVS=%02X%02X FL=%02X%02X",
+                 "FRAR=%01X%02X ADDVS=%02X%02X FL=%02X%02X COM8=0x%02X COM1=0x%02X",
                  clkrc, dvp_sp, (reg2a >> 4), frarl,
-                 addvsh, addvsl, flh, fll);
+                 addvsh, addvsl, flh, fll, com8, com1);
         return ESP_ERR_INVALID_STATE;
     }
+    ESP_LOGI(TAG, "OV2640 banding filter off, dummy frames off: COM8=0x%02X COM1=0x%02X",
+             com8, com1);
 
     ESP_LOGI(TAG,
              "OV2640 DVP format: R_BYPASS=0x%02X CTRL0=0x%02X "
@@ -1540,6 +1600,7 @@ esp_err_t cam_record_start(int64_t trigger_us)
 #endif
 
     /* SD 檔案準備完成後才恢復 VSYNC，避免預配置期間累積舊影格。 */
+    s_recording.incomplete_at_start = cam_get_incomplete_frames();
     esp_err_t err = cam_record_resume();
     if (err != ESP_OK) {
         s_recording.start_error = err;
@@ -1576,8 +1637,22 @@ esp_err_t cam_record_start(int64_t trigger_us)
     return ESP_OK;
 }
 
+const char *cam_record_fault_name(cam_record_fault_t fault)
+{
+    switch (fault) {
+    case CAM_RECORD_FAULT_NONE:          return "none";
+    case CAM_RECORD_FAULT_FRAME_DROP:    return "frame_drop";
+    case CAM_RECORD_FAULT_FB_INCOMPLETE: return "fb_incomplete";
+    case CAM_RECORD_FAULT_FRAME_GAP:     return "frame_gap";
+    case CAM_RECORD_FAULT_CAPTURE:       return "capture";
+    case CAM_RECORD_FAULT_STORAGE:       return "storage";
+    case CAM_RECORD_FAULT_OTHER:
+    default:                             return "other";
+    }
+}
+
 /**
- * @brief 等待錄影結束、停止相機、檢核品質並將檔案移到 done/ 或 broken/
+ * @brief 等待錄影結束、停止相機、檢核品質；合格移到 done/，不合格直接刪除
  */
 esp_err_t cam_record_finish(cam_record_result_t *result)
 {
@@ -1594,14 +1669,17 @@ esp_err_t cam_record_finish(cam_record_result_t *result)
 
     esp_err_t err = ESP_OK;
     esp_err_t pause_err = ESP_OK;
+    cam_record_fault_t fault = CAM_RECORD_FAULT_NONE;
+    uint32_t incomplete_frames = 0;
     recording_stats_t *stats = &s_recording.stats;
 
     if (!s_recording.started) {
-        /* start() 未成功：沒有任何影格寫入，清空預配置空間後標記為 broken */
+        /* start() 未成功：沒有任何影格寫入，檔案在 finish_recording 時刪除 */
         pause_err = cam_record_pause();
         (void)ftruncate(s_recording.fd, 0);
         err = s_recording.start_error != ESP_OK ? s_recording.start_error
                                                 : ESP_ERR_INVALID_STATE;
+        fault = CAM_RECORD_FAULT_OTHER;
     } else {
         /* 6. 阻塞等待兩大任務雙雙回報完成 (CAPTURE_DONE & WRITER_DONE) */
         xEventGroupWaitBits(s_record_events,
@@ -1656,15 +1734,19 @@ esp_err_t cam_record_finish(cam_record_result_t *result)
                  (unsigned)(timestamp_milli_fps / 1000U),
                  (unsigned)(timestamp_milli_fps % 1000U),
                  (stats->writer_end_us - s_recording.trigger_us) / 1000);
+        /* 驅動丟棄的 FB-SIZE 幀不會到 camera_capture，只會表現成時戳斷層，要另外算 */
+        incomplete_frames = cam_get_incomplete_frames() - s_recording.incomplete_at_start;
         ESP_LOGI(TAG,
                  "Recording details: stale=%u invalid=%u timeout=%u "
-                 "timestamp_error=%u gaps=%u queue_error=%u peak_ready=%u/%u "
+                 "timestamp_error=%u gaps=%u fb_incomplete=%u queue_error=%u "
+                 "peak_ready=%u/%u "
                  "sd_frame_max=%" PRId64 " us sd_chunk_max=%" PRId64 " us",
                  (unsigned)stats->stale_frames,
                  (unsigned)stats->invalid_frames,
                  (unsigned)stats->capture_timeouts,
                  (unsigned)stats->timestamp_errors,
                  (unsigned)stats->frame_gaps,
+                 (unsigned)incomplete_frames,
                  (unsigned)stats->queue_errors,
                  (unsigned)stats->peak_ready_slots,
                  (unsigned)FRAME_QUEUE_CAPACITY,
@@ -1686,14 +1768,35 @@ esp_err_t cam_record_finish(cam_record_result_t *result)
                  (unsigned)stats->saved_frames,
                  (unsigned)s_sd_dma_buffer_bytes);
 
-        /* 8. 品質檢核：SD 寫入錯誤 (檔案已損壞) 或存檔幀數不足才標記為 broken */
-        if (stats->writer_result != ESP_OK) {
+        /* 8. 嚴格品質檢核：任一錯誤或掉幀即刪除 (不上傳、不留在 SD)。
+         *    依序判定，第一個符合的就是這次的失敗類別 */
+        if (pause_err != ESP_OK) {
+            err = pause_err;
+            fault = CAM_RECORD_FAULT_OTHER;
+        } else if (stats->capture_result != ESP_OK) {
+            err = stats->capture_result;
+            fault = CAM_RECORD_FAULT_CAPTURE;
+        } else if (stats->writer_result != ESP_OK) {
             err = stats->writer_result;
-        } else if (stats->saved_frames < RECORD_MIN_VALID_FRAMES) {
-            ESP_LOGW(TAG, "Insufficient frames: saved=%u, required=%u",
+            fault = CAM_RECORD_FAULT_STORAGE;
+        } else if (stats->pool_overflows != 0U) {
+            /* 丟掉的幀有算進 in_window，saved != in_window 也歸在這裡 */
+            err = ESP_ERR_INVALID_STATE;
+            fault = CAM_RECORD_FAULT_FRAME_DROP;
+        } else if (stats->frame_gaps != 0U ||
+                   stats->saved_frames < RECORD_MIN_VALID_FRAMES) {
+            ESP_LOGW(TAG, "Frame gaps or insufficient frames: gaps=%u saved=%u, required=%u",
+                     (unsigned)stats->frame_gaps,
                      (unsigned)stats->saved_frames,
                      (unsigned)RECORD_MIN_VALID_FRAMES);
             err = ESP_ERR_INVALID_SIZE;
+            fault = incomplete_frames != 0U ? CAM_RECORD_FAULT_FB_INCOMPLETE
+                                            : CAM_RECORD_FAULT_FRAME_GAP;
+        } else if (stats->saved_frames != stats->in_window_frames ||
+                   stats->queue_errors != 0U) {
+            /* 照理不會發生：丟幀與寫入錯誤已在上面處理，出現代表統計邏輯有問題 */
+            err = ESP_ERR_INVALID_STATE;
+            fault = CAM_RECORD_FAULT_OTHER;
         } else {
             err = ESP_OK;
         }
@@ -1705,12 +1808,17 @@ esp_err_t cam_record_finish(cam_record_result_t *result)
     if (storage_err != ESP_OK) {
         err = storage_err;
         recording_ok = false;
+        if (fault == CAM_RECORD_FAULT_NONE) {
+            fault = CAM_RECORD_FAULT_STORAGE;
+        }
     }
 
     result->success = recording_ok;
+    result->fault = recording_ok ? CAM_RECORD_FAULT_NONE : fault;
     result->saved_frames = stats->saved_frames;
     result->dropped_frames = stats->pool_overflows;
     result->frame_gaps = stats->frame_gaps;
+    result->incomplete_frames = incomplete_frames;
     result->first_frame_offset_us =
         stats->saved_frames > 0U ? stats->first_frame_us - s_recording.trigger_us
                                  : 0;
@@ -1718,10 +1826,12 @@ esp_err_t cam_record_finish(cam_record_result_t *result)
                              ? (stats->writer_end_us - s_recording.trigger_us) / 1000
                              : 0;
     result->error = err;
-    const char *result_path = recording_ok ? s_recording.storage.done_path
-                                           : s_recording.storage.broken_path;
-    strlcpy(result->file_path, result_path, sizeof(result->file_path));
-    (void)node_storage_get_file_size(result_path, &result->file_bytes);
+    /* 失敗的錄影已被刪除，沒有檔案可回報 */
+    if (recording_ok) {
+        strlcpy(result->file_path, s_recording.storage.done_path,
+                sizeof(result->file_path));
+        (void)node_storage_get_file_size(result->file_path, &result->file_bytes);
+    }
 
     /* cam_writer 已結束 (WRITER_DONE)，暫存區不再使用，交還給上傳 */
     release_sd_dma_buffer();
@@ -1760,13 +1870,19 @@ esp_err_t cam_record_init(void)
         return err;
     }
 
-    /* 步驟 4：鎖定曝光與白平衡，防止錄影期間畫面閃爍變色 */
+    /* 步驟 4：鎖定曝光與白平衡，防止錄影期間畫面閃爍變色。
+     * 不鎖定時維持暖機的 auto 狀態，每次錄影跟著當下光線調整；
+     * 降頻 / 虛擬行已在 configure_sensor() 另外關閉，幀率不受影響。 */
+#if APP_CAM_LOCK_AUTO_CONTROLS
     err = set_auto_controls(sensor, false);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Cannot lock camera controls: %s", esp_err_to_name(err));
         esp_camera_deinit();
         return err;
     }
+#else
+    ESP_LOGW(TAG, "AE/AGC/AWB left enabled for recording (APP_CAM_LOCK_AUTO_CONTROLS=0)");
+#endif
 
     /* 步驟 5：執行開機 10 秒 5 FPS 資格驗證測試 (不寫入 SD，只驗證硬體純度) */
     err = run_startup_fps_test();

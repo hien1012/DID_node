@@ -194,7 +194,11 @@ static esp_err_t preallocate_file(int fd, size_t expected_bytes)
     return ESP_OK;
 }
 
-/* Files left in undone/ were cut off by a reset or power loss. */
+/*
+ * Files left in undone/ were cut off by a reset or power loss. Video is
+ * deleted (about 92 MB each, broken ones would fill the card); audio is kept
+ * in broken/.
+ */
 static void mark_interrupted_recordings(void)
 {
     DIR *directory = opendir(STORAGE_UNDONE_DIR);
@@ -211,10 +215,19 @@ static void mark_interrupted_recordings(void)
         char stem[STORAGE_STEM_MAX] = {0};
         char from[sizeof(STORAGE_UNDONE_DIR) + NAME_MAX + 1] = {0};
         char to[NODE_STORAGE_PATH_MAX] = {0};
+        snprintf(from, sizeof(from), STORAGE_UNDONE_DIR "/%s", entry->d_name);
+        if (media == NODE_MEDIA_VIDEO) {
+            if (unlink(from) == 0) {
+                ESP_LOGW(TAG, "Interrupted video discarded: %s", from);
+            } else {
+                ESP_LOGE(TAG, "Cannot delete interrupted video %s (errno=%d)",
+                         from, errno);
+            }
+            continue;
+        }
         if (!format_stem(epoch, stem, sizeof(stem))) {
             continue;
         }
-        snprintf(from, sizeof(from), STORAGE_UNDONE_DIR "/%s", entry->d_name);
         snprintf(to, sizeof(to), STORAGE_BROKEN_DIR "/%s" STORAGE_BROKEN_SUFFIX "%s",
                  stem, media_extension(media));
         if (!path_exists(to) && rename(from, to) == 0) {
@@ -361,7 +374,15 @@ esp_err_t node_storage_finish_recording(node_recording_t *recording, bool upload
     recording->fd = -1;
 
     const char *target = upload ? recording->done_path : recording->broken_path;
-    if (path_exists(target)) {
+    if (!upload && recording->media == NODE_MEDIA_VIDEO) {
+        /* 壞掉的錄影不保留：每支約 92 MB，留著會把 SD 塞滿；失敗原因由 heartbeat 的 faults 回報 */
+        if (unlink(recording->undone_path) == 0) {
+            ESP_LOGW(TAG, "Broken video discarded: %s", recording->undone_path);
+        } else {
+            ESP_LOGE(TAG, "Cannot discard %s (errno=%d)", recording->undone_path, errno);
+            err = ESP_FAIL;
+        }
+    } else if (path_exists(target)) {
         ESP_LOGE(TAG, "Target already exists: %s", target);
         err = ESP_ERR_INVALID_STATE;
     } else if (rename(recording->undone_path, target) != 0) {

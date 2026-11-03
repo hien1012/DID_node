@@ -111,6 +111,9 @@ esp_err_t rec_session_run(time_t start_epoch, rec_session_result_t *result)
     } else {
         result->camera.error = s_camera_ready ? result->camera_prepare_error
                                               : ESP_ERR_INVALID_STATE;
+        /* prepare 失敗幾乎都是建檔 / 預配置 (或 I/O 緩衝被佔用)，歸在 storage */
+        result->camera.fault = s_camera_ready ? CAM_RECORD_FAULT_STORAGE
+                                              : CAM_RECORD_FAULT_NONE;
     }
     if (s_camera_ready) {
         /* 相機已暫停：停止 XCLK 直到下一次錄影，避免干擾接下來的上傳 */
@@ -131,7 +134,9 @@ esp_err_t rec_session_run(time_t start_epoch, rec_session_result_t *result)
     ESP_LOGI(TAG, "Session %lld done: camera=%s (%u frames, first +%" PRId64
              " ms) mic=%s (%u samples, first +%" PRId64 " ms)",
              (long long)start_epoch,
-             result->camera.success ? "ok" : "broken",
+             !result->camera_enabled ? "disabled"
+             : result->camera.success ? "ok"
+                                      : cam_record_fault_name(result->camera.fault),
              (unsigned)result->camera.saved_frames,
              result->camera.first_frame_offset_us / 1000,
              result->mic.success ? "ok" : "broken",

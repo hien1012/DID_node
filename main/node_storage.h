@@ -9,9 +9,11 @@
 
 /*
  * SD layout:
- *   /sdcard/undone/  file being recorded (left over after power loss -> broken)
+ *   /sdcard/undone/  file being recorded (left over after power loss -> broken;
+ *                    video is deleted instead)
  *   /sdcard/done/    complete recordings waiting for upload, deleted after ACK
- *   /sdcard/broken/  damaged or rejected recordings, kept on the card
+ *   /sdcard/broken/  damaged audio and server-rejected files, kept on the card
+ *                    (damaged video is deleted, not kept)
  * Names: YYYY_MM_DD_HHMMSS.raw / .wav, broken ones YYYY_MM_DD_HHMMSS_broken.raw
  */
 
@@ -48,7 +50,7 @@ esp_err_t node_storage_begin_recording(node_recording_t *recording,
                                        time_t recorded_at_epoch,
                                        size_t expected_bytes);
 
-/** Close the file and move it to done/ (upload) or broken/. */
+/** Close the file and move it to done/ (upload) or broken/; broken video is deleted. */
 esp_err_t node_storage_finish_recording(node_recording_t *recording,
                                         bool upload);
 

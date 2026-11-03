@@ -7,6 +7,7 @@
 #include "cJSON.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 #include "app_config.h"
 
@@ -44,7 +45,10 @@ esp_err_t time_sync_from_server(void)
         return err;
     }
 
+    /* open 已送出請求；server 取時間約在「送出」與「收到回應」的中點，用來補 HTTP 延遲 */
+    const int64_t sent_us = esp_timer_get_time();
     (void)esp_http_client_fetch_headers(client);
+    const int64_t received_us = esp_timer_get_time();
     int status = esp_http_client_get_status_code(client);
     char response[160] = {0};
     int bytes = esp_http_client_read_response(client, response,
@@ -58,23 +62,39 @@ esp_err_t time_sync_from_server(void)
     }
     response[bytes] = '\0';
 
+    /* 優先用微秒欄位 epoch_us；舊 server 只有整數秒 epoch */
     cJSON *root = cJSON_Parse(response);
+    cJSON *us_item = root ? cJSON_GetObjectItemCaseSensitive(root, "epoch_us") : NULL;
     cJSON *epoch_item = root ? cJSON_GetObjectItemCaseSensitive(root, "epoch") : NULL;
-    if (!cJSON_IsNumber(epoch_item) || epoch_item->valuedouble < MIN_VALID_EPOCH) {
+    int64_t server_us = 0;
+    if (cJSON_IsNumber(us_item)) {
+        server_us = (int64_t)us_item->valuedouble;
+    } else if (cJSON_IsNumber(epoch_item)) {
+        server_us = (int64_t)epoch_item->valuedouble * 1000000LL;
+    }
+    cJSON_Delete(root);
+    if (server_us < MIN_VALID_EPOCH * 1000000LL) {
         ESP_LOGE(TAG, "Invalid time response: %s", response);
-        cJSON_Delete(root);
         esp_http_client_cleanup(client);
         return ESP_ERR_INVALID_RESPONSE;
     }
 
+    struct timeval before = {0};
+    gettimeofday(&before, NULL);
+    const int64_t now_us =
+        server_us + (esp_timer_get_time() - (sent_us + received_us) / 2);
+    const int64_t before_us = (int64_t)before.tv_sec * 1000000LL + before.tv_usec;
     struct timeval now = {
-        .tv_sec = (time_t)epoch_item->valuedouble,
-        .tv_usec = 0,
+        .tv_sec = (time_t)(now_us / 1000000LL),
+        .tv_usec = (suseconds_t)(now_us % 1000000LL),
     };
-    cJSON_Delete(root);
     err = settimeofday(&now, NULL) == 0 ? ESP_OK : ESP_FAIL;
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "Clock synchronized: epoch=%lld", (long long)now.tv_sec);
+        /* offset = 校正量，每輪重新校時時可看出這段期間的時鐘漂移 */
+        ESP_LOGI(TAG, "Clock synchronized: epoch=%lld rtt=%lld ms offset=%lld ms",
+                 (long long)now.tv_sec,
+                 (long long)((received_us - sent_us) / 1000),
+                 (long long)((now_us - before_us) / 1000));
     } else {
         ESP_LOGE(TAG, "settimeofday failed");
     }

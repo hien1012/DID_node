@@ -34,6 +34,7 @@ static const char *TAG = "NODE_APP";
 /* Stop starting uploads this long before the next session's preparation. */
 #define UPLOAD_GUARD_SEC             10U
 #define NO_RECORDER_RESTART_MS       30000U
+#define SLEEP_CHUNK_MS               60000U
 
 typedef struct {
     TaskHandle_t caller;
@@ -108,32 +109,39 @@ static void synchronize_clock(void)
 }
 
 /*
- * The first session starts as soon as its files can be prepared after boot;
- * later sessions start one period after the previous start. If a cycle
- * overran its period, the next session starts as soon as possible.
+ * Sessions start on the next epoch multiple of APP_RECORD_PERIOD_SEC that still
+ * leaves lead_sec to prepare the files (the second already under way does not
+ * count). A cycle that overran its period skips the slots it missed.
  */
 static time_t next_session_start(time_t previous_start, time_t lead_sec)
 {
-    const time_t earliest = time(NULL) + lead_sec;
-    if (previous_start == 0) {
-        return earliest;
+    const time_t period = (time_t)APP_RECORD_PERIOD_SEC;
+    const time_t earliest = time(NULL) + 1 + lead_sec;
+    const time_t slot = ((earliest + period - 1) / period) * period;
+    if (previous_start != 0 && slot - previous_start > period) {
+        ESP_LOGW(TAG, "Previous cycle overran its period; skipped %u slot(s)",
+                 (unsigned)((slot - previous_start) / period - 1));
     }
-    const time_t scheduled = previous_start + (time_t)APP_RECORD_PERIOD_SEC;
-    if (scheduled < earliest) {
-        ESP_LOGW(TAG, "Previous cycle overran its period; starting now");
-        return earliest;
-    }
-    return scheduled;
+    return slot;
 }
 
+/* Sleep in chunks and recheck the clock: a resync that moves the system time
+ * must not make us oversleep the slot. */
 static void sleep_until(time_t epoch, uint32_t lead_ms)
 {
-    struct timeval now = {0};
-    gettimeofday(&now, NULL);
-    const int64_t now_ms = (int64_t)now.tv_sec * 1000LL + now.tv_usec / 1000;
-    const int64_t wait_ms = (int64_t)epoch * 1000LL - (int64_t)lead_ms - now_ms;
-    if (wait_ms > 0) {
-        vTaskDelay(pdMS_TO_TICKS(wait_ms));
+    while (true) {
+        struct timeval now = {0};
+        gettimeofday(&now, NULL);
+        const int64_t now_ms = (int64_t)now.tv_sec * 1000LL + now.tv_usec / 1000;
+        int64_t wait_ms = (int64_t)epoch * 1000LL - (int64_t)lead_ms - now_ms;
+        if (wait_ms <= 0) {
+            return;
+        }
+        if (wait_ms > SLEEP_CHUNK_MS) {
+            wait_ms = SLEEP_CHUNK_MS;
+        }
+        /* +1 tick: pdMS_TO_TICKS rounds down, so never wake before the target */
+        vTaskDelay(pdMS_TO_TICKS((uint32_t)wait_ms) + 1U);
     }
 }
 

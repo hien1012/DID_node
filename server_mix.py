@@ -7,7 +7,8 @@ session ID; both are stored side by side:
     <DATA_ROOT>/<device_id>/<YYYY-MM-DD>/<YYYY_MM_DD_HHMMSS>.wav
 
 Endpoints
-    GET  /time            {"epoch": <unix seconds>} used by the node at boot
+    GET  /time            {"epoch": <unix seconds>, "epoch_us": <unix microseconds>}
+                          used by the node at boot and after every upload pass
     POST /upload/video    raw body + X-* headers, JSON ACK
     POST /upload/audio    raw body + X-* headers, JSON ACK
     POST /heartbeat       JSON status once a minute (docs/heartbeat.md)
@@ -321,7 +322,9 @@ def save_upload(
 
 @app.get("/time")
 def get_time():
-    return jsonify({"epoch": int(time.time())})
+    # epoch_us lets the node set sub-second time; epoch stays for older firmware.
+    now_us = time.time_ns() // 1000
+    return jsonify({"epoch": now_us // 1_000_000, "epoch_us": now_us})
 
 
 @app.post("/upload/video")
@@ -399,6 +402,17 @@ def describe_heartbeat(payload: dict) -> str:
     ]
     if recording:
         parts.append(f"last_rec cam={recording.get('camera')} mic={recording.get('mic')}")
+    faults = payload.get("faults")
+    if isinstance(faults, dict):
+        # Camera failures per category since boot (uptime_s decreasing marks a reboot).
+        counts = {k: int(v) for k, v in faults.items() if isinstance(v, (int, float))}
+        detail = " ".join(f"{k}={v}" for k, v in counts.items() if v)
+        parts.append(
+            f"cam_broken_since_boot={sum(counts.values())}" + (f" ({detail})" if detail else "")
+        )
+        last_fault = payload.get("last_fault")
+        if last_fault and last_fault != "none":
+            parts.append(f"last_fault={last_fault}")
     if wifi.get("heartbeat_fail_streak"):
         parts.append(f"hb_fail_streak={wifi['heartbeat_fail_streak']}")
     return " ".join(parts)

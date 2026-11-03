@@ -92,3 +92,6 @@ backup/
 backup/esp32_legacy/
 task*
 boot1.SVDat
+PCB_layout/perfboard_back.png
+PCB_layout/perfboard_front.png
+LA_capture.csv
