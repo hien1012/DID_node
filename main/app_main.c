@@ -92,11 +92,12 @@ void app_main(void)
     ESP_ERROR_CHECK(health_monitor_start());
 
     upload_boot_backlog();
-    ESP_LOGI(TAG, "Automatic schedule started: record 5 minutes every 10 minutes");
+    ESP_LOGI(TAG, "Automatic schedule started: %u seconds at every %u-minute mark",
+             (unsigned)APP_RECORD_DURATION_SEC, (unsigned)(APP_RECORD_SLOT_SEC / 60U));
 
+    time_t slot = time_sync_wait_next_slot(APP_RECORD_SLOT_SEC,
+                                           APP_FIRST_SLOT_MIN_LEAD_SEC);
     while (true) {
-        TickType_t cycle_started = xTaskGetTickCount();
-
         audio_record_result_t record_result = {0};
         esp_err_t err = audio_record_once(&record_result);
         health_note_recording(&record_result);
@@ -120,12 +121,12 @@ void app_main(void)
             ESP_LOGW(TAG, "Upload deferred: Wi-Fi unavailable");
         }
 
-        TickType_t elapsed = xTaskGetTickCount() - cycle_started;
-        TickType_t period = pdMS_TO_TICKS(APP_RECORD_PERIOD_MS);
-        if (elapsed < period) {
-            vTaskDelay(period - elapsed);
-        } else {
-            ESP_LOGW(TAG, "Cycle exceeded 10 minutes; next recording starts now");
+        time_sync_refresh_if_due();
+        const time_t next_slot = time_sync_wait_next_slot(APP_RECORD_SLOT_SEC, 0U);
+        if (next_slot - slot > (time_t)APP_RECORD_SLOT_SEC) {
+            ESP_LOGW(TAG, "Cycle overran its period; skipped %u slot(s)",
+                     (unsigned)((next_slot - slot) / APP_RECORD_SLOT_SEC - 1));
         }
+        slot = next_slot;
     }
 }

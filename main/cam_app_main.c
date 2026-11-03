@@ -174,13 +174,13 @@ void app_main(void)
     ESP_LOGE(TAG, "Camera stream stopped: %s", esp_err_to_name(stream_err));
     ESP_ERROR_CHECK(cam_record_pause());
 #endif
-    ESP_LOGI(TAG, "Automatic camera schedule started: %u seconds every %u seconds",
+    ESP_LOGI(TAG, "Automatic camera schedule started: %u seconds at every %u-minute mark",
              (unsigned)CAM_RECORD_DURATION_SEC,
-             (unsigned)(CAM_RECORD_PERIOD_MS / 1000U));
+             (unsigned)(APP_RECORD_SLOT_SEC / 60U));
 
+    time_t slot = time_sync_wait_next_slot(APP_RECORD_SLOT_SEC,
+                                           APP_FIRST_SLOT_MIN_LEAD_SEC);
     while (true) {
-        TickType_t cycle_started = xTaskGetTickCount();
-
         cam_record_result_t record_result = {0};
         cam_health_set_state(CAM_HEALTH_STATE_RECORDING);
         esp_err_t err = cam_record_once(&record_result);
@@ -193,8 +193,9 @@ void app_main(void)
                      (unsigned)record_result.saved_frames,
                      (unsigned)record_result.file_bytes);
         } else {
-            ESP_LOGE(TAG, "Camera recording failed: %s",
-                     esp_err_to_name(record_result.error));
+            ESP_LOGE(TAG, "Camera recording failed: %s, fault=%s",
+                     esp_err_to_name(record_result.error),
+                     cam_record_fault_name(record_result.fault));
         }
 
         cam_health_set_state(CAM_HEALTH_STATE_UPLOADING);
@@ -210,12 +211,12 @@ void app_main(void)
         }
         cam_health_set_state(CAM_HEALTH_STATE_IDLE);
 
-        TickType_t elapsed = xTaskGetTickCount() - cycle_started;
-        TickType_t period = pdMS_TO_TICKS(CAM_RECORD_PERIOD_MS);
-        if (elapsed < period) {
-            vTaskDelay(period - elapsed);
-        } else {
-            ESP_LOGW(TAG, "Camera cycle exceeded its period; next capture starts now");
+        time_sync_refresh_if_due();
+        const time_t next_slot = time_sync_wait_next_slot(APP_RECORD_SLOT_SEC, 0U);
+        if (next_slot - slot > (time_t)APP_RECORD_SLOT_SEC) {
+            ESP_LOGW(TAG, "Camera cycle overran its period; skipped %u slot(s)",
+                     (unsigned)((next_slot - slot) / APP_RECORD_SLOT_SEC - 1));
         }
+        slot = next_slot;
     }
 }

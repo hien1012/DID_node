@@ -10,7 +10,8 @@ Successful RAW uploads also receive a background-generated .sheet.png preview.
 SQLite sheet_jobs tracks pending/processing/ready/failed; no PNG work delays ACK.
 
 Endpoints
-    GET  /time            {"epoch": <unix seconds>} used by the node at boot
+    GET  /time            {"epoch": <unix seconds>, "epoch_us": <unix microseconds>}
+                          used by the node at boot and hourly
     POST /upload/video    raw body + X-* headers, JSON ACK
     POST /upload/audio    raw body + X-* headers, JSON ACK
     POST /heartbeat       JSON status once a minute (docs/heartbeat.md)
@@ -322,7 +323,9 @@ def save_upload(
 
 @app.get("/time")
 def get_time():
-    return jsonify({"epoch": int(time.time())})
+    # epoch_us lets the node set sub-second time; epoch stays for older firmware.
+    now_us = time.time_ns() // 1000
+    return jsonify({"epoch": now_us // 1_000_000, "epoch_us": now_us})
 
 
 @app.post("/upload/video")
@@ -386,20 +389,68 @@ def upload_audio():
     )
 
 
+# esp_err_t values reported by the legacy cam-*/mic-* firmware in last_record_error.
+ESP_ERR_NAMES = {
+    0: "OK",
+    -1: "ESP_FAIL",
+    0x101: "NO_MEM",
+    0x102: "INVALID_ARG",
+    0x103: "INVALID_STATE",
+    0x104: "INVALID_SIZE",
+    0x105: "NOT_FOUND",
+    0x107: "TIMEOUT",
+}
+
+
 def describe_heartbeat(payload: dict) -> str:
-    """One readable console line per heartbeat."""
+    """One readable console line per heartbeat.
+
+    S3 node (v1) nests wifi/storage; legacy cam/mic firmware sends flat fields.
+    """
     wifi = payload.get("wifi") or {}
     storage = payload.get("storage") or {}
     recording = payload.get("last_recording") or {}
-    parts = [
-        f"state={payload.get('state', '?')}",
-        f"rssi={wifi.get('rssi', '?')}",
-        f"pending={storage.get('pending_files', '?')}",
-        f"broken={storage.get('broken_files', '?')}",
-        f"sd_free={storage.get('free_mb', '?')}MB",
-    ]
+    rssi = wifi.get("rssi", payload.get("wifi_rssi", "?"))
+    pending = storage.get("pending_files", payload.get("pending_files", "?"))
+    free_mb = storage.get("free_mb")
+    if free_mb is None and isinstance(payload.get("sd_free_bytes"), (int, float)):
+        free_mb = int(payload["sd_free_bytes"]) // (1024 * 1024)
+    broken = storage.get("broken_files", payload.get("broken_files"))
+    parts = []
+    if "state" in payload:
+        parts.append(f"state={payload['state']}")
+    parts += [f"rssi={rssi}", f"pending={pending}"]
+    # Legacy mic firmware has no broken/ directory, so omit rather than print "?"
+    if broken is not None:
+        parts.append(f"broken={broken}")
+    parts.append(f"sd_free={'?' if free_mb is None else free_mb}MB")
     if recording:
         parts.append(f"last_rec cam={recording.get('camera')} mic={recording.get('mic')}")
+    if "recordings_failed" in payload:
+        # Legacy firmware: the failure reason is only visible through these fields.
+        error = payload.get("last_record_error", 0)
+        parts.append(
+            f"rec ok={payload.get('recordings_ok', '?')} "
+            f"fail={payload['recordings_failed']} "
+            f"last_err={ESP_ERR_NAMES.get(error, error)}"
+        )
+        if "last_saved_frames" in payload:
+            parts.append(
+                f"saved={payload['last_saved_frames']} "
+                f"dropped={payload.get('last_dropped_frames', '?')} "
+                f"gaps={payload.get('last_frame_gaps', '?')}"
+            )
+    faults = payload.get("faults")
+    if isinstance(faults, dict):
+        # Legacy cam: per-category failure counters since boot (uptime_seconds marks the boot).
+        counts = {k: int(v) for k, v in faults.items() if isinstance(v, (int, float))}
+        detail = " ".join(f"{k}={v}" for k, v in counts.items() if v)
+        parts.append(
+            f"broken_since_boot={sum(counts.values())}" + (f" ({detail})" if detail else "")
+        )
+        last_fault = payload.get("last_fault")
+        if last_fault and last_fault != "none":
+            parts.append(f"last_fault={last_fault}")
     if wifi.get("heartbeat_fail_streak"):
         parts.append(f"hb_fail_streak={wifi['heartbeat_fail_streak']}")
     return " ".join(parts)

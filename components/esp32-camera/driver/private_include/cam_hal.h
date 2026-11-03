@@ -64,6 +64,9 @@ bool cam_get_available_frames(void);
 void cam_set_psram_mode(bool enable);
 bool cam_get_psram_mode(void);
 
+/* 開機以來長度不符（FB-SIZE）而被丟棄的幀數，只增不減；呼叫端自行相減取區間值 */
+uint32_t cam_get_incomplete_frames(void);
+
 #ifdef __cplusplus
 }
 #endif

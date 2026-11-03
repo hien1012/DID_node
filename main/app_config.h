@@ -23,6 +23,15 @@
 
 #define CAM_RECORD_PERIOD_MS       APP_RECORD_PERIOD_MS
 
+/* 錄製開始時間對齊到週期倍數（5 分 → 每小時 :00、:05、…、:55），cam / mic 相同 */
+#define APP_RECORD_SLOT_SEC        (APP_RECORD_PERIOD_MS / 1000U)
+/* mic 開機後要等 MIC_BOOT_DELAY_MS（7 s）才能錄，第一次錄製至少要在這之後 */
+#define APP_FIRST_SLOT_MIN_LEAD_SEC 10U
+/* 每小時重新向 server 校時一次（在錄製之間做），抵銷時鐘漂移 */
+#define APP_TIME_RESYNC_SEC        3600U
+_Static_assert(APP_RECORD_PERIOD_MS % 1000U == 0U, "record period must be whole seconds");
+_Static_assert(3600U % APP_RECORD_SLOT_SEC == 0U, "record slots must align to the hour");
+
 /* 開機網路 A/B 測試：PC 執行 iperf2 `iperf -s -i 1`。
  * HOST 必須是節點可連線的 PC IPv4；每個狀態送 8 MiB，會延後正式錄製。
  * 設為 0 即跳過測速與周邊時脈切換，保留正常啟動流程。 */

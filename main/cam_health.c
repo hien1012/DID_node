@@ -30,12 +30,18 @@ typedef struct {
     uint32_t last_saved_frames;
     uint32_t last_dropped_frames;
     uint32_t last_frame_gaps;
+    cam_record_fault_t last_fault;
+    uint32_t faults[CAM_RECORD_FAULT_COUNT];   /* 開機以來各類失敗次數，只增不減 */
     cam_health_state_id_t state;
 } cam_health_state_t;
 
 static const char *TAG = "CAM_HEALTH";
 static SemaphoreHandle_t s_mutex = NULL;
 static cam_health_state_t s_state;
+/* 只在 heartbeat task 存取。錄影中不碰 SD（列目錄、查剩餘空間會和 writer 搶 FatFs 鎖，
+ * 造成寫入卡頓），讀取失敗也一樣，都沿用上一次的值，不送 0 */
+static size_t s_pending_files = 0;
+static uint64_t s_sd_free_bytes = 0;
 
 static const char *state_name(cam_health_state_id_t state)
 {
@@ -60,15 +66,15 @@ static esp_err_t send_heartbeat(void)
         xSemaphoreGive(s_mutex);
     }
 
-    size_t pending_files = 0;
-    size_t broken_files = 0;
-    uint64_t sd_free_bytes = 0;
-    (void)cam_storage_count_done(&pending_files);
-    (void)cam_storage_count_undone(&broken_files);
-    (void)cam_storage_get_free_bytes(&sd_free_bytes);
-    /* 錄影中的檔案也暫放在 cam_undone，不算 broken */
-    if (snapshot.state == CAM_HEALTH_STATE_RECORDING && broken_files > 0U) {
-        --broken_files;
+    if (snapshot.state != CAM_HEALTH_STATE_RECORDING) {
+        size_t pending_files = 0;
+        uint64_t sd_free_bytes = 0;
+        if (cam_storage_count_done(&pending_files) == ESP_OK) {
+            s_pending_files = pending_files;
+        }
+        if (cam_storage_get_free_bytes(&sd_free_bytes) == ESP_OK) {
+            s_sd_free_bytes = sd_free_bytes;
+        }
     }
     const int rssi = wifi_manager_get_rssi();
 
@@ -88,8 +94,8 @@ static esp_err_t send_heartbeat(void)
     cJSON_AddNumberToObject(
         root, "free_psram_bytes",
         (double)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-    cJSON_AddNumberToObject(root, "sd_free_bytes", (double)sd_free_bytes);
-    cJSON_AddNumberToObject(root, "pending_files", (double)pending_files);
+    cJSON_AddNumberToObject(root, "sd_free_bytes", (double)s_sd_free_bytes);
+    cJSON_AddNumberToObject(root, "pending_files", (double)s_pending_files);
     cJSON_AddNumberToObject(root, "recordings_ok", snapshot.recordings_ok);
     cJSON_AddNumberToObject(root, "recordings_failed", snapshot.recordings_failed);
     cJSON_AddNumberToObject(root, "uploads_ok", snapshot.uploads_ok);
@@ -100,20 +106,17 @@ static esp_err_t send_heartbeat(void)
     cJSON_AddNumberToObject(root, "last_saved_frames", snapshot.last_saved_frames);
     cJSON_AddNumberToObject(root, "last_dropped_frames", snapshot.last_dropped_frames);
     cJSON_AddNumberToObject(root, "last_frame_gaps", snapshot.last_frame_gaps);
+    cJSON_AddStringToObject(root, "last_fault",
+                            cam_record_fault_name(snapshot.last_fault));
+    cJSON *faults = cJSON_AddObjectToObject(root, "faults");
+    if (faults) {
+        for (int i = CAM_RECORD_FAULT_NONE + 1; i < CAM_RECORD_FAULT_COUNT; ++i) {
+            cJSON_AddNumberToObject(faults,
+                                    cam_record_fault_name((cam_record_fault_t)i),
+                                    snapshot.faults[i]);
+        }
+    }
     cJSON_AddNumberToObject(root, "reset_reason", esp_reset_reason());
-
-    /* server_mix.py 的 console 摘要讀 v1 巢狀欄位；上面的平面欄位保留給既有分析工具 */
-    cJSON *wifi = cJSON_AddObjectToObject(root, "wifi");
-    if (wifi) {
-        cJSON_AddNumberToObject(wifi, "rssi", rssi);
-    }
-    cJSON *storage = cJSON_AddObjectToObject(root, "storage");
-    if (storage) {
-        cJSON_AddNumberToObject(storage, "free_mb",
-                                (double)(sd_free_bytes / (1024U * 1024U)));
-        cJSON_AddNumberToObject(storage, "pending_files", (double)pending_files);
-        cJSON_AddNumberToObject(storage, "broken_files", (double)broken_files);
-    }
 
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -208,6 +211,11 @@ void cam_health_note_recording(const cam_record_result_t *result)
     s_state.last_saved_frames = result->saved_frames;
     s_state.last_dropped_frames = result->dropped_frames;
     s_state.last_frame_gaps = result->frame_gaps;
+    s_state.last_fault = result->success ? CAM_RECORD_FAULT_NONE : result->fault;
+    if (!result->success && result->fault > CAM_RECORD_FAULT_NONE &&
+        result->fault < CAM_RECORD_FAULT_COUNT) {
+        ++s_state.faults[result->fault];
+    }
     xSemaphoreGive(s_mutex);
 }
 

@@ -94,3 +94,5 @@ managed_components/
 sheet.png
 /server_mix_data/
 output.mp4
+analysis_out/
+did_node_status/

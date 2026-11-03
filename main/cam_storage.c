@@ -156,6 +156,37 @@ static esp_err_t preallocate_file(int fd, size_t expected_bytes)
     return ESP_OK;
 }
 
+/* cam_undone 只放錄影中的檔案；開機時的殘檔是斷電中斷或舊韌體留下的 broken 檔，直接刪除 */
+static void purge_undone(void)
+{
+    DIR *directory = opendir(CAM_STORAGE_UNDONE_DIR);
+    if (!directory) {
+        ESP_LOGW(TAG, "Cannot open %s (errno=%d)", CAM_STORAGE_UNDONE_DIR, errno);
+        return;
+    }
+    unsigned deleted = 0;
+    unsigned failed = 0;
+    char path[sizeof(CAM_STORAGE_UNDONE_DIR) + NAME_MAX + 1];
+    struct dirent *entry = NULL;
+    while ((entry = readdir(directory)) != NULL) {
+        time_t ignored = 0;
+        if (!parse_recorded_epoch(entry->d_name, &ignored)) {
+            continue;
+        }
+        snprintf(path, sizeof(path), CAM_STORAGE_UNDONE_DIR "/%s", entry->d_name);
+        if (unlink(path) == 0) {
+            ++deleted;
+        } else {
+            ++failed;
+        }
+    }
+    closedir(directory);
+    if (deleted > 0U || failed > 0U) {
+        ESP_LOGW(TAG, "Discarded leftover broken recordings: deleted=%u failed=%u",
+                 deleted, failed);
+    }
+}
+
 esp_err_t cam_storage_init(void)
 {
     if (s_initialized) {
@@ -198,6 +229,7 @@ esp_err_t cam_storage_init(void)
         s_storage_mutex = NULL;
         return err;
     }
+    purge_undone();
 
     s_initialized = true;
     ESP_LOGI(TAG, "SD mounted; camera recording directories are ready");
@@ -291,7 +323,13 @@ esp_err_t cam_storage_finish_recording(cam_storage_recording_t *recording,
             ESP_LOGI(TAG, "Recording done: %s", recording->done_path);
         }
     } else if (path_exists(recording->undone_path)) {
-        ESP_LOGW(TAG, "Incomplete recording kept as: %s", recording->undone_path);
+        /* broken 檔不保留：每支約 30 MB，留著會把 SD 塞滿 */
+        if (unlink(recording->undone_path) == 0) {
+            ESP_LOGW(TAG, "Broken recording discarded: %s", recording->undone_path);
+        } else {
+            ESP_LOGE(TAG, "Cannot discard %s (errno=%d)",
+                     recording->undone_path, errno);
+        }
     }
 
     recording->active = false;
@@ -390,12 +428,6 @@ static esp_err_t count_recordings(const char *directory_path, size_t *count_out)
 esp_err_t cam_storage_count_done(size_t *count_out)
 {
     return count_recordings(CAM_STORAGE_DONE_DIR, count_out);
-}
-
-/* 失敗的錄影留在 cam_undone（不會上傳），heartbeat 回報為 broken_files */
-esp_err_t cam_storage_count_undone(size_t *count_out)
-{
-    return count_recordings(CAM_STORAGE_UNDONE_DIR, count_out);
 }
 
 esp_err_t cam_storage_delete_done(const char *path)

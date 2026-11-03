@@ -23,7 +23,7 @@
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 
-#define I2S_MIC 0
+#define I2S_MIC 1
 
 #if I2S_MIC
 #include "driver/i2s_std.h"
