@@ -5,8 +5,8 @@
 #define APP_WIFI_SSID              "TP-LINK_AFA6"
 #define APP_WIFI_PASSWORD          "93348942"
 #define APP_SERVER_BASE_URL        "http://140.123.91.132:5000"
-
-/* #define APP_WIFI_SSID              "NEAT_2.4G"
+/* 
+#define APP_WIFI_SSID              "NEAT_2.4G"
 #define APP_WIFI_PASSWORD          "221b23251"
 #define APP_SERVER_BASE_URL        "http://140.123.91.132:5000" */
 

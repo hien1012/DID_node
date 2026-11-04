@@ -1,3 +1,4 @@
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,7 +24,7 @@
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 
-#define I2S_MIC 1
+#define I2S_MIC 0
 
 #if I2S_MIC
 #include "driver/i2s_std.h"
@@ -55,8 +56,15 @@
 #define DMA_FRAME_NUM           512
 #define I2S_READ_BYTES          8096
 
-// 32-bit raw -> 16-bit PCM 縮位量
+// I2S（INMP441）：32-bit slot -> 16-bit PCM 縮位量。PDM RX 只支援 16-bit，直接讀 int16，不移位
 #define PCM_SHIFT_BITS          16
+
+#if !I2S_MIC
+// ESP32 的 PDM RX 沒有硬體高通（S3 才有 hp_en），麥克風的 DC 與 1 Hz 以下的漂移會原樣進來，
+// 再被 PCM_GAIN 放大到削波（野外資料：夜間 0.45 Hz 慢波）。在增益前補一個一階高通，
+// -3 dB 點對齊 ICS-43434 內建高通的 24 Hz（datasheet DS-000069 p.14），讓 PDM 與 I2S 麥克風低頻響應一致
+#define PDM_HPF_CUTOFF_HZ       24.0f
+#endif
 
 // [+] PCM 增益倍數，由 #define 統一管理（原本寫死在 writer_task 內）
 #define PCM_GAIN                30
@@ -67,7 +75,12 @@
 #define FILE_IO_BUFFER_SIZE     32768
 
 // [+] 開錄前丟棄的 DMA 暖身讀次數（清掉 I2S pipeline 殘留資料）
+#if I2S_MIC
 #define I2S_FLUSH_READS         4
+#else
+#define I2S_FLUSH_READS         2
+#endif
+
 
 // I2S 只在錄音期間 enable（上傳時不輸出時脈）。重新給時脈後麥克風需要啟動時間：
 // INMP441 為 2^18 SCK ≈ 256 ms（BCLK 1.024 MHz），PDM 麥克風通常 < 50 ms，取 300 ms 都涵蓋
@@ -134,9 +147,15 @@ static size_t            g_total_samples_written = 0;
 static int64_t           g_record_started_us = 0;
 static bool              g_initialized = false;
 
+#if I2S_MIC
+typedef int32_t mic_raw_t;   // INMP441：32-bit slot，資料在高 16 位
+#else
+typedef int16_t mic_raw_t;   // PDM RX 只支援 16-bit（ESP-IDF i2s_pdm.h）
+#endif
+
 // 固定記憶體池
+static mic_raw_t g_i2s_read_buffer[I2S_READ_BYTES / sizeof(mic_raw_t)];
 static audio_block_t g_audio_blocks[AUDIO_BLOCK_COUNT];
-static int32_t       g_i2s_read_buffer[I2S_READ_BYTES / sizeof(int32_t)];
 static char          g_file_io_buffer[FILE_IO_BUFFER_SIZE];
 
 // [+] 動態 WAV 路徑緩衝（"/sdcard/N.wav"，最大支援到 9999.wav）
@@ -270,7 +289,7 @@ static esp_err_t i2s_init(void)
 #else
     i2s_pdm_rx_config_t pdm_rx_cfg = {
         .clk_cfg = I2S_PDM_RX_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
-        .slot_cfg = I2S_PDM_RX_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT,
+        .slot_cfg = I2S_PDM_RX_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
                                                         I2S_SLOT_MODE_MONO),
         .gpio_cfg = {
             .clk = PDM_CLK_IO,
@@ -340,6 +359,39 @@ static void audio_pipeline_deinit(void)
     if (q_full_blocks) { vQueueDelete(q_full_blocks); q_full_blocks = NULL; }
 }
 
+#if !I2S_MIC
+// ==========================================================
+//  PDM 一階高通：y[n] = g·(x[n] − x[n−1]) + a·y[n−1]
+//  a = exp(−2π·fc/fs)，g = (1 + a)/2 讓高頻增益為 1
+// ==========================================================
+typedef struct {
+    float a;
+    float g;
+    float x_prev;
+    float y_prev;
+} pdm_hpf_t;
+
+// 每輪錄音重新開始；x[−1] 取第一個樣本，開頭不會因為 DC 產生跳變
+static void pdm_hpf_reset(pdm_hpf_t *f, int16_t first_sample)
+{
+    f->a = expf(-6.28318531f * PDM_HPF_CUTOFF_HZ / (float)SAMPLE_RATE);
+    f->g = (1.0f + f->a) * 0.5f;
+    f->x_prev = (float)first_sample;
+    f->y_prev = 0.0f;
+}
+
+static int16_t pdm_hpf_apply(pdm_hpf_t *f, int16_t sample)
+{
+    const float x = (float)sample;
+    const float y = f->g * (x - f->x_prev) + f->a * f->y_prev;
+    f->x_prev = x;
+    f->y_prev = y;
+    const float rounded = y >= 0.0f ? y + 0.5f : y - 0.5f;
+    return rounded > (float)INT16_MAX ? INT16_MAX :
+           rounded < (float)INT16_MIN ? INT16_MIN : (int16_t)rounded;
+}
+#endif
+
 // ==========================================================
 //  Capture Task
 // ==========================================================
@@ -381,6 +433,10 @@ static void capture_task(void *arg)
     uint32_t level_count = 0;
     uint32_t level_clipped = 0;
 #endif
+#if !I2S_MIC
+    pdm_hpf_t hpf = {0};   // 第一個樣本進來才 reset；先清零避免 -Wmaybe-uninitialized
+    bool hpf_started = false;
+#endif
 
     while (total_samples_captured < target_samples) {
         esp_err_t ret = i2s_channel_read(rx_handle,
@@ -394,20 +450,32 @@ static void capture_task(void *arg)
             break;
         }
 
-        int n = bytes_read / sizeof(int32_t);
+        int n = bytes_read / sizeof(g_i2s_read_buffer[0]);
         for (int i = 0; i < n && total_samples_captured < target_samples; i++) {
-            int16_t pcm = (int16_t)(g_i2s_read_buffer[i] >> PCM_SHIFT_BITS);
+#if I2S_MIC
+            const int16_t raw = (int16_t)(g_i2s_read_buffer[i] >> PCM_SHIFT_BITS);
+            const int16_t pcm = raw;
+#else
+            const int16_t raw = g_i2s_read_buffer[i];
+            if (!hpf_started) {
+                pdm_hpf_reset(&hpf, raw);
+                hpf_started = true;
+            }
+            const int16_t pcm = pdm_hpf_apply(&hpf, raw);
+#endif
             blk->samples[blk->sample_count++] = pcm;
             total_samples_captured++;
 
 #if MIC_LEVEL_LOG_ENABLE
-            level_sum += pcm;
-            if (pcm < level_min) { level_min = pcm; }
-            if (pcm > level_max) { level_max = pcm; }
+            // mean/min/max 看濾波前的原始值（DC 漂移、是否接近 int16 上限）；
+            // clipped 看實際寫進檔案的值（濾波後 × PCM_GAIN）
+            level_sum += raw;
+            if (raw < level_min) { level_min = raw; }
+            if (raw > level_max) { level_max = raw; }
             const int32_t gained = (int32_t)pcm * PCM_GAIN;
             if (gained > INT16_MAX || gained < INT16_MIN) { level_clipped++; }
             if (++level_count >= SAMPLE_RATE) {
-                ESP_LOGI(TAG, "level %us: mean=%d min=%d max=%d clipped=%u/%u",
+                ESP_LOGI(TAG, "level %us: raw mean=%d min=%d max=%d clipped=%u/%u",
                          (unsigned)(total_samples_captured / SAMPLE_RATE),
                          (int)(level_sum / (int64_t)level_count),
                          (int)level_min, (int)level_max,
