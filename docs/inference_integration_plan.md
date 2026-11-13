@@ -5,6 +5,7 @@
 PSRAM / cache 頻寬之後再看。
 
 - 標「估」的數字沒有上板量測；量測值註明來源（LA 量測 = 2026-10-24 `digital.csv`，RAM = 2026-10-19 `S3 節點 RAM 預算.html`）。
+- 實際做出來的是 `infer_node/`（一塊板子只跑 cam 或 mic），上板實測記在 §9。
 - 互動版（時間軸動畫、記憶體試算）：同內容的網頁 artifact。
 
 ---
@@ -190,6 +191,9 @@ mic_capture → block ─► audio_infer (CPU1, prio 3)：湊滿 2 s → gain ×
 | **新增合計** | **≈ 19 KB** | |
 | 推估剩餘 | ≈ 40 KB | 估 |
 
+**實作時補上（上表沒算到）**：`stage2.c` 的 `g_pairs` 是 32 × 100 × 16 B = 51 KB 的靜態陣列，原本在內部 RAM (.bss)。
+`infer_node` 已改成開機配置到 PSRAM。實際 task 配置（`infer_node/README.md`）比 did_node 多約 18 KB 內部 RAM，與上表相符。
+
 **必改**：`CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384` 讓 ≤16 KB 的 `malloc` 優先進內部 RAM。
 fd_mix.c 每幀都會 `malloc`：flood fill 初始 stack 8 KB（`fd_mix.c` `INIT_CAPACITY 2048 × 4 B`，最壞可長到 307 KB）、
 bbox 陣列 2 KB、NMS 陣列等 → 每幀約 10 KB 內部 RAM 瞬態 + 碎片化。整合時改成啟動時用
@@ -280,3 +284,204 @@ task stack 放 PSRAM 理論上可行，但會碰到 cache 關閉期間的限制�
 4. ESP-NN on/off 對照：同一批 ROI / WAV，比對 PC 輸出與耗時。
 5. A3-a：fb 所有權改造、tracker 跨視窗、判定延遲與 fb 低水位監看。
 6. 之後再看：PSRAM / cache 頻寬（cam_task 寫 1.54 MB/s、FD 讀、保存時 cam_writer 讀 1.54 MB/s、arena 存取）。
+
+---
+
+## 9. infer_node 實測
+
+### 9.1 音訊（麥克風節點），2026-11-10
+
+**條件**
+
+| 項目 | 設定 |
+|---|---|
+| 韌體 | `infer_node`，`INFER_NODE_ROLE = INFER_ROLE_MIC`，I2S 麥克風，16 kHz mono，增益 ×30 |
+| 優化 | 兩次量測：① 全部 `-Og`（含 tflite-micro、esp-nn）② `-O2`（tflite-micro `-O3`、`depthwise_conv.cc` `-O2`，esp-nn `-O2`）。下面的表是 ①，② 的對照在本節最後 |
+| CNN kernel | `ESP_NN_KERNEL_SET=all`（ESP-NN S3 版）；**輸出尚未和 PC TFLite 比對**（§7-1） |
+| 管線 | 3 塊 2 s 視窗；`audio_infer`（Core 0, prio 3）logmel + CNN；`audio_writer`（Core 0, prio 2）寫低信賴 WAV；`mic_capture`（Core 1, prio 7） |
+| 上傳 | 讀 SD 前 `mic_infer_wait_gap()` 挑空檔。這段量測期間**沒有上傳**（`main` 只有 0.1 ms / 輪，待上傳未滿 20 個） |
+
+**每個視窗的推論時間**（`MIC_INFER` log，w30）：logmel 224 ms + CNN 57 ms = **281 ms**，佔 2 s 視窗的 14%。
+§6 的估計是 logmel 40–120 ms、CNN（int8 + ESP-NN）10–40 ms；實測都比估計慢。`-O2` 的對照在本節最後。
+
+**推論期間**（`Task CPU per inference`，30 次平均，每次 281.3 ms；只量 logmel + CNN 那一段）
+
+| task | core | ms | 占比 |
+|---|---|---|---|
+| audio_infer | 0 | 280.9 | 99.9% |
+| IDLE | 1 | 274.6 | 97.6% |
+| mic_capture | 1 | 1.3 | 0.4% |
+| wifi | 0 | 0.3 | 0.1% |
+| esp_timer | 0 | 0.1 | 0.0% |
+| sum | | | 198.1% |
+| **busy** | | | **core 0 100.0%，core 1 2.4%** |
+
+**一輪 = 一個 2 s 視窗**（`Task CPU per audio cycle`，29 輪平均，每輪 1999.4 ms；從這個視窗到下一個視窗連續量，兩核心所有 task）
+
+| task | core | ms / 輪 | 占比 |
+|---|---|---|---|
+| IDLE | 1 | 1982.4 | 99.1% |
+| IDLE | 0 | 1703.9 | 85.2% |
+| audio_infer | 0 | 284.3 | 14.2% |
+| mic_capture | 1 | 8.6 | 0.4% |
+| result_report | 不綁 | 6.5 | 0.3% |
+| tiT | 不綁 | 5.0 | 0.3% |
+| wifi | 0 | 4.8 | 0.2% |
+| audio_writer | 0 | 2.6 | 0.1% |
+| heartbeat | 不綁 | 0.3 | 0.0% |
+| sys_evt | 0 | 0.3 | 0.0% |
+| esp_timer | 0 | 0.2 | 0.0% |
+| main | 0 | 0.1 | 0.0% |
+| sum | | | 200.0% |
+| **busy** | | | **core 0 14.8%，core 1 0.9%** |
+
+**解讀**
+
+- **一輪錄音的忙碌程度：Core 0 約 15%、Core 1 約 1%。** Core 0 幾乎全是推論（284 ms），其餘 task 合計約 13 ms；
+  Core 1 只有 `mic_capture` 每 64 ms 讀一次 I2S（約 0.3 ms / 次）。
+- 推論表的 `audio_infer 99.9%` 是「推論那 281 ms 內」的占比，不是整體負載；整體要看一輪的表。
+- 每輪約有 1.7 s 空檔，上傳挑空檔時每輪約有 1.4 s 可讀 SD（扣掉 300 ms 餘裕）。
+- `audio_writer` 平均 2.6 ms / 輪，代表這 29 輪中有少數低信賴視窗寫了 WAV；寫入在推論之後，不影響推論時間。
+- 29 輪而不是 30：第一次 mark 只開始計時，30 個視窗之間是 29 個完整的輪。
+- 推論表的 `sum 198.1%`：快照當下 Core 1 正在跑的 IDLE 還沒更新計數器，少算約 2%；一輪的區間長，誤差攤平到 0%。
+
+**`-Og` 與 `-O2` 對照**（同一塊板子、同樣條件；`-O2` 為 w29 / w30 與 30 次 / 29 輪平均，這段期間同樣沒有上傳）
+
+| 項目 | `-Og` | `-O2` | 變化 |
+|---|---|---|---|
+| logmel | 224 ms | 180–182 ms | −19% |
+| CNN（ESP-NN） | 57 ms | 56 ms | −2% |
+| 推論期間平均（`Task CPU per inference`） | 281.3 ms | 239.7 ms | −15% |
+| 一輪的 `audio_infer` | 284.3 ms | 242.5 ms | −15% |
+| 一輪的 `mic_capture` | 8.6 ms | 7.5 ms | |
+| 一輪的 `result_report` / `tiT` / `wifi` / `audio_writer` | 6.5 / 5.0 / 4.8 / 2.6 ms | 5.7 / 4.5 / 4.5 / 2.5 ms | 幾乎不變（多半在等 I/O） |
+| 一輪的 IDLE（core 0 / core 1） | 85.2% / 99.1% | 87.4% / 99.2% | |
+| **一輪 busy** | **core 0 14.8%，core 1 0.9%** | **core 0 12.6%，core 1 0.8%** | |
+
+- `-O2` 省下的幾乎都在 logmel（純 C 浮點）；CNN 主要是 esp-nn 的 `.S` 組合語言，優化等級幾乎沒影響。
+- `-O2` 下 logmel 仍有 180 ms，高於 §6 的 40–120 ms。剩下的主要是寫法：去 DC 每個樣本一次 **double** 除法與加法、
+  每個視窗重算 **double** cos / sin 表（S3 FPU 只有單精度，double 是軟體模擬，`-O2` 也救不了），以及用 512 點複數 FFT
+  算實數訊號。這三項都能改成幾乎同結果的寫法；目前負載 12.6%，只有要做 1 s hop 的重疊視窗（§4.5）時才需要。
+
+**還沒量**
+
+1. 有上傳時的一輪（`main`、`wifi`、`tiT`、`audio_writer` 實際多少，以及 `Upload audio: ... gap_wait= gap_timeouts=`）。
+2. ESP-NN 輸出和 PC TFLite 的比對（用存下的 WAV 樣本）。
+
+### 9.2 影像（相機節點），2026-11-10
+
+**條件**
+
+| 項目 | 設定 |
+|---|---|
+| 韌體 | `infer_node`，`INFER_NODE_ROLE = INFER_ROLE_CAM`，GRAY8 640×480 5 fps，AE/AGC/AWB 暖機後鎖定 |
+| 優化 | `-O2`（tflite-micro `-O3`、`depthwise_conv.cc` `-O2`，esp-nn `-O2`） |
+| CNN kernel | `ESP_NN_KERNEL_SET=all`；**輸出尚未和 PC TFLite 比對** |
+| 管線 | `cam_task` → `camera_capture` → `cam_detect`（Core 1, prio 5：下採樣 + FD + 追蹤）→ `cam_infer`（Core 0, prio 1：crop + CNN）→ `cam_writer`（Core 0, prio 5） |
+| 統計 | 推論期間 = 每個 ROI 的 CNN `Invoke`；一輪 = `cam_detect` 每處理 10 幀標記一次（5 fps 下 2 s），`cam_infer` 每分鐘印 |
+
+**忙碌場景**（一分鐘 194 個 ROI ≈ 3.2 個/s，87 幀有候選，平均每幀 2.2 個 ROI）
+
+推論期間（`Task CPU per inference`，194 次平均，每次 279.5 ms）
+
+| task | core | ms | 占比 |
+|---|---|---|---|
+| cam_infer | 0 | 258.1 | 92.3% |
+| cam_detect | 1 | 233.9 | 83.7% |
+| IDLE | 1 | 23.9 | 8.6% |
+| cam_task | 1 | 15.7 | 5.6% |
+| result_report | 不綁 | 10.2 | 3.6% |
+| tiT | 不綁 | 8.7 | 3.1% |
+| wifi | 0 | 6.2 | 2.2% |
+| cam_writer | 0 | 1.9 | 0.7% |
+| sum | | | 200.1% |
+| **busy** | | | **core 0 100.0%，core 1 91.4%** |
+
+一輪（`Task CPU per video cycle`，27 輪平均，每輪 **2261.8 ms**）
+
+| task | core | ms / 輪 | 占比 |
+|---|---|---|---|
+| cam_infer | 0 | 1919.4 | 84.9% |
+| cam_detect | 1 | 1914.3 | 84.6% |
+| IDLE | 1 | 172.5 | 7.6% |
+| IDLE | 0 | 156.8 | 6.9% |
+| cam_task | 1 | 127.4 | 5.6% |
+| result_report | 不綁 | 90.1 | 4.0% |
+| tiT | 不綁 | 73.3 | 3.2% |
+| wifi | 0 | 51.4 | 2.3% |
+| cam_writer | 0 | 14.3 | 0.6% |
+| sys_evt / camera_capture / heartbeat / esp_timer / main | | 3.7 / 0.7 / 0.6 / 0.3 / 0.1 | 約 0.2% |
+| sum | | | 200.1% |
+| **busy** | | | **core 0 93.1%，core 1 92.4%** |
+
+CNN 分層（194 次平均）與安靜時（同日稍早，5 次平均）對照
+
+| 運算 | 安靜時 | 忙碌時 | 變化 |
+|---|---|---|---|
+| 各層合計 | 234.1 ms | 277.5 ms | +18% |
+| 第一層 CONV_2D | 32.7 ms | 42.0 ms | +28% |
+| BN 的 ADD + MUL（6 個 op） | 153.1 ms | 180.4 ms | +18% |
+| FULLY_CONNECTED | 24.8 ms | 27.7 ms | +11% |
+| `CNN stage` | | `cnn_wait` 979 / 2301 ms，`cnn`（每幀合計）620 / 1214 ms（平均 / 最長） | |
+
+**解讀**
+
+- **兩顆核心都約 93% 忙，同時是瓶頸。** Core 0：3.2 ROI/s × 0.277 s ≈ 0.9，CNN 快滿；Core 1：`cam_detect` 每 10 個處理過的幀用
+  1914 ms，平均每幀約 191 ms，貼近 200 ms 上限。
+- **有丟幀**：一輪應是 2000 ms，實測 2261.8 ms。一輪以「處理過的 10 幀」計，多出的 13% 約等於每 10 幀丟 1.3 幀
+  （由長度推算；這段的 `Camera: dropped=` 沒有記錄）。
+- **CNN 變慢 18%**：CNN 期間 Core 1 的 `cam_detect` 從安靜時 56% 升到 84%，兩核心同時大量讀寫 PSRAM，互搶 cache 與頻寬
+  （和 10 月 FD 移到 Core 1 時 715 → 845 ms 同一現象）。
+- **結果回報的成本變明顯**：`result_report` + `tiT` + `wifi` 約 214 ms / 輪（9.5%），ROI 多時每幀都有 frame / roi 記錄要轉 JSON、POST。
+- 安靜時（一分鐘 5 個 ROI）`detect` 平均 78.5 ms，但最長 307 ms（`refine` 158、`contour` 84），2100 幀中丟 1 幀：
+  整片變化產生的大框，見 `fd_mix.c` 的 flood fill 與 refine。
+
+**靜止畫面**（同日稍後，畫面沒有動靜，幾乎沒有 ROI）
+
+一輪（`Task CPU per video cycle`，30 輪平均，每輪 1999.2 ms，沒有丟幀）
+
+| task | core | ms / 輪 | 占比 |
+|---|---|---|---|
+| IDLE | 0 | 1916.0 | 95.8% |
+| IDLE | 1 | 1304.3 | 65.2% |
+| cam_detect | 1 | 547.6 | 27.4% |
+| cam_task | 1 | 96.3 | 4.8% |
+| result_report | 不綁 | 54.2 | 2.7% |
+| tiT | 不綁 | 41.9 | 2.1% |
+| wifi | 0 | 31.3 | 1.6% |
+| cam_infer | 0 | 3.4 | 0.2% |
+| sys_evt / camera_capture / heartbeat / esp_timer / main | | 2.3 / 0.6 / 0.2 / 0.2 / 0.1 | 約 0.2% |
+| sum | | | 200.0% |
+| **busy** | | | **core 0 4.2%，core 1 34.8%** |
+
+FD 的固定成本（`Detect stage`，300 幀，沒有框所以 refine / nms 不執行）
+
+| 階段 | 平均 / 最長 ms | 佔 detect |
+|---|---|---|
+| capture / queue | 200.0 / 200.0、0.0 / 0.0 | |
+| downscale | 5.3 / 6.8 | 9% |
+| diff | 12.2 / 14.2 | 22% |
+| **morph** | **32.5 / 33.5** | **57%** |
+| contour | 6.6 / 7.3 | 12% |
+| track | 0.1 / 0.2 | |
+| **detect** | **56.7 / 59.2** | |
+
+開機以來累計（`Camera:`，2432 幀，包含前面的忙碌時段）：`dropped=32 gaps=7 incomplete=7 stale=1 rois=249 expired=104 low=8 saved=8`，
+幀間隔 198.9–399.8 ms；`Stack free: cam_detect=5300 B cam_infer=6904 B`；內部 RAM free 134,159 B、min 129,891 B。
+
+**解讀（靜止）**
+
+- **FD 的固定成本：每幀約 55–57 ms（Core 1 的 27%），其中 morph 32.5 ms 佔 57%。** 沒有任何動靜也要付。
+- **結果回報的固定成本：127 ms / 輪（6.4%）。** 沒有 ROI 也照樣每幀送一筆 frame 記錄（5 筆 / s）。
+- 忙碌時段累計的 `dropped=32`、`expired=104` 證實上面的推算：FD 和 CNN 都曾跟不上。
+- **`incomplete=7`（相機驅動拿到不完整的幀）是新的警訊**：前一次安靜時段 7 分鐘只有 1 次。推測是兩核心同時大量讀寫 PSRAM、
+  拖慢 `cam_task` 把 DMA 資料搬進 fb，**未證實**。
+
+**下一步**
+
+1. FD：morph / diff 改寫（任何時候都要付的成本）、整片變化過濾、flood fill 推進前檢查、Sobel 去 `sqrtf` → 降 Core 1 負載，
+   也減少 PSRAM 競爭讓 CNN 回到約 234 ms，並觀察 `incomplete` 是否跟著下降。
+2. BN 廣播 ADD / MUL 走 ESP-NN（MUL 有 `esp_nn_mul_broadcast_channel_s8`，ADD 要自己寫）→ CNN 估計 277 → 約 130 ms（估）。
+3. 回報量：沒有候選的幀不送 frame 記錄，改用統計（靜止時省約 6%）。
+4. 補記錄：忙碌時段的 `Detect stage avg/max ms`（看 FD 時間花在 morph、refine 還是 contour）。
+5. Stage2 追蹤器的配對規則（累計 vs 連續、距離門檻、雜點、重複分類）：見 `docs/cam_tracker_issues.md`。

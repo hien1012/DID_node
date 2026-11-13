@@ -39,6 +39,13 @@ idf.py -B build\s3 build
 - `components/esp32-camera/`：**本地修改版，已納入 git**（2026-10-13 起；之前被 ignore，換電腦會缺檔）。
   `cam_record.c` include 私有 `cam_hal.h` 用 pause/resume。`patches/esp32-camera-pause.patch` 只是對原版的差異參考，可能落後於目前驅動。
 
+## 推論韌體（`infer_node/`）
+- 獨立 ESP-IDF 專案，與 `main/` 平行；進資料夾 `idf.py -B build build`。沿用 `main/app_config.h`、`components/esp32-camera`，
+  並直接編譯 `main/` 的 wifi_manager、time_sync、node_storage 等（改這些檔案兩邊都受影響）。說明見 `infer_node/README.md`。
+- **一塊板子只跑一個功能**：相機節點或麥克風節點，燒錄前改 `main/infer_config.h` 的 `INFER_NODE_ROLE`。相機：擷取在 Core 1，CNN 在 Core 0；FD + 追蹤（`cam_detect`）在 Core 1，不被 CNN 擋住。麥克風的分配相反（見下一點）。
+- mic 連續 2 s 視窗邊錄邊推論（3 塊視窗；Core 0 = `mic_capture` + `audio_feature`（logmel），Core 1 = `audio_cnn` + `audio_writer`（寫 WAV）；上傳讀 SD 前用 `mic_infer_wait_gap()` 挑空檔）、cam 暖機後連續 capture + infer（兩個模型都是 int8，預設 reference kernel）；結果 POST `/infer/results`，低信賴樣本存 SD 滿 20 個 POST `/infer/sample`。
+  `server_mix.py` 的儀表板在 `/`（`tools/infer_dashboard.html`），`tools/infer_fake_node.py` 可不接硬體測試。
+
 ## FreeRTOS tasks
 | 名稱 | 優先權 | stack | core | 用途 |
 |---|---|---|---|---|

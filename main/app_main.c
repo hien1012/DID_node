@@ -141,7 +141,7 @@ static void sleep_until(time_t epoch, uint32_t lead_ms)
             wait_ms = SLEEP_CHUNK_MS;
         }
         /* +1 tick: pdMS_TO_TICKS rounds down, so never wake before the target */
-        vTaskDelay(pdMS_TO_TICKS((uint32_t)wait_ms) + 1U);
+        vTaskDelay(pdMS_TO_TICKS((uint32_t)wait_ms) + 1U); //計算要睡多久
     }
 }
 
@@ -255,13 +255,13 @@ void app_main(void)
     /* Files left from before the reboot are uploaded after the first session. */
     time_t start_epoch = 0;
     while (true) {
-        start_epoch = next_session_start(start_epoch, lead_sec);
+        start_epoch = next_session_start(start_epoch, lead_sec); //計算下一次開始前還要多久
         struct tm local_start = {0};
         localtime_r(&start_epoch, &local_start);
         ESP_LOGI(TAG, "Next session at %02d:%02d:%02d (%u s, every %u s)",
                  local_start.tm_hour, local_start.tm_min, local_start.tm_sec,
                  (unsigned)APP_RECORD_DURATION_SEC, (unsigned)APP_RECORD_PERIOD_SEC);
-        sleep_until(start_epoch, APP_PREPARE_LEAD_MS);
+        sleep_until(start_epoch, APP_PREPARE_LEAD_MS); //睡到下一次
         timing_trace_begin();
         timing_trace_mark(TT_MARK_WAKE);
 

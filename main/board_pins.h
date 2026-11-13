@@ -16,17 +16,13 @@
 /* --- Camera (8-bit DVP, ESP32-S3-EYE layout) --- */
 /* 3.3 V module only. OV2640 with its own 12 MHz oscillator leaves XCLK
  * unconnected (see USE_OV2640_ONBOARD_XVCLK in cam_record.c). */
-#define CAM_PIN_PWDN   -1   /* not wired on this build (GPIO21 is the LA probe below) */
+/* 
+#define CAM_PIN_PWDN   -1
 #define CAM_PIN_RESET  -1
 #define CAM_PIN_XCLK   15
 #define CAM_PIN_SIOD   4
-#define CAM_PIN_SIOC   5
+#define CAM_PIN_SIOC   5 
 
-/*
- * CAM_PIN_D0..D7 are bus bits from least to most significant:
- *   OV7725 breakout labelled D2..D9 (Y2..Y9): D2->D0, ..., D9->D7
- *   OV7670/OV2640 breakout labelled D0..D7:    D0->D0, ..., D7->D7
- */
 #define CAM_PIN_D0     11
 #define CAM_PIN_D1     9
 #define CAM_PIN_D2     8
@@ -38,8 +34,27 @@
 
 #define CAM_PIN_VSYNC  6
 #define CAM_PIN_HREF   7
-#define CAM_PIN_PCLK   13
+#define CAM_PIN_PCLK   13 
+*/
 
+#define CAM_PIN_PWDN   -1   /* not wired on this build (GPIO21 is the LA probe below) */
+#define CAM_PIN_RESET  -1
+#define CAM_PIN_XCLK   9
+#define CAM_PIN_SIOD   13
+#define CAM_PIN_SIOC   12
+
+#define CAM_PIN_D0     5
+#define CAM_PIN_D1     4
+#define CAM_PIN_D2     7
+#define CAM_PIN_D3     6
+#define CAM_PIN_D4     16
+#define CAM_PIN_D5     15
+#define CAM_PIN_D6     18
+#define CAM_PIN_D7     17
+
+#define CAM_PIN_VSYNC  10
+#define CAM_PIN_HREF   11
+#define CAM_PIN_PCLK   8
 /* --- Microphone (I2S0; PDM RX is only available on I2S0) --- */
 /* 1: I2S standard mic (BCLK/WS/DIN), 0: PDM mic (CLK/DIN, WS unused). */
 #define MIC_INTERFACE_I2S 1

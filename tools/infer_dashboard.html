@@ -1,0 +1,683 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DID 節點推論</title>
+<style>
+/* 伺服器可能在沒有對外網路的 LAN：不依賴任何 CDN，字型用系統字型。 */
+:root {
+  --bg: #eef1ef; --panel: #ffffff; --ink: #18211e; --muted: #5a6761; --line: #d6ddd9; --track: #e6ebe8;
+  --drone: #c2410c; --helicopter: #7c3aed; --bird: #0369a1; --background: #6b7a73;
+  --low: #b45309; --ok: #15803d; --bad: #b91c1c; --accent: #0f766e;
+  --t-down: #0369a1; --t-fd: #0f766e; --t-track: #a16207; --t-crop: #7c3aed; --t-roi: #c2410c; --t-other: #6b7a73;
+  --mono: ui-monospace, "Cascadia Mono", Consolas, Menlo, monospace;
+  --sans: "Segoe UI", "Microsoft JhengHei", "PingFang TC", "Noto Sans TC", system-ui, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #101513; --panel: #181f1c; --ink: #e4ebe7; --muted: #97a59e; --line: #2a3430; --track: #252e2a;
+    --drone: #fb923c; --helicopter: #a78bfa; --bird: #38bdf8; --background: #8a9a92;
+    --low: #fbbf24; --ok: #4ade80; --bad: #f87171; --accent: #2dd4bf;
+    --t-down: #38bdf8; --t-fd: #2dd4bf; --t-track: #facc15; --t-crop: #a78bfa; --t-roi: #fb923c; --t-other: #8a9a92;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.5 var(--sans); }
+header.top {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px 18px;
+  padding: 12px 18px; background: var(--panel); border-bottom: 1px solid var(--line);
+  position: sticky; top: 0; z-index: 5;
+}
+h1 { font-size: 17px; margin: 0; font-weight: 600; }
+h2 { font-size: 13px; margin: 0; font-weight: 600; color: var(--muted); }
+main { display: grid; gap: 14px; padding: 14px 18px 40px; max-width: 1500px; margin: 0 auto; }
+.grid2 { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 440px), 1fr)); }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.panel-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.panel-head .title { font-size: 15px; font-weight: 600; }
+.muted { color: var(--muted); }
+.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.pill { font: 12px var(--mono); padding: 1px 8px; border-radius: 99px; border: 1px solid currentColor; white-space: nowrap; }
+.pill.ok { color: var(--ok); } .pill.bad { color: var(--bad); } .pill.low { color: var(--low); } .pill.idle { color: var(--muted); }
+select, button { font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 5px; padding: 3px 9px; }
+button { cursor: pointer; }
+button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--panel); }
+button:focus-visible, select:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.now { display: grid; grid-template-columns: minmax(150px, 210px) 1fr; gap: 16px; align-items: center; }
+@media (max-width: 520px) { .now { grid-template-columns: 1fr; } }
+.verdict { display: flex; flex-direction: column; gap: 2px; }
+.verdict .label { font-size: 30px; line-height: 1.15; font-weight: 700; letter-spacing: -0.01em; overflow-wrap: anywhere; }
+.verdict .conf { font: 15px var(--mono); }
+.bars { display: grid; gap: 6px; }
+.bar { display: grid; grid-template-columns: 86px 1fr 56px; gap: 8px; align-items: center; font-size: 12.5px; }
+.bar .track { position: relative; height: 12px; background: var(--track); border-radius: 3px; overflow: hidden; }
+.bar .fill { height: 100%; border-radius: 3px; transition: width .25s ease; }
+.bar .gate { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--low); }
+.bar .pct { text-align: right; font-family: var(--mono); }
+
+.strip { display: flex; gap: 2px; align-items: flex-end; height: 44px; overflow: hidden; }
+.strip i { flex: 1 1 0; min-width: 3px; max-width: 16px; border-radius: 1px; display: block; }
+.strip i.low { outline: 1px solid var(--low); outline-offset: -1px; }
+.legend { display: flex; flex-wrap: wrap; gap: 3px 12px; font-size: 12px; color: var(--muted); }
+.legend span::before { content: ""; display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 5px; background: var(--c); }
+
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(96px, 1fr)); gap: 8px; }
+.stat { border: 1px solid var(--line); border-radius: 6px; padding: 6px 9px; min-width: 0; }
+.stat .k { font-size: 11.5px; color: var(--muted); }
+.stat .v { font: 15px var(--mono); overflow-wrap: anywhere; }
+.stat.warn .v { color: var(--low); } .stat.bad .v { color: var(--bad); }
+
+.progress { display: grid; gap: 4px; }
+.progress .row { display: flex; justify-content: space-between; font-size: 12.5px; }
+.progress .track { height: 8px; background: var(--track); border-radius: 4px; overflow: hidden; }
+.progress .fill { height: 100%; background: var(--low); transition: width .25s ease; }
+
+canvas.chart { width: 100%; height: 150px; display: block; }
+
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { padding: 5px 8px; border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; }
+td.num, th.num { text-align: right; font-family: var(--mono); }
+tr.sub td:first-child { padding-left: 22px; color: var(--muted); }
+tr.sum td { font-weight: 600; }
+td .share { display: inline-block; width: 64px; height: 8px; background: var(--track); border-radius: 2px; overflow: hidden; vertical-align: middle; margin-right: 6px; }
+td .share i { display: block; height: 100%; background: var(--accent); }
+tr.low td:first-child { box-shadow: inset 3px 0 0 var(--low); }
+.tag { font-weight: 600; }
+
+.tabs { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.gallery { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr)); }
+.card { border: 1px solid var(--line); border-radius: 7px; padding: 10px; display: flex; flex-direction: column; gap: 7px; min-width: 0; }
+.card .head { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.frame-wrap { position: relative; line-height: 0; background: #000; border-radius: 4px; overflow: hidden; }
+.frame-wrap img { width: 100%; height: auto; display: block; image-rendering: auto; }
+.frame-wrap svg { position: absolute; inset: 0; width: 100%; height: 100%; }
+.rois { display: flex; flex-wrap: wrap; gap: 6px; }
+.roi { display: flex; gap: 6px; align-items: center; font-size: 12px; }
+.roi img { width: 48px; height: 48px; image-rendering: pixelated; border-radius: 3px; display: block; }
+audio { width: 100%; height: 32px; }
+canvas.wave { width: 100%; height: 56px; display: block; background: var(--track); border-radius: 4px; }
+details summary { cursor: pointer; font-size: 12px; color: var(--muted); }
+details pre { font: 11.5px/1.45 var(--mono); margin: 6px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.empty { color: var(--muted); padding: 18px 4px; }
+.pager { display: flex; gap: 8px; align-items: center; justify-content: flex-end; font-size: 12.5px; }
+@media (prefers-reduced-motion: reduce) { .bar .fill, .progress .fill { transition: none; } }
+</style>
+</head>
+<body>
+<header class="top">
+  <h1>DID 節點推論</h1>
+  <a href="/nodes" style="color:var(--accent)">全部節點</a>
+  <label class="muted">裝置 <select id="device"></select></label>
+  <span id="link" class="pill idle">連線中…</span>
+  <span id="node-state" class="muted"></span>
+  <span id="clock" class="muted mono" style="margin-left:auto"></span>
+</header>
+
+<main>
+  <div class="grid2">
+    <section class="panel" aria-labelledby="mic-title">
+      <div class="panel-head">
+        <span class="title" id="mic-title">麥克風</span>
+        <span class="muted mono" id="mic-when">尚無資料</span>
+      </div>
+      <div class="now">
+        <div class="verdict">
+          <span class="label" id="mic-label">—</span>
+          <span class="conf" id="mic-conf"></span>
+        </div>
+        <div class="bars" id="mic-bars"></div>
+      </div>
+      <div>
+        <h2>最近的視窗（每格 2 秒，高度 = 信賴度，描邊 = 低信賴）</h2>
+        <div class="strip" id="mic-strip" role="img" aria-label="最近視窗的判斷結果"></div>
+        <div class="legend" id="mic-legend"></div>
+      </div>
+      <div class="stats" id="mic-stats"></div>
+      <div class="progress" id="mic-progress"></div>
+    </section>
+
+    <section class="panel" aria-labelledby="cam-title">
+      <div class="panel-head">
+        <span class="title" id="cam-title">相機</span>
+        <span class="muted mono" id="cam-when">尚無資料</span>
+      </div>
+      <div class="now">
+        <div class="verdict">
+          <span class="label" id="cam-label">—</span>
+          <span class="conf" id="cam-conf"></span>
+        </div>
+        <div class="bars" id="cam-bars"></div>
+      </div>
+      <div>
+        <h2>最近的每幀處理時間（ms，虛線 = 200 ms 幀週期，只有下採樣 + FD + 追蹤要低於它）</h2>
+        <canvas class="chart" id="frame-chart" role="img" aria-label="每幀處理時間"></canvas>
+        <div class="legend">
+          <span style="--c:var(--t-down)">下採樣</span><span style="--c:var(--t-fd)">幀差 FD</span><span style="--c:var(--t-track)">追蹤</span><span style="--c:var(--t-crop)">裁切</span><span style="--c:var(--t-roi)">CNN</span><span style="--c:var(--t-other)">回報與其他</span>
+        </div>
+      </div>
+      <div>
+        <h2 id="stage-title">每階段耗時（每幀平均，沒有 ROI 的幀 CNN 算 0）</h2>
+        <div class="scroll"><table>
+          <thead><tr><th>階段</th><th class="num">平均 ms</th><th class="num">最長 ms</th><th>占處理時間</th></tr></thead>
+          <tbody id="stage-table"></tbody>
+        </table></div>
+      </div>
+      <details>
+        <summary id="ops-title">CNN 每一層耗時（尚無資料）</summary>
+        <div class="scroll"><table>
+          <thead><tr><th class="num">#</th><th>層</th><th class="num">平均 ms</th><th>占 CNN</th></tr></thead>
+          <tbody id="ops-table"></tbody>
+        </table></div>
+      </details>
+      <div class="stats" id="cam-stats"></div>
+      <div class="progress" id="cam-progress"></div>
+    </section>
+  </div>
+
+  <section class="panel" aria-labelledby="usage-title">
+    <div class="panel-head">
+      <span class="title" id="usage-title">推論一次，每個 task 占用的 CPU</span>
+      <span class="muted mono" id="usage-summary">尚無資料</span>
+    </div>
+    <p class="muted" style="margin:0;font-size:12.5px">FreeRTOS run time stats，相機的一次 = 一個 64×64 ROI 的 CNN，麥克風的一次 = logmel + CNN。占比以單一核心 100% 計算，兩顆核心加總為 200%；中斷的時間會算在被打斷的 task 上。</p>
+    <div class="scroll"><table>
+      <thead><tr><th>Task</th><th>核心</th><th class="num">每次推論 ms</th><th>占比</th></tr></thead>
+      <tbody id="usage-table"></tbody>
+    </table></div>
+  </section>
+
+  <section class="panel" aria-labelledby="sample-title">
+    <div class="panel-head">
+      <span class="title" id="sample-title">低信賴度樣本（已回傳）</span>
+      <div class="tabs" id="sample-tabs">
+        <button type="button" data-media="video" aria-pressed="true">影像</button>
+        <button type="button" data-media="audio" aria-pressed="false">音訊</button>
+      </div>
+    </div>
+    <div class="gallery" id="gallery"></div>
+    <div class="pager">
+      <span class="muted mono" id="pager-info"></span>
+      <button type="button" id="pager-new">較新</button>
+      <button type="button" id="pager-old">較舊</button>
+    </div>
+  </section>
+
+  <section class="panel" aria-labelledby="log-title">
+    <div class="panel-head">
+      <span class="title" id="log-title">最近的判斷</span>
+      <div class="tabs" id="log-tabs">
+        <button type="button" data-kind="all" aria-pressed="true">全部</button>
+        <button type="button" data-kind="audio" aria-pressed="false">音訊</button>
+        <button type="button" data-kind="roi" aria-pressed="false">影像</button>
+        <button type="button" data-kind="low" aria-pressed="false">低信賴</button>
+      </div>
+    </div>
+    <div class="scroll"><table>
+      <thead><tr><th>時間</th><th>來源</th><th>判斷</th><th class="num">信賴度</th><th class="num">處理 ms</th><th>細節</th></tr></thead>
+      <tbody id="log"></tbody>
+    </table></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+const AUDIO_LABELS = ["background", "drone", "helicopter"];
+const VIDEO_LABELS = ["drone", "bird", "background"];
+const NAMES = { background: "背景", drone: "無人機", helicopter: "直升機", bird: "鳥" };
+const STALE_MS = 15000;
+const PAGE = 12;
+
+const $ = (id) => document.getElementById(id);
+/* /dashboard?device=<id>：從總覽頁 (/nodes) 點進來時直接顯示那個節點 */
+const state = { device: new URLSearchParams(location.search).get("device"), media: "video", offset: 0, kind: "all", overview: null, sampleKey: "" };
+
+function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+function colorOf(label) { return `var(--${label in NAMES ? label : "background"})`; }
+function nameOf(label) { return NAMES[label] || label || "—"; }
+function pad(n) { return String(n).padStart(2, "0"); }
+function timeText(ms) {
+  if (!ms) return "—";
+  const d = new Date(ms);
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+function dateTimeText(ms) {
+  const d = new Date(ms);
+  return `${pad(d.getMonth() + 1)}/${pad(d.getDate())} ${timeText(ms)}`;
+}
+function agoText(ms, now) {
+  const s = Math.max(0, Math.round((now - ms) / 1000));
+  if (s < 90) return `${s} 秒前`;
+  if (s < 5400) return `${Math.round(s / 60)} 分前`;
+  return `${Math.round(s / 3600)} 小時前`;
+}
+function msText(us) { return us == null ? "—" : (us / 1000).toFixed(us < 10000 ? 1 : 0); }
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function renderBars(el, labels, probs, threshold) {
+  el.innerHTML = labels.map((label, i) => {
+    const p = probs ? probs[i] : 0;
+    return `<div class="bar"><span>${nameOf(label)}</span>
+      <div class="track"><div class="fill" style="width:${(p * 100).toFixed(1)}%;background:${colorOf(label)}"></div>
+      <div class="gate" style="left:${threshold * 100}%"></div></div>
+      <span class="pct">${probs ? (p * 100).toFixed(1) + "%" : "—"}</span></div>`;
+  }).join("");
+}
+function stat(k, v, cls) {
+  return `<div class="stat ${cls || ""}"><div class="k">${k}</div><div class="v">${v}</div></div>`;
+}
+function renderProgress(el, name, pending, target) {
+  const pct = Math.min(100, (pending / target) * 100);
+  el.innerHTML = `<div class="row"><span>${name}：SD 累積的低信賴樣本</span><span class="mono">${pending} / ${target}</span></div>
+    <div class="track"><div class="fill" style="width:${pct.toFixed(1)}%"></div></div>`;
+}
+
+function renderDevices(ov) {
+  const select = $("device");
+  const ids = ov.devices.map((d) => d.device_id);
+  const current = [...select.options].map((o) => o.value);
+  if (ids.join() !== current.join()) {
+    select.innerHTML = ids.map((id) => `<option value="${escapeHtml(id)}">${escapeHtml(id)}</option>`).join("");
+  }
+  if (ov.device_id) { select.value = ov.device_id; state.device = ov.device_id; }
+  const device = ov.devices.find((d) => d.device_id === ov.device_id);
+  const link = $("link");
+  if (!device) {
+    link.textContent = "等待節點資料";
+    link.className = "pill idle";
+  } else if (ov.now_ms - device.updated_ms > STALE_MS) {
+    link.textContent = `${agoText(device.updated_ms, ov.now_ms)}收到`;
+    link.className = "pill bad";
+  } else {
+    link.textContent = "即時";
+    link.className = "pill ok";
+  }
+  const hb = ov.heartbeat;
+  $("node-state").textContent = hb
+    ? `狀態 ${hb.state} · RSSI ${hb.wifi ? hb.wifi.rssi : "?"} dBm · 內部 RAM ${hb.memory ? hb.memory.heap_free_kb : "?"} KB（最低 ${hb.memory && hb.memory.heap_min_kb != null ? hb.memory.heap_min_kb : "?"}）· SD 剩 ${hb.storage ? hb.storage.free_mb : "?"} MB`
+    : "";
+}
+
+function renderMic(ov, threshold, target) {
+  const list = ov.audio || [];
+  const last = list[0];
+  renderBars($("mic-bars"), AUDIO_LABELS, last && last.probs, threshold);
+  if (last) {
+    $("mic-label").textContent = nameOf(last.label);
+    $("mic-label").style.color = colorOf(last.label);
+    $("mic-conf").innerHTML = `${(last.conf * 100).toFixed(1)}%` + (last.low ? ' <span class="pill low">低信賴</span>' : "");
+    $("mic-when").textContent = `視窗 #${last.window} · ${timeText(last.start_ms)}–${timeText(last.end_ms)} · ${agoText(last.end_ms, ov.now_ms)}`;
+  } else {
+    $("mic-label").textContent = "—";
+    $("mic-conf").textContent = "";
+    $("mic-when").textContent = "尚無資料";
+  }
+  $("mic-strip").innerHTML = list.slice().reverse().map((r) =>
+    `<i class="${r.low ? "low" : ""}" title="${timeText(r.start_ms)} ${nameOf(r.label)} ${(r.conf * 100).toFixed(1)}%" style="height:${Math.max(6, r.conf * 100)}%;background:${colorOf(r.label)}"></i>`
+  ).join("");
+  $("mic-legend").innerHTML = AUDIO_LABELS.map((l) => `<span style="--c:${colorOf(l)}">${nameOf(l)}</span>`).join("");
+
+  const counts = (ov.counts || []).filter((c) => c.kind === "audio");
+  const total = counts.reduce((s, c) => s + c.total, 0);
+  const low = counts.reduce((s, c) => s + (c.low || 0), 0);
+  const hbAudio = ov.heartbeat && ov.heartbeat.inference ? ov.heartbeat.inference.audio : null;
+  const overflow = hbAudio ? hbAudio.overflows : (last ? last.overflows : 0);
+  const dropped = last ? last.dropped : 0;
+  $("mic-stats").innerHTML =
+    stat("logmel", last ? `${msText(last.feature_us)} ms` : "—") +
+    stat("CNN", last ? `${msText(last.invoke_us)} ms` : "—") +
+    stat("等待推論", last ? `${msText(last.queue_us)} ms` : "—") +
+    stat("24 h 視窗", total) +
+    stat("24 h 低信賴", total ? `${low} (${Math.round((low / total) * 100)}%)` : "0") +
+    stat("丟棄", dropped, dropped ? "warn" : "") +
+    stat("I2S overflow", overflow == null ? "—" : overflow, overflow ? "warn" : "") +
+    stat("已回傳樣本", (ov.samples_received || {}).audio || 0);
+  const device = ov.devices.find((d) => d.device_id === ov.device_id);
+  renderProgress($("mic-progress"), "音訊", device ? device.pending_audio : 0, target);
+}
+
+function renderCam(ov, threshold, target) {
+  const list = ov.rois || [];
+  const last = list[0];
+  renderBars($("cam-bars"), VIDEO_LABELS, last && last.probs, threshold);
+  if (last) {
+    $("cam-label").textContent = nameOf(last.label);
+    $("cam-label").style.color = colorOf(last.label);
+    $("cam-conf").innerHTML = `${(last.conf * 100).toFixed(1)}%` + (last.low ? ' <span class="pill low">低信賴</span>' : "");
+    $("cam-when").textContent = `幀 #${last.frame} · track ${last.track} · ${timeText(last.ts_ms)} · ${agoText(last.ts_ms, ov.now_ms)}`;
+  } else {
+    $("cam-label").textContent = "—";
+    $("cam-conf").textContent = "";
+    $("cam-when").textContent = "還沒有 ROI 送進 CNN";
+  }
+  const session = (ov.sessions || [])[0];
+  const counts = (ov.counts || []).filter((c) => c.kind === "roi");
+  const total = counts.reduce((s, c) => s + c.total, 0);
+  const low = counts.reduce((s, c) => s + (c.low || 0), 0);
+  const frames = ov.frames || [];
+  const avg = (key) => frames.length ? frames.reduce((s, f) => s + (f[key] || 0), 0) / frames.length : null;
+  /* FD 和 CNN 分開跑之後，只有偵測要在一個幀週期內做完；舊記錄沒有 detect_us */
+  const maxDetect = frames.reduce((m, f) => Math.max(m, f.detect_us == null ? (f.total_us || 0) : f.detect_us), 0);
+  $("cam-stats").innerHTML =
+    stat("相機啟動", session ? dateTimeText(session.session * 1000) : "—") +
+    stat("已處理幀", session ? session.processed : "—") +
+    stat("丟幀", session ? session.dropped : "—", session && session.dropped ? "warn" : "") +
+    stat("斷層", session ? session.gaps : "—", session && session.gaps ? "warn" : "") +
+    stat("候選過期", session && session.rois_expired != null ? session.rois_expired : "—", session && session.rois_expired ? "warn" : "") +
+    stat("FD 平均", avg("fd_us") == null ? "—" : `${msText(avg("fd_us"))} ms`) +
+    stat("偵測最長", frames.length ? `${msText(maxDetect)} ms` : "—", maxDetect > 200000 ? "warn" : "") +
+    stat("CNN", last ? `${msText(last.invoke_us)} ms` : "—") +
+    stat("24 h ROI", total) +
+    stat("24 h 低信賴", total ? `${low} (${Math.round((low / total) * 100)}%)` : "0") +
+    stat("已回傳樣本", (ov.samples_received || {}).video || 0);
+  const device = ov.devices.find((d) => d.device_id === ov.device_id);
+  renderProgress($("cam-progress"), "影像", device ? device.pending_video : 0, target);
+  drawFrameChart(frames.slice().reverse());
+  renderStageTable(frames, session);
+  renderOpsTable((ov.cnn_ops || [])[0]);
+}
+
+/* roi_us 比 crop + CNN 多出來的部分是回報 (含序列埠 log) */
+function roiOther(f) {
+  return f.cnn_us == null ? null : Math.max(0, (f.roi_us || 0) - (f.crop_us || 0) - f.cnn_us);
+}
+const STAGES = [
+  { name: "拍攝 → 取得 fb", get: (f) => f.capture_us, before: true },
+  { name: "排隊等待偵測", get: (f) => f.queue_us, before: true },
+  { name: "下採樣", get: (f) => f.downscale_us },
+  { name: "幀差 FD", get: (f) => f.fd_us },
+  { name: "幀差 + 二值化", get: (f) => f.fd_diff_us, sub: true },
+  { name: "形態學", get: (f) => f.fd_morph_us, sub: true },
+  { name: "輪廓 (flood fill)", get: (f) => f.fd_contour_us, sub: true },
+  { name: "ROI refine", get: (f) => f.fd_refine_us, sub: true },
+  { name: "NMS", get: (f) => f.fd_nms_us, sub: true },
+  { name: "追蹤", get: (f) => f.track_us },
+  { name: "排隊等待 CNN", get: (f) => f.cnn_wait_us, before: true },
+  { name: "ROI 裁切", get: (f) => f.crop_us },
+  { name: "CNN", get: (f) => f.cnn_us },
+  { name: "回報與其他", get: roiOther },
+  { name: "處理合計", get: (f) => f.total_us, sum: true },
+];
+
+function shareCell(ratio) {
+  if (ratio == null) return "<td></td>";
+  const pct = Math.min(100, ratio * 100);
+  return `<td><span class="share"><i style="width:${pct.toFixed(1)}%"></i></span><span class="mono">${pct.toFixed(1)}%</span></td>`;
+}
+
+function renderStageTable(frames, session) {
+  const summarize = (get) => {
+    const values = frames.map(get).filter((v) => v != null);
+    if (!values.length) return null;
+    return { avg: values.reduce((s, v) => s + v, 0) / values.length, max: Math.max(...values) };
+  };
+  const total = summarize((f) => f.total_us);
+  $("stage-title").textContent = `每階段耗時（最近 ${frames.length} 幀的每幀平均，沒有 ROI 的幀 CNN 算 0）`;
+  const rows = STAGES.map((stage) => {
+    const s = summarize(stage.get);
+    const share = !stage.before && s && total && total.avg ? s.avg / total.avg : null;
+    return `<tr class="${stage.sub ? "sub" : ""} ${stage.sum ? "sum" : ""}"><td>${stage.name}</td>
+      <td class="num">${s ? msText(s.avg) : "—"}</td><td class="num">${s ? msText(s.max) : "—"}</td>${shareCell(share)}</tr>`;
+  });
+  /* 寫 SD 在另一個 task，不算在每幀的處理時間內 */
+  if (session && session.save_avg_us != null) {
+    rows.push(`<tr><td>等待寫 SD（啟動以來）</td><td class="num">${msText(session.save_wait_avg_us)}</td><td class="num">${msText(session.save_wait_max_us)}</td><td></td></tr>`);
+    rows.push(`<tr><td>寫 SD 一個樣本（啟動以來）</td><td class="num">${msText(session.save_avg_us)}</td><td class="num">${msText(session.save_max_us)}</td><td></td></tr>`);
+  }
+  $("stage-table").innerHTML = rows.join("");
+}
+
+function renderTaskUsage(record) {
+  if (!record || !Array.isArray(record.tasks) || !record.avg_wall_us) {
+    $("usage-summary").textContent = "尚無資料";
+    $("usage-table").innerHTML = "";
+    return;
+  }
+  const sum = record.tasks.reduce((s, t) => s + t[2], 0);
+  $("usage-summary").textContent =
+    `${record.inferences} 次平均，每次 ${msText(record.avg_wall_us)} ms，加總 ${((sum / record.avg_wall_us) * 100).toFixed(1)}%`;
+  $("usage-table").innerHTML = record.tasks.filter((t) => t[2] > 0).map((t) =>
+    `<tr><td class="mono">${escapeHtml(t[0])}</td><td>${t[1] < 0 ? "不綁" : t[1]}</td><td class="num">${msText(t[2])}</td>${shareCell(t[2] / record.avg_wall_us)}</tr>`
+  ).join("");
+}
+
+function renderOpsTable(record) {
+  if (!record || !Array.isArray(record.ops)) {
+    $("ops-title").textContent = "CNN 每一層耗時（尚無資料，每分鐘回報一次）";
+    $("ops-table").innerHTML = "";
+    return;
+  }
+  const sum = record.ops.reduce((s, op) => s + op[1], 0) || 1;
+  $("ops-title").textContent = `CNN 每一層耗時（第 ${record.frame} 幀回報，${record.invokes} 次推論平均，合計 ${msText(sum)} ms）`;
+  $("ops-table").innerHTML = record.ops.map((op, i) =>
+    `<tr><td class="num">${i}</td><td class="mono">${escapeHtml(op[0])}</td><td class="num">${msText(op[1])}</td>${shareCell(op[1] / sum)}</tr>`
+  ).join("");
+}
+
+function drawFrameChart(frames) {
+  const canvas = $("frame-chart");
+  const ratio = window.devicePixelRatio || 1;
+  const width = canvas.clientWidth, height = canvas.clientHeight;
+  if (!width || !height) return;
+  canvas.width = Math.round(width * ratio);
+  canvas.height = Math.round(height * ratio);
+  const g = canvas.getContext("2d");
+  g.setTransform(ratio, 0, 0, ratio, 0, 0);
+  g.clearRect(0, 0, width, height);
+  const left = 34, bottom = 16, top = 6;
+  const plotH = height - bottom - top, plotW = width - left - 4;
+  const maxMs = Math.max(250, frames.reduce((m, f) => Math.max(m, (f.total_us || 0) / 1000), 0) * 1.05);
+  const y = (ms) => top + plotH - (ms / maxMs) * plotH;
+  const muted = css("--muted"), line = css("--line");
+  g.font = "11px " + css("--mono");
+  g.fillStyle = muted; g.textAlign = "right"; g.textBaseline = "middle";
+  const step = maxMs > 600 ? 200 : maxMs > 300 ? 100 : 50;
+  for (let v = 0; v <= maxMs; v += step) {
+    g.strokeStyle = line; g.lineWidth = 1; g.setLineDash([]);
+    g.beginPath(); g.moveTo(left, y(v)); g.lineTo(width - 4, y(v)); g.stroke();
+    g.fillText(String(v), left - 5, y(v));
+  }
+  if (!frames.length) {
+    g.textAlign = "center"; g.fillText("尚無幀資料", left + plotW / 2, top + plotH / 2);
+    return;
+  }
+  /* 舊版韌體的記錄沒有 cnn_us，ROI 時間整段算在 CNN */
+  const parts = [
+    [(f) => f.downscale_us, "--t-down"], [(f) => f.fd_us, "--t-fd"], [(f) => f.track_us, "--t-track"],
+    [(f) => f.crop_us, "--t-crop"], [(f) => (f.cnn_us == null ? f.roi_us : f.cnn_us), "--t-roi"], [roiOther, "--t-other"],
+  ];
+  const colors = parts.map(([, name]) => css(name));
+  const barW = Math.max(1, plotW / frames.length - 1);
+  frames.forEach((f, i) => {
+    const x = left + (i * plotW) / frames.length;
+    let acc = 0;
+    parts.forEach(([get], k) => {
+      const ms = (get(f) || 0) / 1000;
+      if (ms <= 0) return;
+      g.fillStyle = colors[k];
+      g.fillRect(x, y(acc + ms), barW, Math.max(0.5, y(acc) - y(acc + ms)));
+      acc += ms;
+    });
+  });
+  g.strokeStyle = css("--low"); g.setLineDash([4, 3]); g.lineWidth = 1;
+  g.beginPath(); g.moveTo(left, y(200)); g.lineTo(width - 4, y(200)); g.stroke();
+  g.setLineDash([]);
+  g.fillStyle = muted; g.textAlign = "left"; g.textBaseline = "alphabetic";
+  g.fillText(`幀 #${frames[0].frame}`, left, height - 3);
+  g.textAlign = "right"; g.fillText(`#${frames[frames.length - 1].frame}`, width - 4, height - 3);
+}
+
+function renderLog(ov) {
+  const merged = [];
+  (ov.audio || []).forEach((r) => merged.push({
+    ts: r.end_ms, src: "音訊", kind: "audio", label: r.label, conf: r.conf, low: r.low,
+    cost: (r.feature_us + r.invoke_us),
+    detail: `視窗 #${r.window}`,
+  }));
+  (ov.rois || []).forEach((r) => merged.push({
+    ts: r.ts_ms, src: "影像", kind: "roi", label: r.label, conf: r.conf, low: r.low,
+    cost: r.invoke_us,
+    detail: `幀 #${r.frame} track ${r.track} [${(r.bbox || []).join(", ")}]`,
+  }));
+  merged.sort((a, b) => b.ts - a.ts);
+  const shown = merged.filter((r) =>
+    state.kind === "all" || (state.kind === "low" ? r.low : r.kind === state.kind)).slice(0, 40);
+  $("log").innerHTML = shown.length ? shown.map((r) => `<tr class="${r.low ? "low" : ""}">
+      <td class="mono">${timeText(r.ts)}</td><td>${r.src}</td>
+      <td class="tag" style="color:${colorOf(r.label)}">${nameOf(r.label)}</td>
+      <td class="num">${(r.conf * 100).toFixed(1)}%</td><td class="num">${msText(r.cost)}</td>
+      <td class="muted">${escapeHtml(r.detail)}</td></tr>`).join("")
+    : '<tr><td colspan="6" class="empty">沒有符合的紀錄</td></tr>';
+}
+
+function roiOverlay(meta) {
+  const boxes = (meta.rois || []).map((roi) => {
+    const [x1, y1, x2, y2] = roi.bbox;
+    const color = roi.low ? "var(--low)" : colorOf(roi.label);
+    return `<rect x="${x1}" y="${y1}" width="${x2 - x1 + 1}" height="${y2 - y1 + 1}" fill="none" stroke="${color}" stroke-width="3"/>
+      <text x="${x1 + 4}" y="${Math.max(y1 - 6, 18)}" fill="${color}" font-size="20" font-family="sans-serif">${nameOf(roi.label)} ${(roi.conf * 100).toFixed(0)}%</text>`;
+  }).join("");
+  return `<svg viewBox="0 0 ${meta.width} ${meta.height}" aria-hidden="true">${boxes}</svg>`;
+}
+
+function timingLine(meta) {
+  const parts = [];
+  if (meta.feature_us != null) parts.push(`logmel ${msText(meta.feature_us)} ms`);
+  if (meta.invoke_us != null) parts.push(`CNN ${msText(meta.invoke_us)} ms`);
+  if (meta.fd_us != null) parts.push(`FD ${msText(meta.fd_us)} ms`);
+  if (meta.track_us != null) parts.push(`追蹤 ${msText(meta.track_us)} ms`);
+  if (meta.encode_us) parts.push(`JPEG ${msText(meta.encode_us)} ms`);
+  if (meta.write_us != null) parts.push(`寫 SD ${msText(meta.write_us)} ms`);
+  if (meta.format) parts.push(meta.format);
+  return parts.join(" · ");
+}
+
+function sampleCard(sample) {
+  const meta = sample.meta;
+  const id = encodeURIComponent(sample.sample_id);
+  const head = `<div class="head"><span class="tag" style="color:${colorOf(sample.label)}">${nameOf(sample.label)} ${sample.conf != null ? (sample.conf * 100).toFixed(1) + "%" : ""}</span>
+    <span class="muted mono">${dateTimeText(sample.ts_ms)}</span></div>`;
+  const foot = `<div class="muted" style="font-size:12px">${timingLine(meta)}</div>
+    <details><summary>原始記錄</summary><pre>${escapeHtml(JSON.stringify(meta, null, 1))}</pre></details>
+    <a href="/api/infer/sample/${id}/data" download style="font-size:12px;color:var(--accent)">下載原始資料（${(sample.data_bytes / 1024).toFixed(0)} KB）</a>`;
+  if (sample.media === "video") {
+    const rois = (meta.rois || []).map((roi, i) =>
+      `<div class="roi"><img loading="lazy" src="/api/infer/sample/${id}/roi/${i}.png" alt="ROI ${i}">
+       <span><span class="tag" style="color:${colorOf(roi.label)}">${nameOf(roi.label)}</span><br><span class="mono">${(roi.conf * 100).toFixed(1)}%</span></span></div>`
+    ).join("");
+    return `<article class="card">${head}
+      <div class="frame-wrap"><img loading="lazy" src="/api/infer/sample/${id}/frame" alt="幀 ${meta.frame}" width="${meta.width}" height="${meta.height}">${roiOverlay(meta)}</div>
+      <div class="rois">${rois}</div>${foot}</article>`;
+  }
+  return `<article class="card">${head}
+    <canvas class="wave" data-wav="/api/infer/sample/${id}/data"></canvas>
+    <audio controls preload="none" src="/api/infer/sample/${id}/data"></audio>
+    <div class="bars">${(meta.labels || AUDIO_LABELS).map((label, i) => `<div class="bar"><span>${nameOf(label)}</span><div class="track"><div class="fill" style="width:${((meta.probs || [])[i] || 0) * 100}%;background:${colorOf(label)}"></div></div><span class="pct">${(((meta.probs || [])[i] || 0) * 100).toFixed(1)}%</span></div>`).join("")}</div>
+    ${foot}</article>`;
+}
+
+async function drawWave(canvas) {
+  const url = canvas.dataset.wav;
+  delete canvas.dataset.wav;
+  try {
+    const buffer = await (await fetch(url)).arrayBuffer();
+    const pcm = new Int16Array(buffer, 44, Math.floor((buffer.byteLength - 44) / 2));
+    const ratio = window.devicePixelRatio || 1;
+    const w = canvas.clientWidth, h = canvas.clientHeight;
+    canvas.width = Math.round(w * ratio); canvas.height = Math.round(h * ratio);
+    const g = canvas.getContext("2d");
+    g.setTransform(ratio, 0, 0, ratio, 0, 0);
+    g.fillStyle = css("--accent");
+    const per = Math.max(1, Math.floor(pcm.length / w));
+    for (let x = 0; x < w; x++) {
+      let min = 0, max = 0;
+      for (let i = x * per; i < Math.min(pcm.length, (x + 1) * per); i++) {
+        if (pcm[i] < min) min = pcm[i];
+        if (pcm[i] > max) max = pcm[i];
+      }
+      const top = h / 2 - (max / 32768) * (h / 2);
+      const bottom = h / 2 - (min / 32768) * (h / 2);
+      g.fillRect(x, top, 1, Math.max(1, bottom - top));
+    }
+  } catch (err) { /* 波形只是輔助，播放器仍可用 */ }
+}
+
+async function loadSamples() {
+  if (!state.device) return;
+  const query = new URLSearchParams({ device: state.device, media: state.media, limit: PAGE, offset: state.offset });
+  const res = await fetch(`/api/infer/samples?${query}`);
+  if (!res.ok) return;
+  const data = await res.json();
+  const key = state.media + state.offset + ":" + data.total + ":" + (data.samples[0] ? data.samples[0].sample_id : "");
+  $("pager-info").textContent = data.total ? `${state.offset + 1}–${Math.min(state.offset + PAGE, data.total)} / ${data.total}` : "";
+  $("pager-new").disabled = state.offset === 0;
+  $("pager-old").disabled = state.offset + PAGE >= data.total;
+  if (key === state.sampleKey) return;     /* 沒有新樣本就不重畫，避免打斷正在播放的音訊 */
+  state.sampleKey = key;
+  $("gallery").innerHTML = data.samples.length ? data.samples.map(sampleCard).join("")
+    : '<div class="empty">還沒有樣本。節點累積滿 20 個低信賴樣本才會回傳。</div>';
+  document.querySelectorAll("canvas.wave[data-wav]").forEach(drawWave);
+}
+
+async function refresh() {
+  try {
+    const query = state.device ? `?device=${encodeURIComponent(state.device)}` : "";
+    const res = await fetch(`/api/infer/overview${query}`);
+    if (!res.ok) throw new Error(String(res.status));
+    const ov = await res.json();
+    state.overview = ov;
+    renderDevices(ov);
+    const inference = ov.heartbeat && ov.heartbeat.inference ? ov.heartbeat.inference : {};
+    const threshold = inference.threshold != null ? inference.threshold : 0.5;
+    const target = inference.upload_after != null ? inference.upload_after : 20;
+    renderMic(ov, threshold, target);
+    renderCam(ov, threshold, target);
+    renderTaskUsage((ov.task_usage || [])[0]);
+    renderLog(ov);
+    $("clock").textContent = timeText(ov.now_ms);
+  } catch (err) {
+    const link = $("link");
+    link.textContent = "連不到 server";
+    link.className = "pill bad";
+  }
+}
+
+$("device").addEventListener("change", (e) => {
+  state.device = e.target.value;
+  history.replaceState(null, "", `?device=${encodeURIComponent(state.device)}`);
+  state.offset = 0;
+  state.sampleKey = "";
+  refresh();
+  loadSamples();
+});
+$("sample-tabs").addEventListener("click", (e) => {
+  const button = e.target.closest("button");
+  if (!button) return;
+  state.media = button.dataset.media;
+  state.offset = 0;
+  state.sampleKey = "";
+  [...$("sample-tabs").children].forEach((b) => b.setAttribute("aria-pressed", String(b === button)));
+  loadSamples();
+});
+$("log-tabs").addEventListener("click", (e) => {
+  const button = e.target.closest("button");
+  if (!button) return;
+  state.kind = button.dataset.kind;
+  [...$("log-tabs").children].forEach((b) => b.setAttribute("aria-pressed", String(b === button)));
+  if (state.overview) renderLog(state.overview);
+});
+$("pager-old").addEventListener("click", () => { state.offset += PAGE; loadSamples(); });
+$("pager-new").addEventListener("click", () => { state.offset = Math.max(0, state.offset - PAGE); loadSamples(); });
+window.addEventListener("resize", () => { if (state.overview) drawFrameChart((state.overview.frames || []).slice().reverse()); });
+
+refresh().then(loadSamples);
+setInterval(refresh, 1000);
+setInterval(loadSamples, 5000);
+</script>
+</body>
+</html>

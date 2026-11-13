@@ -3,9 +3,9 @@
 #include "sdkconfig.h"
 
 /* Edit these when moving to another site; this is the only place they live. */
-#define APP_WIFI_SSID              "TP-LINK_AFA6"
-#define APP_WIFI_PASSWORD          "93348942"
-#define APP_SERVER_BASE_URL        "http://140.123.91.132:5000"
+#define APP_WIFI_SSID              "Hien"
+#define APP_WIFI_PASSWORD          "hien1012"
+#define APP_SERVER_BASE_URL        "http://172.20.10.2:5000"
 
 
 #define APP_SERVER_TIME_URL        APP_SERVER_BASE_URL "/time"
@@ -38,7 +38,7 @@ _Static_assert(3600U % APP_RECORD_PERIOD_SEC == 0U, "record slots must align to 
 /* Debug: network throughput test at boot (net_bench.c). Run `iperf -s -i 1`
  * (iperf2) on the PC first. Set to 0 when done; it costs a few seconds per boot. */
 #define APP_NET_BENCH_ENABLE       0
-#define APP_NET_BENCH_HOST         "10.10.10.7"
+#define APP_NET_BENCH_HOST         "172.20.10.2"
 #define APP_NET_BENCH_PORT         5001
 #define APP_NET_BENCH_BYTES        (8U * 1024U * 1024U)
 
@@ -46,7 +46,7 @@ _Static_assert(3600U % APP_RECORD_PERIOD_SEC == 0U, "record slots must align to 
  * exposure of that moment (no flicker, but no follow-up as the light changes).
  * 0: leave them running, so each session adapts to the current light; frame
  * timing does not change (auto frame rate / dummy lines stay off). */
-#define APP_CAM_LOCK_AUTO_CONTROLS 0
+#define APP_CAM_LOCK_AUTO_CONTROLS 1
 
 /* Debug: per-round timing trace (timing_trace.c). Timestamps every stage of
  * prepare → record → upload in memory and prints one ====start==== ...
@@ -65,8 +65,8 @@ _Static_assert(3600U % APP_RECORD_PERIOD_SEC == 0U, "record slots must align to 
 /* Debug: stream frames straight to the PC instead of recording (cam_stream.c).
  * Run `python tools/cam_stream_view.py` on the PC first. While 1, the node
  * never records or uploads; set back to 0 when done. */
-#define APP_CAM_STREAM_ENABLE      0
-#define APP_CAM_STREAM_HOST        "140.123.91.132"
+#define APP_CAM_STREAM_ENABLE      1
+#define APP_CAM_STREAM_HOST        "172.20.10.2"
 #define APP_CAM_STREAM_PORT        5002
 /* 1: also write the SD card in the background like a recording, switching
  * it on/off every 20 frames, to A/B its effect on the image (cam_stream.c). */
