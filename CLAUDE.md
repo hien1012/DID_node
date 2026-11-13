@@ -37,6 +37,14 @@ idf.py -B build\s3 build
 - `components/esp32-camera/`：**本地修改版，已納入 git**（2026-10-13 起；之前被 ignore，換電腦會缺檔）。
   `cam_record.c` include 私有 `cam_hal.h` 用 pause/resume。`patches/esp32-camera-pause.patch` 只是對原版的差異參考，可能落後於目前驅動。
 
+## 推論韌體（`infer_node/`，ESP32 / TTGO T8）
+- 由 `DID_NODE/infer_node`（S3）移植的獨立 ESP-IDF 專案，進資料夾 `idf.py -B build build`；說明與差異表見 `infer_node/README.md`。
+- 直接編譯 `main/` 的 `app_config.h`、`camera_pinout.h`、`camera_registers.c`、`device_identity.c`、`time_sync.c`（改這些兩邊都受影響）；
+  `wifi_manager.*` 用 S3 版的副本（watchdog API），`node_storage.*` 是精簡版，其餘推論模組照搬 S3。
+- 一塊板只跑一個角色：`infer_node/main/infer_config.h` 的 `INFER_NODE_ROLE`；mic 介面 `board_pins.h` 的 `MIC_INTERFACE_I2S`（PDM 走 26/25）。
+- PCM 預設 TTGO_I2S_Record_Test 格式（32-bit >> 16 ×30，訓練資料）；`MIC_PDM_16BIT_HPF=1` 改用 8ddab23 的 PDM 16-bit + 高通。
+- Server 用 `DID_NODE/server_mix.py`（有 `/infer/*`）；Device ID 前綴 `e32cam` / `e32mic`。
+
 ## FreeRTOS tasks
 | 名稱 | 優先權 | stack | core | 用途 |
 |---|---|---|---|---|

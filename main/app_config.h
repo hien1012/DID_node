@@ -2,13 +2,17 @@
 
 #include "sdkconfig.h"
 
-#define APP_WIFI_SSID              "TP-LINK_AFA6"
+/* #define APP_WIFI_SSID              "TP-LINK_AFA6"
 #define APP_WIFI_PASSWORD          "93348942"
-#define APP_SERVER_BASE_URL        "http://140.123.91.132:5000"
+#define APP_SERVER_BASE_URL        "http://140.123.91.132:5000" */
 /* 
 #define APP_WIFI_SSID              "NEAT_2.4G"
 #define APP_WIFI_PASSWORD          "221b23251"
 #define APP_SERVER_BASE_URL        "http://140.123.91.132:5000" */
+
+#define APP_WIFI_SSID           "Strawberry"
+#define APP_WIFI_PASSWORD          "10122001"
+#define APP_SERVER_BASE_URL        "http://10.10.10.10:5000"
 
 #define APP_SERVER_TIME_URL        APP_SERVER_BASE_URL "/time"
 #define APP_SERVER_AUDIO_URL       APP_SERVER_BASE_URL "/upload/audio"
@@ -50,3 +54,14 @@ _Static_assert(3600U % APP_RECORD_SLOT_SEC == 0U, "record slots must align to th
 #endif
 #define APP_CAM_STREAM_HOST        "140.123.91.132"
 #define APP_CAM_STREAM_PORT        5002
+
+/*
+ * 以下只有推論韌體 (infer_node/) 使用：它的 wifi_manager.c / infer_health.c 是 S3 版，
+ * 有重連 backoff 與 Wi-Fi watchdog (規則見 docs/heartbeat.md)。錄影韌體不會用到。
+ */
+#define APP_WIFI_RECONNECT_MIN_MS            1000U
+#define APP_WIFI_RECONNECT_MAX_MS            30000U
+/* 連續這麼多次 heartbeat 傳輸失敗 (沒有 HTTP 回應) 就強制重建 Wi-Fi 連線 */
+#define APP_HEARTBEAT_FAILS_BEFORE_RECONNECT 3U
+/* 離線超過這麼久就重啟 Wi-Fi driver (之後每隔同樣時間再試) */
+#define APP_WIFI_RESTART_AFTER_OFFLINE_S     (10U * 60U)
