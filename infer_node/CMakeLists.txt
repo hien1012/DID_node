@@ -15,9 +15,10 @@ set(EXTRA_COMPONENT_DIRS "${CMAKE_CURRENT_LIST_DIR}/../components")
 #     cam: FD_did_cam_v4 once got constant (uniform) softmax output with ESP-NN on the ESP32.
 #          If the cam CNN probabilities look stuck, fall back to -DESP_NN_KERNEL_SET=none,
 #          or bisect with dw / conv / fc / arith / pool / softmax.
+#   Several groups are comma-separated, e.g. all except fc: dw,conv,arith,pool,softmax
 #   Override (sticks in the CMake cache until changed back with -DESP_NN_KERNEL_SET=auto):
 #     idf.py -B build -DESP_NN_KERNEL_SET=none build
-set(ESP_NN_KERNEL_SET "auto" CACHE STRING "ESP-NN kernels: auto/none/all/dw/conv/fc/arith/pool/softmax")
+set(ESP_NN_KERNEL_SET "auto" CACHE STRING "ESP-NN kernels: auto/none/all or comma-separated dw/conv/fc/arith/pool/softmax")
 if(ESP_NN_KERNEL_SET STREQUAL "auto")
     set(ESP_NN_KERNEL_SET "all")
 endif()

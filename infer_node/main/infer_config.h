@@ -14,7 +14,7 @@
 #define INFER_ROLE_CAM                1
 #define INFER_ROLE_MIC                2
 #ifndef INFER_NODE_ROLE
-#define INFER_NODE_ROLE               INFER_ROLE_MIC
+#define INFER_NODE_ROLE               INFER_ROLE_CAM
 #endif
 
 #if INFER_NODE_ROLE != INFER_ROLE_CAM && INFER_NODE_ROLE != INFER_ROLE_MIC
@@ -38,6 +38,20 @@ _Static_assert(sizeof(INFER_DEVICE_ID_PREFIX) - 1U <= 10U, "Device ID prefix is 
 
 /* 預測類別的機率低於此值 = 低信賴度，原始資料存 SD。 */
 #define INFER_LOW_CONF_THRESHOLD      0.5f
+
+/*
+ * 除了低信賴度，預測為「非背景」的也存 SD 並上傳 (audio：drone / helicopter；video：drone / bird)。
+ *   0：只存低信賴度 (原本的行為)。
+ *   1：低信賴度 或 非背景，任一成立就存。video 只要一幀內有一個 ROI 非背景就存整幀。
+ * 偵測多時樣本量會大增 (video 每幀約 300 KB)；待上傳數達 INFER_MAX_PENDING_SAMPLES 後不再存新的。
+ * 背景類別在開機時以名稱 INFER_BACKGROUND_LABEL 從模型的類別表找出 (不寫死索引：
+ * audio 的 background 是 0，video 是 2)；找不到時這個開關無效，只存低信賴度。
+ * 樣本 meta 的 save_reason 記錄為什麼存："low_conf" / "non_background" / "both"。
+ */
+#ifndef INFER_SAVE_NON_BACKGROUND
+#define INFER_SAVE_NON_BACKGROUND     1
+#endif
+#define INFER_BACKGROUND_LABEL        "background"
 
 /* 同一種 media 累積這麼多個低信賴樣本才上傳 (音訊、影像分開計算)。 */
 #define INFER_UPLOAD_AFTER_SAMPLES    20U

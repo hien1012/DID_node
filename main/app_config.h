@@ -5,14 +5,14 @@
 /* #define APP_WIFI_SSID              "TP-LINK_AFA6"
 #define APP_WIFI_PASSWORD          "93348942"
 #define APP_SERVER_BASE_URL        "http://140.123.91.132:5000" */
-/* 
+
 #define APP_WIFI_SSID              "NEAT_2.4G"
 #define APP_WIFI_PASSWORD          "221b23251"
-#define APP_SERVER_BASE_URL        "http://140.123.91.132:5000" */
+#define APP_SERVER_BASE_URL        "http://140.123.91.132:5000"
 
-#define APP_WIFI_SSID           "Strawberry"
+/* #define APP_WIFI_SSID           "Strawberry"
 #define APP_WIFI_PASSWORD          "10122001"
-#define APP_SERVER_BASE_URL        "http://10.10.10.10:5000"
+#define APP_SERVER_BASE_URL        "http://10.10.10.10:5000" */
 
 #define APP_SERVER_TIME_URL        APP_SERVER_BASE_URL "/time"
 #define APP_SERVER_AUDIO_URL       APP_SERVER_BASE_URL "/upload/audio"

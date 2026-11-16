@@ -5,10 +5,20 @@
 CONFIG_IDF_TARGET="esp32"
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
-CONFIG_ESPTOOLPY_FLASHFREQ_40M=y
+# 80 MHz flash + 80 MHz PSRAM, same as DID_CAM_SEAN/FD_did_cam_v4 on this board (and the
+# esp32-camera README). The cam CNN is memory-bound (arena in PSRAM, FC weights in flash):
+# FD_v4 ran the same model in about half the invoke time at 80/80, even with -Og and
+# reference kernels. On the ESP32, PSRAM 80 MHz requires flash 80 MHz.
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# This board's chip: ESP32-D0WD v3.1 (ECO4). Requiring >= v3.0 removes the rev0/1
+# PSRAM cache workaround (SPIRAM_CACHE_WORKAROUND: a memw after every memory access,
+# compiled into all code); with it on, the cam CNN took ~930 ms, dominated by
+# per-element cost. Chips older than v3.0 refuse to boot this firmware.
+CONFIG_ESP32_REV_MIN_3=y
 
 # -O2 (Performance). tflite-micro then adds its upstream -O3 (depthwise_conv.cc -O2),
 # esp-nn follows the project. For debugging use CONFIG_COMPILER_OPTIMIZATION_DEFAULT=y (-Og).
@@ -17,10 +27,11 @@ CONFIG_COMPILER_OPTIMIZATION_PERF=y
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 
 # PSRAM: camera fb (8 x 300 KB), TFLM arena, FD buffers, audio windows.
-# 40 MHz is the speed the recording firmware was verified at with the camera running.
+# 80 MHz (see the flash frequency above); the recording firmware uses 40 MHz.
+# 80 MHz makes PSRAM occupy the VSPI host; SD is SDMMC and the camera I2S0, so no conflict.
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_USE_MALLOC=y
-CONFIG_SPIRAM_SPEED_40M=y
+CONFIG_SPIRAM_SPEED_80M=y
 # Plain malloc() above 4 KB goes to PSRAM so internal RAM is not fragmented;
 # DMA buffers request MALLOC_CAP_DMA / MALLOC_CAP_INTERNAL explicitly.
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
@@ -59,7 +70,8 @@ CONFIG_LWIP_TCP_WND_DEFAULT=16384
 CONFIG_LWIP_TCP_RECVMBOX_SIZE=64
 CONFIG_LWIP_UDP_RECVMBOX_SIZE=64
 CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
-# The PSRAM cache workaround already places libc in IRAM; these two would overflow
-# iram0_0_seg on the ESP32 (see ../sdkconfig.camera.defaults).
+# Kept off from the PSRAM cache workaround era (it placed libc in IRAM and these two
+# overflowed iram0_0_seg, see ../sdkconfig.camera.defaults). With REV_MIN_3 the
+# workaround is gone; these could be re-evaluated, but stay off until measured.
 # CONFIG_LWIP_IRAM_OPTIMIZATION is not set
 # CONFIG_ESP_WIFI_RX_IRAM_OPT is not set
