@@ -52,6 +52,9 @@ tr.offline td { color: var(--muted); }
 .meter { display: inline-block; width: 54px; height: 7px; background: var(--track); border-radius: 3px; overflow: hidden; vertical-align: middle; margin-right: 6px; }
 .meter i { display: block; height: 100%; background: var(--low); }
 .empty { color: var(--muted); padding: 18px 4px; }
+/* 同一格的第二行 (次要的 heartbeat 欄位) */
+.sub { font-size: 11px; color: var(--muted); }
+.sub .warn { color: var(--low); }
 </style>
 </head>
 <body>
@@ -148,15 +151,68 @@ function pendingText(node) {
 
 function pipelineText(node) {
   const p = node.pipeline || {};
+  const c = node.counters || {};
   if (node.role === "video") {
     const dropped = p.dropped || 0;
     const expired = p.rois_expired || 0;
+    /* 第一行 = 最新 session 記錄；第二行 = heartbeat (inference.video) */
     return `<span class="mono ${dropped ? "warn" : ""}">丟幀 ${num(p.dropped)}</span> ·
       <span class="mono ${expired ? "warn" : ""}">過期 ${num(p.rois_expired)}</span> ·
-      <span class="mono ${p.gaps ? "warn" : ""}">斷層 ${num(p.gaps)}</span>`;
+      <span class="mono ${p.gaps ? "warn" : ""}">斷層 ${num(p.gaps)}</span>
+      <div class="sub mono" title="heartbeat：開機以來偵測的幀數 / CNN 的 ROI 數 / camera_capture 丟幀">
+        幀 ${num(c.frames)} · ROI ${num(c.rois)} · <span class="${c.dropped ? "warn" : ""}">丟 ${num(c.dropped)}</span></div>`;
   }
   return `<span class="mono ${p.dropped ? "warn" : ""}">丟視窗 ${num(p.dropped)}</span> ·
-    <span class="mono ${p.overflows ? "warn" : ""}">overflow ${num(p.overflows)}</span>`;
+    <span class="mono ${p.overflows ? "warn" : ""}">overflow ${num(p.overflows)}</span>
+    <div class="sub mono" title="heartbeat：開機以來推論的 2 s 視窗數">視窗 ${num(p.windows)}</div>`;
+}
+
+/* 開機以來：低信賴 (video = 含低信賴 ROI 的幀) 與實際寫進 SD 的樣本 (含非背景) */
+function savedText(node) {
+  const c = node.counters || {};
+  const lowName = node.role === "video" ? "低信賴幀" : "低信賴";
+  return `<span class="mono">已存 ${num(c.saved)}</span>
+    <div class="sub mono">${lowName} ${num(c.low_conf)}</div>`;
+}
+
+/* result_report：已送出 (heartbeat) / 佇列滿丟掉 (最新一批結果) */
+function reportText(node) {
+  const dropped = node.report_dropped || 0;
+  return `<span class="mono">${num(node.report_sent)}</span>
+    <div class="sub mono"><span class="${dropped ? "warn" : ""}">丟 ${num(node.report_dropped)}</span></div>`;
+}
+
+function lastUploadText(node, now) {
+  const u = node.last_upload;
+  if (!u) return '<span class="muted">尚未上傳</span>';
+  const bad = (u.failed || 0) + (u.rejected || 0);
+  return `<span class="muted" title="${timeText(u.at * 1000)}">${agoText(u.at * 1000, now)}</span>
+    <div class="sub mono">成功 ${num(u.uploaded)} ·
+      <span class="${u.failed ? "warn" : ""}">失敗 ${num(u.failed)}</span> ·
+      <span class="${u.rejected ? "warn" : ""}">拒收 ${num(u.rejected)}</span></div>`;
+}
+
+/* esp_wifi_types.h 的 wifi_err_reason_t (常見的幾個) */
+const WIFI_REASONS = {
+  2: "AUTH_EXPIRE", 3: "AUTH_LEAVE", 4: "ASSOC_EXPIRE", 8: "ASSOC_LEAVE",
+  15: "4WAY_HANDSHAKE_TIMEOUT", 200: "BEACON_TIMEOUT", 201: "NO_AP_FOUND",
+  202: "AUTH_FAIL", 203: "ASSOC_FAIL", 204: "HANDSHAKE_TIMEOUT", 205: "CONNECTION_FAIL",
+};
+
+function wifiText(node) {
+  const rssiWarn = node.rssi != null && node.rssi < -75 ? "warn" : "";
+  const streak = node.heartbeat_fail_streak || 0;
+  const reason = node.wifi_last_reason;
+  const reasonText = reason ? `${reason}${WIFI_REASONS[reason] ? " " + WIFI_REASONS[reason] : ""}` : "—";
+  return `<span class="mono ${rssiWarn}">${num(node.rssi)}</span>
+    <div class="sub mono" title="最後斷線原因：${escapeHtml(reasonText)}">
+      斷線 ${num(node.disconnects)} · 重啟 ${num(node.wifi_restarts)}${streak ? ` · <span class="warn">HB 失敗 ${streak}</span>` : ""}</div>`;
+}
+
+function memoryText(node) {
+  const heapWarn = node.heap_min_kb != null && node.heap_min_kb < 16 ? "warn" : "";
+  return `<span class="mono ${heapWarn}">${node.heap_min_kb != null ? node.heap_min_kb + " KB" : "—"}</span>
+    <div class="sub mono">PSRAM ${node.psram_free_kb != null ? node.psram_free_kb + " KB" : "—"}</div>`;
 }
 
 function renderTable(el, nodes, now, offlineMs) {
@@ -166,13 +222,12 @@ function renderTable(el, nodes, now, offlineMs) {
   }
   const head = `<tr><th>狀態</th><th>節點</th><th class="num">最近 1 小時</th><th class="num">低信賴</th>
     <th>類別分布</th><th>最新結果</th><th>待上傳樣本</th><th class="num">已收樣本</th><th>管線</th>
-    <th class="num">RSSI</th><th class="num">RAM 最低</th><th class="num">SD 剩餘</th><th class="num">開機</th></tr>`;
+    <th class="num">存檔</th><th class="num">結果回報</th><th>上次上傳</th>
+    <th class="num">Wi-Fi RSSI</th><th class="num">RAM 最低</th><th class="num">SD 剩餘</th><th class="num">開機</th></tr>`;
   const rows = nodes.map((node) => {
     const link = linkState(node, now, offlineMs);
     const w = node.window || { total: 0, low: 0, labels: {} };
     const lowPct = w.total ? (w.low * 100 / w.total).toFixed(0) + "%" : "—";
-    const heapWarn = node.heap_min_kb != null && node.heap_min_kb < 16 ? "warn" : "";
-    const rssiWarn = node.rssi != null && node.rssi < -75 ? "warn" : "";
     return `<tr class="${link.cls === "bad" ? "offline" : ""}">
       <td><span class="pill ${link.cls}" title="最後收到 ${timeText(link.seen)}">${link.text}</span>
         <span class="muted">${link.cls === "ok" ? "" : agoText(link.seen, now)}</span></td>
@@ -185,8 +240,11 @@ function renderTable(el, nodes, now, offlineMs) {
       <td>${pendingText(node)}</td>
       <td class="num" title="最後收到 ${timeText(node.samples_last_ms)}">${node.samples_received}</td>
       <td>${pipelineText(node)}</td>
-      <td class="num ${rssiWarn}">${num(node.rssi)}</td>
-      <td class="num ${heapWarn}">${node.heap_min_kb != null ? node.heap_min_kb + " KB" : "—"}</td>
+      <td class="num">${savedText(node)}</td>
+      <td class="num">${reportText(node)}</td>
+      <td>${lastUploadText(node, now)}</td>
+      <td class="num">${wifiText(node)}</td>
+      <td class="num">${memoryText(node)}</td>
       <td class="num">${node.sd_free_mb != null ? node.sd_free_mb + " MB" : "—"}</td>
       <td class="num" title="${escapeHtml(node.reset_reason || "")}">${uptimeText(node.uptime_s)}</td>
     </tr>`;
@@ -217,8 +275,8 @@ async function refresh() {
     renderSummary(data);
     renderTable($("video-table"), data.nodes.filter((n) => n.role === "video"), data.now_ms, offlineMs);
     renderTable($("audio-table"), data.nodes.filter((n) => n.role === "audio"), data.now_ms, offlineMs);
-    $("video-note").textContent = "數量 = ROI 的 CNN 次數；管線 = 開機以來累計";
-    $("audio-note").textContent = "數量 = 2 s 視窗數；管線 = 開機以來累計";
+    $("video-note").textContent = "數量 = ROI 的 CNN 次數；管線 / 存檔 / 回報 = 開機以來累計 (heartbeat 每分鐘更新)";
+    $("audio-note").textContent = "數量 = 2 s 視窗數；管線 / 存檔 / 回報 = 開機以來累計 (heartbeat 每分鐘更新)";
     $("link").textContent = "已更新";
     $("link").className = "pill ok";
     $("clock").textContent = timeText(data.now_ms);

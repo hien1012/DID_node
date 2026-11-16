@@ -1160,6 +1160,14 @@ def infer_nodes():
             wifi = heartbeat.get("wifi") or {}
             memory = heartbeat.get("memory") or {}
             storage = heartbeat.get("storage") or {}
+            # Boot-time counters of the enabled pipeline, as of the last heartbeat.
+            counter_keys = (
+                ("frames", "dropped", "rois", "low_conf", "saved")
+                if role == "video"
+                else ("windows", "dropped", "low_conf", "saved", "overflows")
+            )
+            role_counters = inference.get(role) or {}
+            last_upload = heartbeat.get("last_upload")
             sample_row = samples.get(device_id)
             nodes.append(
                 {
@@ -1172,12 +1180,18 @@ def infer_nodes():
                     "reset_reason": heartbeat.get("reset_reason"),
                     "rssi": wifi.get("rssi"),
                     "disconnects": wifi.get("disconnects"),
+                    "wifi_restarts": wifi.get("restarts"),
+                    "wifi_last_reason": wifi.get("last_reason"),
+                    "heartbeat_fail_streak": wifi.get("heartbeat_fail_streak"),
                     "heap_min_kb": memory.get("heap_min_kb"),
                     "psram_free_kb": memory.get("psram_free_kb"),
                     "sd_free_mb": storage.get("free_mb"),
                     "pending": device["pending_video"] if role == "video" else device["pending_audio"],
                     "upload_after": inference.get("upload_after"),
                     "report_dropped": device["dropped"],
+                    "report_sent": inference.get("report_sent"),
+                    "counters": {key: role_counters.get(key) for key in counter_keys},
+                    "last_upload": last_upload if isinstance(last_upload, dict) else None,
                     "window": counts,
                     "last": last,
                     "pipeline": pipeline,
