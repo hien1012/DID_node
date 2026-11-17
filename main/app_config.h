@@ -3,10 +3,13 @@
 #include "sdkconfig.h"
 
 /* Edit these when moving to another site; this is the only place they live. */
-#define APP_WIFI_SSID              "Hien"
+/* #define APP_WIFI_SSID              "Hien"
 #define APP_WIFI_PASSWORD          "hien1012"
-#define APP_SERVER_BASE_URL        "http://172.20.10.2:5000"
+#define APP_SERVER_BASE_URL        "http://172.20.10.2:5000" */
 
+#define APP_WIFI_SSID              "NEAT_2.4G"
+#define APP_WIFI_PASSWORD          "221b23251"
+#define APP_SERVER_BASE_URL        "http://140.123.91.132:5000"
 
 #define APP_SERVER_TIME_URL        APP_SERVER_BASE_URL "/time"
 #define APP_SERVER_AUDIO_URL       APP_SERVER_BASE_URL "/upload/audio"

@@ -12,7 +12,7 @@
  */
 #define INFER_ROLE_CAM                1
 #define INFER_ROLE_MIC                2
-#define INFER_NODE_ROLE               INFER_ROLE_MIC
+#define INFER_NODE_ROLE               INFER_ROLE_CAM
 
 #if INFER_NODE_ROLE != INFER_ROLE_CAM && INFER_NODE_ROLE != INFER_ROLE_MIC
 #error "INFER_NODE_ROLE must be INFER_ROLE_CAM or INFER_ROLE_MIC"
@@ -44,6 +44,20 @@
  */
 #define INFER_CAM_SAMPLE_JPEG         0
 #define INFER_CAM_JPEG_QUALITY        80U   /* 1..100，越大越清晰 */
+
+/*
+ * 每個 task 的 CPU 占比統計 (task_usage.c：TASK_USAGE log 與回傳 server 的 task_usage 記錄)。
+ *   1：開啟。每次推論前後、相機每 10 幀各呼叫一次 uxTaskGetSystemState()。
+ *   0：關閉，上面的函式都變成空的，不印 TASK_USAGE、不回傳 task_usage 記錄。
+ * uxTaskGetSystemState() 在 IDF 5.1 雙核心下會關閉呼叫端核心的中斷並拿住 kernel lock，
+ * 再逐 byte 掃描所有 task 的剩餘 stack (約 1–2 ms)。ESP32 版 (ESP32_cam_mic/infer_node) 因此
+ * 漏掉相機 DMA 的 EOF 中斷，約 10–20% 的幀被丟掉 (Camera: incomplete)，關閉後降到 0 (2026-11-16)。
+ * S3 的相機 DMA 架構不同，未驗證是否受影響，預設一樣關閉。
+ * cam_infer 每次推論的 run / preempt / fd_overlap 不受影響 (只讀自己的計數器，不掃 stack)。
+ */
+#ifndef INFER_TASK_USAGE_ENABLE
+#define INFER_TASK_USAGE_ENABLE       0
+#endif
 
 /* 每幀最多送幾個 ROI 進 CNN，避免一張雜訊幀佔住 fb 太久；超過的留到該 track 下一次配對。 */
 #define INFER_CAM_MAX_ROI_PER_FRAME   4U

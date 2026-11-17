@@ -18,6 +18,9 @@
 #error "Run time stats are off: delete infer_node/sdkconfig so sdkconfig.defaults is applied"
 #endif
 
+/* 關閉時 task_usage.h 提供空的 inline 版本，這個檔案不編任何東西 */
+#if INFER_TASK_USAGE_ENABLE
+
 /* 系統約有 20 個 task；放不下時 uxTaskGetSystemState() 回傳 0，只會少這段統計 */
 #define MAX_TASKS 32U
 
@@ -271,3 +274,5 @@ void task_usage_cycle_report(const char *label)
     const uint32_t avg_wall_us = (uint32_t)(s_cycle_copy.wall_total_us / s_cycle_copy.intervals);
     print_table(&s_cycle_copy, order, label, "cycles", avg_wall_us);
 }
+
+#endif /* INFER_TASK_USAGE_ENABLE */

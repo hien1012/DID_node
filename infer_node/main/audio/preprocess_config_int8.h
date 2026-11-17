@@ -32,17 +32,17 @@ static const uint16_t g_audio_mel_bin_edges[AUDIO_MODEL_INPUT_HEIGHT + 2] = {
 };
 
 /* Real value = scale * (quantized value - zero point). */
-#define AUDIO_MODEL_INPUT_SCALE 0.0455048569f
-#define AUDIO_MODEL_INPUT_ZERO_POINT 15
+#define AUDIO_MODEL_INPUT_SCALE 0.052464284f
+#define AUDIO_MODEL_INPUT_ZERO_POINT 10
 #define AUDIO_MODEL_OUTPUT_SCALE 0.00390625f
 #define AUDIO_MODEL_OUTPUT_ZERO_POINT -128
 
 /* Float frontend normalization performed before final INT8 quantization. */
 static const float g_audio_input_mean[AUDIO_MODEL_INPUT_CHANNELS] = {
-    1.03034625e-09f
+    -7.30749328e-09f
 };
 static const float g_audio_input_inv_std[AUDIO_MODEL_INPUT_CHANNELS] = {
-    1.00003624f
+    1.00003099f
 };
 /* Output tensor index-to-label mapping generated from training classes. */
 static const char *const g_audio_class_names[AUDIO_MODEL_CLASS_COUNT] = {

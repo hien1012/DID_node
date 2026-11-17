@@ -25,6 +25,7 @@
 
 #include <errno.h>
 #include <inttypes.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -362,6 +363,8 @@ typedef struct {
     uint32_t crop_us;
     uint32_t invoke_us;         /* cam_model_predict()：複製輸入 + Invoke + 反量化 */
     uint32_t invoke_only_us;    /* 其中 Invoke() 本身 (只印 log) */
+    uint32_t run_us;            /* 同一段期間 cam_infer 自己佔用 CPU 的時間 (含等 cache miss 的停頓) */
+    uint32_t fd_overlap_us;     /* 同一段期間另一顆核心的 cam_detect 在處理幀的時間 */
     uint8_t pred;
     float conf;
     float probs[CAM_MODEL_CLASS_COUNT];
@@ -373,6 +376,22 @@ typedef struct {
     uint64_t total_us;
     uint32_t max_us;
 } stage_stat_t;
+
+/*
+ * 一個回報週期內每次推論的 (FD 重疊量 x, 推論時間 y) 累加值，用來算相關係數與斜率。
+ * 單位 ms；y 分兩組：wall = 實際經過時間，run = cam_infer 自己的 CPU 時間 (扣掉被搶占)。
+ */
+typedef struct {
+    uint32_t n;
+    double sum_x;
+    double sum_xx;
+    double sum_wall;
+    double sum_wall2;
+    double sum_x_wall;
+    double sum_run;
+    double sum_run2;
+    double sum_x_run;
+} overlap_stats_t;
 
 typedef enum {
     STAGE_CAPTURE,
@@ -506,6 +525,18 @@ static StaticTask_t s_infer_tcb;
 static StackType_t s_infer_stack[INFER_TASK_STACK_BYTES];
 static TaskHandle_t s_infer_task = NULL;
 static uint32_t s_incomplete_at_start = 0;
+
+/*
+ * 推論期間另一顆核心的 FD 忙碌量，用來驗證 CNN 時間的波動是不是 PSRAM 匯流排競爭。
+ * 不讀 IDLE 的 ulRunTimeCounter：另一顆核心上正在跑的 task，計數器要等它被切換才更新，
+ * 單次推論的誤差可達數十 ms。改由 cam_detect 用 esp_timer 記錄 detect_frame() 的起訖，
+ * cam_infer 讀累計值 (跨核心，用 spinlock)。
+ * 不含驅動 cam_task 搬像素的時間 (每幀固定，大致和推論長度成正比)。
+ */
+static portMUX_TYPE s_fd_busy_lock = portMUX_INITIALIZER_UNLOCKED;
+static int64_t s_fd_busy_since_us = 0;      /* 0 = cam_detect 目前沒在處理幀 */
+static uint64_t s_fd_busy_total_us = 0;
+static overlap_stats_t s_overlap;           /* 只有 cam_infer 存取 */
 
 static esp_err_t cam_infer_resume(void);
 
@@ -1385,6 +1416,15 @@ static void camera_capture(void *argument)
             }
             if (interval_us > GAP_THRESHOLD_US) {
                 session->gaps++;
+                /*
+                 * 印幀號判斷是啟動造成 (frame 1) 還是運作中掉幀；incomplete 一起印，
+                 * 看這次 gap 是不是驅動丟掉長度不符的短幀。gap 很少發生，log 不影響取幀。
+                 */
+                ESP_LOGW(TAG, "Frame gap before frame %u: interval=%" PRId64
+                         " us gaps=%u incomplete=%u stale=%u",
+                         (unsigned)session->frames, interval_us, (unsigned)session->gaps,
+                         (unsigned)(cam_get_incomplete_frames() - s_incomplete_at_start),
+                         (unsigned)session->stale);
             }
         }
         session->last_frame_us = timestamp_us;
@@ -1454,6 +1494,110 @@ static int run_frame_difference(FD_StageTiming *timing)
     return count;
 }
 
+/* cam_detect 呼叫：開始 / 結束處理一幀 */
+static void fd_busy_mark(bool busy)
+{
+    const int64_t now_us = esp_timer_get_time();
+    portENTER_CRITICAL(&s_fd_busy_lock);
+    if (busy) {
+        s_fd_busy_since_us = now_us;
+    } else if (s_fd_busy_since_us != 0) {
+        s_fd_busy_total_us += (uint64_t)(now_us - s_fd_busy_since_us);
+        s_fd_busy_since_us = 0;
+    }
+    portEXIT_CRITICAL(&s_fd_busy_lock);
+}
+
+/* cam_infer 呼叫：開機以來 cam_detect 處理幀的累計時間，含正在處理的這一幀 */
+static uint64_t fd_busy_now_us(void)
+{
+    const int64_t now_us = esp_timer_get_time();
+    portENTER_CRITICAL(&s_fd_busy_lock);
+    uint64_t total_us = s_fd_busy_total_us;
+    /* now_us 在鎖外讀，另一顆核心可能在這之後才開始新的一幀 */
+    if (s_fd_busy_since_us != 0 && now_us > s_fd_busy_since_us) {
+        total_us += (uint64_t)(now_us - s_fd_busy_since_us);
+    }
+    portEXIT_CRITICAL(&s_fd_busy_lock);
+    return total_us;
+}
+
+/*
+ * 呼叫者自己的 ulRunTimeCounter (us)。計數器只在 vTaskSwitchContext 時結算，
+ * 所以先 yield：就算沒有切到別的 task，到目前為止的時間也會記進去。
+ * 只讀自己一個 task、不掃 stack (pdFALSE)，不像 uxTaskGetSystemState() 會長時間關中斷。
+ */
+static uint32_t self_run_time_us(void)
+{
+    taskYIELD();
+    TaskStatus_t status;
+    vTaskGetInfo(NULL, &status, pdFALSE, eRunning);
+    return status.ulRunTimeCounter;
+}
+
+static void overlap_note(const roi_result_t *roi)
+{
+    const double x = (double)roi->fd_overlap_us / 1000.0;
+    const double wall = (double)roi->invoke_us / 1000.0;
+    const double run = (double)roi->run_us / 1000.0;
+    s_overlap.n++;
+    s_overlap.sum_x += x;
+    s_overlap.sum_xx += x * x;
+    s_overlap.sum_wall += wall;
+    s_overlap.sum_wall2 += wall * wall;
+    s_overlap.sum_x_wall += x * wall;
+    s_overlap.sum_run += run;
+    s_overlap.sum_run2 += run * run;
+    s_overlap.sum_x_run += x * run;
+}
+
+/* Pearson 相關係數與斜率 (x 每多 1 ms，y 增加多少 ms)；資料不夠或 x / y 沒變化時回傳 false */
+static bool overlap_fit(double n, double sx, double sxx, double sy, double syy, double sxy,
+                        double *r, double *slope)
+{
+    const double var_x = n * sxx - sx * sx;
+    const double var_y = n * syy - sy * sy;
+    if (n < 3.0 || var_x <= 0.0 || var_y <= 0.0) {
+        return false;
+    }
+    const double cov = n * sxy - sx * sy;
+    *r = cov / sqrt(var_x * var_y);
+    *slope = cov / var_x;
+    return true;
+}
+
+/*
+ * r 接近 1、斜率明顯大於 0 → FD 越忙推論越慢 (PSRAM / flash 匯流排競爭)。
+ * r 接近 0 → 要找其他原因。run 的 r 比 wall 的 r 更能代表匯流排競爭，因為已經扣掉被搶占的時間。
+ */
+static void overlap_report(void)
+{
+    if (s_overlap.n == 0U) {
+        return;
+    }
+    const double n = (double)s_overlap.n;
+    double r_wall = 0.0;
+    double slope_wall = 0.0;
+    double r_run = 0.0;
+    double slope_run = 0.0;
+    const bool wall_ok = overlap_fit(n, s_overlap.sum_x, s_overlap.sum_xx, s_overlap.sum_wall,
+                                     s_overlap.sum_wall2, s_overlap.sum_x_wall, &r_wall, &slope_wall);
+    const bool run_ok = overlap_fit(n, s_overlap.sum_x, s_overlap.sum_xx, s_overlap.sum_run,
+                                    s_overlap.sum_run2, s_overlap.sum_x_run, &r_run, &slope_run);
+    ESP_LOGI(TAG,
+             "CNN vs FD over %u invokes: avg invoke=%.1f run=%.1f preempt=%.1f fd_overlap=%.1f ms",
+             (unsigned)s_overlap.n, s_overlap.sum_wall / n, s_overlap.sum_run / n,
+             (s_overlap.sum_wall - s_overlap.sum_run) / n, s_overlap.sum_x / n);
+    if (wall_ok && run_ok) {
+        ESP_LOGI(TAG,
+                 "CNN vs FD fit: run r=%.2f slope=%.2f ms/ms | invoke r=%.2f slope=%.2f ms/ms",
+                 r_run, slope_run, r_wall, slope_wall);
+    } else {
+        ESP_LOGI(TAG, "CNN vs FD fit: not enough spread in the data");
+    }
+    memset(&s_overlap, 0, sizeof(s_overlap));
+}
+
 /* 候選 → 外擴 → 補正方形 → crop 64x64 → CNN。結果寫進 out，成功回傳 true */
 static bool classify_candidate(const uint8_t *full_frame, const Stage2_CnnCandidate *candidate,
                                uint8_t *roi, roi_result_t *out)
@@ -1471,12 +1615,18 @@ static bool classify_candidate(const uint8_t *full_frame, const Stage2_CnnCandid
     out->crop_us = (uint32_t)(esp_timer_get_time() - crop_start_us);
     /* 推論一次 = 一個 64x64 ROI 的 CNN。統計本身的時間不算進 invoke_us */
     task_usage_begin();
+    const uint32_t run_start_us = self_run_time_us();
+    const uint64_t fd_start_us = fd_busy_now_us();
     const int64_t invoke_start_us = esp_timer_get_time();
     if (cam_model_predict(roi, out->probs, &pred) != ESP_OK || pred < 0) {
         return false;
     }
     out->invoke_us = (uint32_t)(esp_timer_get_time() - invoke_start_us);
     out->invoke_only_us = cam_model_last_invoke_us();
+    out->fd_overlap_us = (uint32_t)(fd_busy_now_us() - fd_start_us);
+    /* 無號相減，計數器 32 位元 (約 71 分鐘) 繞回也正確 */
+    out->run_us = self_run_time_us() - run_start_us;
+    overlap_note(out);
     task_usage_end();
     out->track_id = candidate->track_id;
     out->bbox[0] = box.x1;
@@ -1505,11 +1655,14 @@ static void report_roi(const frame_job_t *job, const roi_result_t *roi)
     memcpy(out->probs, roi->probs, sizeof(out->probs));
     out->low_conf = roi->low_conf;
     result_report_push(&record);
-    ESP_LOGI(TAG, "frame %u track %d: %s %.3f [%.3f %.3f %.3f] cnn=%u ms invoke=%.1f ms%s",
+    const uint32_t preempt_us = roi->invoke_us > roi->run_us ? roi->invoke_us - roi->run_us : 0U;
+    ESP_LOGI(TAG, "frame %u track %d: %s %.3f [%.3f %.3f %.3f] cnn=%u ms invoke=%.1f ms "
+             "run=%.1f preempt=%.1f fd_overlap=%.1f ms%s",
              (unsigned)job->timing.frame, (int)roi->track_id, out->label, (double)roi->conf,
              (double)roi->probs[0], (double)roi->probs[1], (double)roi->probs[2],
              (unsigned)(roi->invoke_us / 1000U), (double)roi->invoke_only_us / 1000.0,
-             roi->low_conf ? " LOW" : "");
+             (double)roi->run_us / 1000.0, (double)preempt_us / 1000.0,
+             (double)roi->fd_overlap_us / 1000.0, roi->low_conf ? " LOW" : "");
 }
 
 static void stage_add(stage_stat_t *stat, uint32_t elapsed_us)
@@ -1638,13 +1791,23 @@ static void cam_detect(void *argument)
     ready_frame_t ready;
     while (true) {
         (void)xQueueReceive(s_ready_queue, &ready, portMAX_DELAY);
+        fd_busy_mark(true);
         detect_frame(&ready, &has_prev);
+        fd_busy_mark(false);
         /* 只抓 snapshot，不印 log；印表交給 cam_infer，不佔 FD 的 200 ms */
         if ((s_session.processed % USAGE_CYCLE_FRAMES) == 0U) {
             task_usage_cycle_mark();
         }
         if ((s_session.processed % STATS_PERIOD_FRAMES) == 0U) {
             report_stats();
+        }
+        /*
+         * 畫面變化大時 FD (尤其 ROI refine) 會比幀間隔還久，s_ready_queue 一直有幀，
+         * cam_detect 連續吃滿 Core 1，IDLE1 超過 5 s 沒跑 → task WDT。
+         * 有積壓才讓出 1 tick；沒積壓時下一次 xQueueReceive 本來就會阻塞。
+         */
+        if (uxQueueMessagesWaiting(s_ready_queue) > 0U) {
+            vTaskDelay(1);
         }
     }
 }
@@ -1920,6 +2083,7 @@ static void report_cnn_work(void)
 {
     log_stage_times(&s_cnn_stages, "CNN");
     report_cnn_ops();
+    overlap_report();
     task_usage_report("video");
     task_usage_cycle_report("video cycle");
 }
