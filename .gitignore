@@ -95,3 +95,9 @@ boot1.SVDat
 PCB_layout/perfboard_back.png
 PCB_layout/perfboard_front.png
 LA_capture.csv
+infer_node/build_debug/
+infer_node/build_cam_debug/
+infer_node/build_replay_nn/
+infer_node/build_replay_ref/
+infer_node/replay_dump*/
+*debug_comparison.json

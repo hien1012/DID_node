@@ -36,6 +36,30 @@ const char *sample_store_media_name(sample_media_t media)
     return media == SAMPLE_MEDIA_AUDIO ? "audio" : "video";
 }
 
+int sample_store_find_background(const char *const *class_names, int class_count)
+{
+#if INFER_SAVE_NON_BACKGROUND
+    for (int i = 0; i < class_count; ++i) {
+        if (class_names[i] && strcmp(class_names[i], INFER_BACKGROUND_LABEL) == 0) {
+            return i;
+        }
+    }
+    ESP_LOGW(TAG, "No \"%s\" class; saving low-confidence samples only", INFER_BACKGROUND_LABEL);
+#else
+    (void)class_names;
+    (void)class_count;
+#endif
+    return -1;
+}
+
+const char *sample_store_save_reason(bool low_conf, bool non_background)
+{
+    if (low_conf && non_background) {
+        return "both";
+    }
+    return non_background ? "non_background" : "low_conf";
+}
+
 static const char *media_dir(sample_media_t media)
 {
     return media == SAMPLE_MEDIA_AUDIO ? SAMPLE_AUDIO_DIR : SAMPLE_VIDEO_DIR;

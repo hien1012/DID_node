@@ -49,6 +49,7 @@
 
 #include "board_pins.h"
 #include "camera_registers.h"
+#include "cam_debug.h"
 #include "cam_model.h"
 #include "fd_mix.h"
 #include "infer_config.h"
@@ -428,6 +429,8 @@ typedef struct {
     size_t candidate_count;
     Stage2_CnnCandidate candidates[INFER_CAM_MAX_ROI_PER_FRAME];
     size_t roi_count;
+    bool any_low;                       /* 有低信賴 ROI */
+    bool any_non_background;            /* 有非背景 ROI (INFER_SAVE_NON_BACKGROUND) */
     roi_result_t rois[INFER_CAM_MAX_ROI_PER_FRAME];
     uint8_t roi_pixels[INFER_CAM_MAX_ROI_PER_FRAME][CAM_MODEL_ROI_BYTES];
     char meta[SAMPLE_META_BYTES];
@@ -525,6 +528,8 @@ static StaticTask_t s_infer_tcb;
 static StackType_t s_infer_stack[INFER_TASK_STACK_BYTES];
 static TaskHandle_t s_infer_task = NULL;
 static uint32_t s_incomplete_at_start = 0;
+/* 模型類別表中 background 的索引；-1 = 不以非背景為存檔條件 (見 INFER_SAVE_NON_BACKGROUND) */
+static int s_background_class = -1;
 
 /*
  * 推論期間另一顆核心的 FD 忙碌量，用來驗證 CNN 時間的波動是不是 PSRAM 匯流排競爭。
@@ -1822,6 +1827,7 @@ static void run_cnn_job(frame_job_t *job)
     timing->cnn_wait_us = (uint32_t)(started_us - job->handed_over_us);
 
     bool any_low = false;
+    bool any_non_background = false;
     job->roi_count = 0;
     for (size_t k = 0; k < job->candidate_count; ++k) {
         const Stage2_CnnCandidate *candidate = &job->candidates[k];
@@ -1838,9 +1844,32 @@ static void run_cnn_job(frame_job_t *job)
         timing->crop_us += roi->crop_us;
         timing->cnn_us += roi->invoke_us;
         report_roi(job, roi);
+#if INFER_CAM_DEBUG_DUMP
+        /* ROI 像素還在 job 裡：就是這次正式推論的輸入。dump 期間 CNN 停住約 20 s */
+        static uint32_t s_debug_dumped = 0;
+        if (s_debug_dumped < INFER_CAM_DEBUG_DUMP_ROIS) {
+            const cam_debug_roi_t dump = {
+                .roi = job->roi_pixels[job->roi_count - 1U],
+                .probs = roi->probs,
+                .pred = (int)roi->pred,
+                .index = s_debug_dumped,
+                .frame = timing->frame,
+                .track_id = roi->track_id,
+                .bbox = roi->bbox,
+                .ts_epoch_ms = timing->ts_epoch_ms,
+                .invoke_us = roi->invoke_only_us,
+            };
+            ++s_debug_dumped;
+            (void)cam_debug_dump_roi(&dump);
+        }
+#endif
         s_stats.last_invoke_us = roi->invoke_us;
         any_low = any_low || roi->low_conf;
+        any_non_background = any_non_background ||
+                             (s_background_class >= 0 && roi->pred != (uint8_t)s_background_class);
     }
+    job->any_low = any_low;
+    job->any_non_background = any_non_background;
     s_session.rois += (uint32_t)job->roi_count;
     s_stats.rois += (uint32_t)job->roi_count;
     timing->roi_us = (uint32_t)(esp_timer_get_time() - started_us);
@@ -1860,6 +1889,9 @@ static void run_cnn_job(frame_job_t *job)
     if (any_low) {
         s_session.low_conf++;
         s_stats.low_conf++;
+    }
+    /* 低信賴或非背景：整幀交給 cam_writer，fb 由 writer 寫完才歸還 */
+    if (any_low || any_non_background) {
         job->handed_over_us = esp_timer_get_time();
         (void)xQueueSend(s_save_queue, &job, 0);
         return;
@@ -1913,12 +1945,13 @@ static bool build_sample_meta(frame_job_t *job, size_t image_bytes, int64_t enco
         ",\"roi_size\":%d,\"roi_count\":%u"
         ",\"threshold\":%.2f,\"queue_us\":%" PRIu32 ",\"downscale_us\":%" PRIu32
         ",\"fd_us\":%" PRIu32 ",\"track_us\":%" PRIu32 ",\"encode_us\":%" PRId64
-        ",\"write_us\":%" PRId64 ",\"labels\":[\"%s\",\"%s\",\"%s\"],\"rois\":[",
+        ",\"write_us\":%" PRId64 ",\"save_reason\":\"%s\",\"labels\":[\"%s\",\"%s\",\"%s\"],\"rois\":[",
         s_session.session_epoch, job->timing.frame, job->timing.ts_epoch_ms,
         (unsigned)CAM_IMAGE_WIDTH, (unsigned)CAM_IMAGE_HEIGHT,
         INFER_CAM_SAMPLE_JPEG ? "JPEG" : "GRAY8", (unsigned)image_bytes, CAM_MODEL_ROI_SIZE,
         (unsigned)job->roi_count, (double)INFER_LOW_CONF_THRESHOLD, job->timing.queue_us,
         job->timing.downscale_us, job->timing.fd_us, job->timing.track_us, encode_us, write_us,
+        sample_store_save_reason(job->any_low, job->any_non_background),
         cam_model_class_name(0), cam_model_class_name(1), cam_model_class_name(2));
     if (written < 0 || (size_t)written >= SAMPLE_META_BYTES) {
         return false;
@@ -2230,6 +2263,13 @@ static esp_err_t init_pipeline(void)
     stage2_init(s_tracker, &track_params);
 
     ESP_RETURN_ON_ERROR(cam_model_init(), TAG, "Camera model initialization failed");
+    const char *class_names[CAM_MODEL_CLASS_COUNT];
+    for (int i = 0; i < CAM_MODEL_CLASS_COUNT; ++i) {
+        class_names[i] = cam_model_class_name(i);
+    }
+    s_background_class = sample_store_find_background(class_names, CAM_MODEL_CLASS_COUNT);
+    ESP_LOGI(TAG, "Saving frames with %s", s_background_class >= 0 ?
+             "low-confidence or non-background ROIs" : "low-confidence ROIs only");
 
     /* 常駐：TFLM 只由 cam_infer 呼叫，FD 與追蹤器只由 cam_detect 呼叫；static 不佔動態 heap */
     s_infer_task = xTaskCreateStaticPinnedToCore(cam_infer, "cam_infer", INFER_TASK_STACK_BYTES,

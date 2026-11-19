@@ -9,6 +9,8 @@
 
 #include "esp_err.h"
 
+#include "debug_dump.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -46,6 +48,20 @@ uint32_t cam_model_last_invoke_us(void);
 size_t cam_model_take_op_times(cam_model_op_time_t ops[CAM_MODEL_MAX_OPS], uint32_t *invokes);
 
 const char *cam_model_class_name(int cls);
+
+/** flatbuffer 長度 (byte)，除錯 dump 的 meta 用來確認 PC 端用的是同一個模型。 */
+size_t cam_model_bytes(void);
+
+/* ---- 除錯 (INFER_CAM_DEBUG_DUMP，vision/cam_debug.c)：每一層的輸出 ---- */
+
+/**
+ * 用另一個 preserve_all_tensors 的 interpreter (1 MB PSRAM arena，第一次呼叫時建立) 推論，
+ * 再對每個張量呼叫 tensor_cb (debug_dump.h)。正式的 interpreter 不受影響。
+ * kernel 與正式路徑相同 (同一份韌體的 ESP-NN / reference)。只在 cam_infer task 內呼叫。
+ */
+esp_err_t cam_model_debug_run(const uint8_t *roi, float probabilities[CAM_MODEL_CLASS_COUNT],
+                              int *predicted_class, size_t *arena_used_bytes,
+                              debug_tensor_cb_t tensor_cb, void *ctx);
 
 #ifdef __cplusplus
 }

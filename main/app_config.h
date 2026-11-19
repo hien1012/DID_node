@@ -68,7 +68,7 @@ _Static_assert(3600U % APP_RECORD_PERIOD_SEC == 0U, "record slots must align to 
 /* Debug: stream frames straight to the PC instead of recording (cam_stream.c).
  * Run `python tools/cam_stream_view.py` on the PC first. While 1, the node
  * never records or uploads; set back to 0 when done. */
-#define APP_CAM_STREAM_ENABLE      1
+#define APP_CAM_STREAM_ENABLE      0
 #define APP_CAM_STREAM_HOST        "172.20.10.2"
 #define APP_CAM_STREAM_PORT        5002
 /* 1: also write the SD card in the background like a recording, switching

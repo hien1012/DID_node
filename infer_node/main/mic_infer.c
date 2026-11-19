@@ -22,11 +22,14 @@
  *
  * PCM 定義與訓練一致 (TTGO_I2S_Record_Test/main/app_audio_infer.c)：
  * (raw32 >> 16) × 30 後飽和，存下來的 WAV 就是推論用的那份資料。
+ * INFER_MIC_HPF_ENABLE=1 時在 × 30 之前加一階高通 (I2S 與 PDM 都是)，見 infer_config.h。
  */
 #include "mic_infer.h"
 
 #include <errno.h>
 #include <inttypes.h>
+#include <math.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -40,6 +43,7 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 
+#include "audio_debug.h"
 #include "audio_model.h"
 #include "board_pins.h"
 #include "infer_config.h"
@@ -82,7 +86,7 @@
 #define MIC_SETTLE_US           500000LL
 
 #define WRITE_BUFFER_BYTES      (8U * 1024U)    /* SD 寫入暫存 (內部 RAM)，為 512 的倍數 */
-#define META_BUFFER_BYTES       640U
+#define META_BUFFER_BYTES       768U    /* PSRAM；最長約 600 B */
 #define TASK_USAGE_PERIOD_WINDOWS 30U   /* 每 30 個視窗 (1 分鐘) 回報一次 task CPU 占比 */
 
 /* 上傳空檔：離下一個視窗收滿至少還有這麼久，才讀下一段 SD 送出 (一段 16 KB 約數十 ms) */
@@ -145,9 +149,10 @@ typedef struct {
     bool usage_open;        /* 這次開了 task_usage 推論區間，由 audio_cnn 結束並交還 */
 } feature_job_t;
 
-/* 低信賴視窗交給 audio_writer；視窗由 writer 寫完後歸還 */
+/* 要存的視窗 (低信賴或非背景) 交給 audio_writer；視窗由 writer 寫完後歸還 */
 typedef struct {
     uint8_t buffer;
+    bool non_background;
     int64_t handed_over_us;
     infer_audio_record_t record;
 } save_job_t;
@@ -157,6 +162,8 @@ static i2s_chan_handle_t s_rx_handle = NULL;
 static volatile uint32_t s_overflow_count = 0;
 static mic_infer_stats_t s_stats;
 static volatile uint32_t s_dropped_windows = 0;
+/* g_audio_class_names 中 background 的索引；-1 = 不以非背景為存檔條件 (見 INFER_SAVE_NON_BACKGROUND) */
+static int s_background_class = -1;
 
 static int16_t *s_windows[WINDOW_COUNT];    /* PSRAM */
 static int8_t *s_features[WINDOW_COUNT];    /* PSRAM，每塊 3,968 B，和視窗同索引 */
@@ -305,15 +312,56 @@ static esp_err_t i2s_init(void)
     return ESP_OK;
 }
 
+#if INFER_MIC_HPF_ENABLE
+/*
+ * 一階高通 (同 ESP32 版 mic_infer.c 的 pdm_hpf_apply)：y[n] = g·(x[n] − x[n−1]) + a·y[n−1]
+ * a = exp(−2π·fc/fs)，g = (1 + a)/2 讓高頻 (Nyquist) 增益為 1。
+ * 連續錄音，狀態一直延續；視窗緩衝都在忙而丟掉的樣本也照樣更新 (mic_capture)，
+ * 恢復收資料時不會因為跳過一段而產生跳變。x[−1] 取第一個樣本，開頭不會因為 DC 跳變。
+ * 只有 mic_capture 使用，不需要鎖。
+ */
+typedef struct {
+    float a;
+    float g;
+    float x_prev;
+    float y_prev;
+    bool started;
+} mic_hpf_t;
+
+static mic_hpf_t s_hpf;
+
+static inline int16_t mic_hpf_apply(int16_t sample)
+{
+    const float x = (float)sample;
+    if (!s_hpf.started) {
+        s_hpf.a = expf(-6.28318531f * INFER_MIC_HPF_CUTOFF_HZ / (float)MIC_SAMPLE_RATE);
+        s_hpf.g = (1.0f + s_hpf.a) * 0.5f;
+        s_hpf.x_prev = x;
+        s_hpf.y_prev = 0.0f;
+        s_hpf.started = true;
+    }
+    const float y = s_hpf.g * (x - s_hpf.x_prev) + s_hpf.a * s_hpf.y_prev;
+    s_hpf.x_prev = x;
+    s_hpf.y_prev = y;
+    const float rounded = y >= 0.0f ? y + 0.5f : y - 0.5f;
+    return rounded > (float)INT16_MAX ? INT16_MAX :
+           rounded < (float)INT16_MIN ? INT16_MIN : (int16_t)rounded;
+}
+#endif
+
 static inline int16_t raw_to_pcm(size_t index)
 {
 #if MIC_INTERFACE_I2S
     const int32_t *raw = (const int32_t *)s_read_buffer;
-    const int32_t gained = (int32_t)(int16_t)(raw[index] >> PCM_SHIFT_BITS) * PCM_GAIN;
+    int16_t sample = (int16_t)(raw[index] >> PCM_SHIFT_BITS);
 #else
     const int16_t *raw = (const int16_t *)s_read_buffer;
-    const int32_t gained = (int32_t)raw[index] * PCM_GAIN;
+    int16_t sample = raw[index];
 #endif
+#if INFER_MIC_HPF_ENABLE
+    sample = mic_hpf_apply(sample);     /* 在增益之前：DC 先拿掉，× 30 才不會削波 */
+#endif
+    const int32_t gained = (int32_t)sample * PCM_GAIN;
     return gained > INT16_MAX ? INT16_MAX : gained < INT16_MIN ? INT16_MIN : (int16_t)gained;
 }
 
@@ -347,11 +395,15 @@ static void mic_capture(void *arg)
             continue;
         }
         const size_t count = bytes_read / RAW_BYTES_PER_SAMPLE;
+        bool no_buffer = false;
         for (size_t i = 0; i < count; ++i) {
+            /* 每個樣本都先轉換：高通 (INFER_MIC_HPF_ENABLE) 的狀態連丟掉的樣本也要更新 */
+            const int16_t pcm = raw_to_pcm(i);
             if (current < 0) {
                 uint8_t next = 0;
-                if (xQueueReceive(s_free_windows, &next, 0) != pdTRUE) {
-                    break;      /* 還是沒有空緩衝：這次讀到的其餘資料丟掉 */
+                if (no_buffer || xQueueReceive(s_free_windows, &next, 0) != pdTRUE) {
+                    no_buffer = true;   /* 還是沒有空緩衝：這次讀到的其餘資料丟掉 */
+                    continue;
                 }
                 current = next;
                 fill = 0;
@@ -363,7 +415,7 @@ static void mic_capture(void *arg)
                                   (int64_t)(count - i) * 1000000LL / MIC_SAMPLE_RATE;
                 window_start_overflows = s_overflow_count;
             }
-            s_windows[current][fill++] = raw_to_pcm(i);
+            s_windows[current][fill++] = pcm;
             if (fill == WINDOW_SAMPLES) {
                 const full_window_t full = {
                     .buffer = (uint8_t)current,
@@ -457,7 +509,7 @@ static esp_err_t write_wav(int fd, const int16_t *pcm)
 }
 
 static esp_err_t save_sample(const int16_t *pcm, const infer_audio_record_t *record,
-                             uint32_t save_wait_us)
+                             bool non_background, uint32_t save_wait_us)
 {
     sample_file_t file;
     ESP_RETURN_ON_ERROR(sample_store_begin(&file, SAMPLE_MEDIA_AUDIO, record->start_epoch_ms),
@@ -474,15 +526,17 @@ static esp_err_t save_sample(const int16_t *pcm, const infer_audio_record_t *rec
     const int meta_bytes = snprintf(
         s_meta, META_BUFFER_BYTES,
         "{\"media\":\"audio\",\"window\":%" PRIu32 ",\"start_ms\":%" PRId64 ",\"end_ms\":%" PRId64
-        ",\"sample_rate\":%u,\"samples\":%u,\"gain\":%d,\"threshold\":%.2f"
+        ",\"sample_rate\":%u,\"samples\":%u,\"gain\":%d,\"hpf_hz\":%.1f,\"threshold\":%.2f"
         ",\"queue_us\":%" PRIu32 ",\"feature_us\":%" PRIu32 ",\"invoke_us\":%" PRIu32
         ",\"save_wait_us\":%" PRIu32 ",\"write_us\":%" PRId64 ",\"overflows\":%" PRIu32
-        ",\"pred\":%u,\"label\":\"%s\",\"conf\":%.4f"
+        ",\"pred\":%u,\"label\":\"%s\",\"conf\":%.4f,\"save_reason\":\"%s\""
         ",\"labels\":[\"%s\",\"%s\",\"%s\"],\"probs\":[%.4f,%.4f,%.4f]}",
         record->window, record->start_epoch_ms, record->end_epoch_ms,
         (unsigned)MIC_SAMPLE_RATE, (unsigned)WINDOW_SAMPLES, PCM_GAIN,
+        INFER_MIC_HPF_ENABLE ? (double)INFER_MIC_HPF_CUTOFF_HZ : 0.0,   /* 0 = 不濾波 */
         (double)INFER_LOW_CONF_THRESHOLD, record->queue_us, record->feature_us, record->invoke_us,
         save_wait_us, write_us, record->overflows, (unsigned)record->pred, record->label, (double)record->conf,
+        sample_store_save_reason(record->low_conf, non_background),
         g_audio_class_names[0], g_audio_class_names[1], g_audio_class_names[2],
         (double)record->probs[0], (double)record->probs[1], (double)record->probs[2]);
     if (meta_bytes < 0 || meta_bytes >= (int)META_BUFFER_BYTES) {
@@ -574,17 +628,37 @@ static void audio_cnn(void *arg)
         audio->conf = probs[pred];
         memcpy(audio->probs, probs, sizeof(audio->probs));
         audio->low_conf = probs[pred] < INFER_LOW_CONF_THRESHOLD;
+        const bool non_background = s_background_class >= 0 && pred != s_background_class;
         result_report_push(&record);    /* 不等 SD：判斷結果馬上送出 */
 
         /* handoff = logmel 結束到 CNN 開始 (跨核心交接 + 等 Core 1) */
         ESP_LOGI(TAG, "w%u %s %.3f [%.3f %.3f %.3f] logmel=%u ms cnn=%u ms invoke=%.1f ms "
-                 "handoff=%.1f ms%s",
+                 "handoff=%.1f ms%s%s",
                  (unsigned)audio->window, audio->label, (double)audio->conf,
                  (double)probs[0], (double)probs[1], (double)probs[2],
                  (unsigned)(audio->feature_us / 1000U), (unsigned)(audio->invoke_us / 1000U),
                  (double)audio_model_last_invoke_us() / 1000.0,
                  (double)(cnn_start_us - job.feature_done_us) / 1000.0,
-                 audio->low_conf ? " LOW" : "");
+                 audio->low_conf ? " LOW" : "", non_background ? " DET" : "");
+
+#if INFER_AUDIO_DEBUG_DUMP
+        /* 視窗還沒釋放：s_windows / s_features 就是這次正式推論用的資料 */
+        static uint32_t s_debug_dumped = 0;
+        if (s_debug_dumped < INFER_AUDIO_DEBUG_DUMP_WINDOWS) {
+            ++s_debug_dumped;
+            const audio_debug_window_t dump = {
+                .pcm = s_windows[full->buffer],
+                .features = s_features[full->buffer],
+                .probs = probs,
+                .pred = pred,
+                .window = full->window,
+                .start_epoch_ms = audio->start_epoch_ms,
+                .feature_us = audio->feature_us,
+                .invoke_us = audio->invoke_us,
+            };
+            (void)audio_debug_dump_window(&dump);
+        }
+#endif
 
         ++s_stats.windows;
         /* 推論統計的 report 也要在通行證內做；正常情況每個視窗都有，等於每 30 個視窗一次 */
@@ -600,14 +674,17 @@ static void audio_cnn(void *arg)
         }
         s_stats.last_feature_us = audio->feature_us;
         s_stats.last_invoke_us = audio->invoke_us;
-        if (!audio->low_conf) {
+        if (audio->low_conf) {
+            ++s_stats.low_conf;
+        }
+        if (!audio->low_conf && !non_background) {
             release_window(full->buffer);
             continue;
         }
         /* 寫 SD 交給 audio_writer，這裡馬上回去等下一個視窗；視窗由 writer 寫完才還 */
-        ++s_stats.low_conf;
         const save_job_t save = {
             .buffer = full->buffer,
+            .non_background = non_background,
             .handed_over_us = esp_timer_get_time(),
             .record = *audio,
         };
@@ -622,7 +699,8 @@ static void audio_writer(void *arg)
     while (true) {
         (void)xQueueReceive(s_save_jobs, &job, portMAX_DELAY);
         const uint32_t save_wait_us = (uint32_t)(esp_timer_get_time() - job.handed_over_us);
-        if (save_sample(s_windows[job.buffer], &job.record, save_wait_us) == ESP_OK) {
+        if (save_sample(s_windows[job.buffer], &job.record, job.non_background,
+                        save_wait_us) == ESP_OK) {
             ++s_stats.saved;
         }
         release_window(job.buffer);
@@ -663,9 +741,14 @@ esp_err_t mic_infer_init(void)
     }
 
     ESP_RETURN_ON_ERROR(audio_model_init(), TAG, "Audio model initialization failed");
+    s_background_class = sample_store_find_background(g_audio_class_names,
+                                                      AUDIO_MODEL_CLASS_COUNT);
+    ESP_LOGI(TAG, "Saving %s", s_background_class >= 0 ?
+             "low-confidence and non-background windows" : "low-confidence windows only");
     ESP_RETURN_ON_ERROR(i2s_init(), TAG, "I2S initialization failed");
-    ESP_LOGI(TAG, "Microphone ready: %s, %u Hz mono, gain x%d, window %u samples",
-             MIC_INTERFACE_I2S ? "I2S" : "PDM", (unsigned)MIC_SAMPLE_RATE, PCM_GAIN,
+    ESP_LOGI(TAG, "Microphone ready: %s, %u Hz mono, high-pass %s %.1f Hz, gain x%d, window %u samples",
+             MIC_INTERFACE_I2S ? "I2S" : "PDM", (unsigned)MIC_SAMPLE_RATE,
+             INFER_MIC_HPF_ENABLE ? "on" : "off", (double)INFER_MIC_HPF_CUTOFF_HZ, PCM_GAIN,
              (unsigned)WINDOW_SAMPLES);
     return ESP_OK;
 }

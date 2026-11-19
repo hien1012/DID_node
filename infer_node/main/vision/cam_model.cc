@@ -3,6 +3,7 @@
 
 #include <cstring>
 
+#include "debug_tensors.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -88,6 +89,43 @@ tflite::MicroInterpreter *s_interpreter = nullptr;
 TfLiteTensor *s_input = nullptr;
 TfLiteTensor *s_output = nullptr;
 
+/* 除錯 interpreter (cam_model_debug_run)：保留所有張量 = 線性配置不重用，非常數張量合計約 156 KB */
+constexpr size_t kDebugArenaSize = 1024 * 1024;
+uint8_t *s_debug_arena = nullptr;
+tflite::MicroInterpreter *s_debug_interpreter = nullptr;
+bool s_debug_init_attempted = false;
+
+using CamOpResolver = tflite::MicroMutableOpResolver<10>;
+
+/* 與模型的運算子同步 (QUANTIZE、DW/CONV、MAX_POOL、SHAPE/STRIDED_SLICE/PACK/RESHAPE、FC、SOFTMAX) */
+TfLiteStatus register_ops(CamOpResolver &resolver)
+{
+    if (resolver.AddConv2D() != kTfLiteOk || resolver.AddDepthwiseConv2D() != kTfLiteOk ||
+        resolver.AddFullyConnected() != kTfLiteOk || resolver.AddSoftmax() != kTfLiteOk ||
+        resolver.AddMaxPool2D() != kTfLiteOk || resolver.AddReshape() != kTfLiteOk ||
+        resolver.AddQuantize() != kTfLiteOk || resolver.AddShape() != kTfLiteOk ||
+        resolver.AddStridedSlice() != kTfLiteOk || resolver.AddPack() != kTfLiteOk) {
+        return kTfLiteError;
+    }
+    return kTfLiteOk;
+}
+
+/* uint8 輸出 → 機率；判定與原專案相同：drone 機率超過門檻就判 drone，否則取最大值 (先出現的勝出) */
+int decode_output(const TfLiteTensor *output, float probabilities[CAM_MODEL_CLASS_COUNT])
+{
+    const int zero_point = output->params.zero_point;
+    const float scale = output->params.scale;
+    int best = 0;
+    for (int i = 0; i < CAM_MODEL_CLASS_COUNT; i++) {
+        probabilities[i] =
+            (static_cast<float>(output->data.uint8[i]) - static_cast<float>(zero_point)) * scale;
+        if (probabilities[i] > probabilities[best]) {
+            best = i;
+        }
+    }
+    return probabilities[kDroneClass] > kDroneProbGate ? kDroneClass : best;
+}
+
 }  // namespace
 
 extern "C" const char *cam_model_class_name(int cls)
@@ -115,12 +153,8 @@ extern "C" esp_err_t cam_model_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    static tflite::MicroMutableOpResolver<10> resolver;
-    if (resolver.AddConv2D() != kTfLiteOk || resolver.AddDepthwiseConv2D() != kTfLiteOk ||
-        resolver.AddFullyConnected() != kTfLiteOk || resolver.AddSoftmax() != kTfLiteOk ||
-        resolver.AddMaxPool2D() != kTfLiteOk || resolver.AddReshape() != kTfLiteOk ||
-        resolver.AddQuantize() != kTfLiteOk || resolver.AddShape() != kTfLiteOk ||
-        resolver.AddStridedSlice() != kTfLiteOk || resolver.AddPack() != kTfLiteOk) {
+    static CamOpResolver resolver;
+    if (register_ops(resolver) != kTfLiteOk) {
         ESP_LOGE(TAG, "Op resolver setup failed");
         return ESP_FAIL;
     }
@@ -173,17 +207,7 @@ extern "C" esp_err_t cam_model_predict(const uint8_t *roi,
     }
     s_last_invoke_us = static_cast<uint32_t>(esp_timer_get_time() - invoke_start_us);
 
-    const int zero_point = s_output->params.zero_point;
-    const float scale = s_output->params.scale;
-    int best = 0;
-    for (int i = 0; i < CAM_MODEL_CLASS_COUNT; i++) {
-        probabilities[i] =
-            (static_cast<float>(s_output->data.uint8[i]) - static_cast<float>(zero_point)) * scale;
-        if (probabilities[i] > probabilities[best]) {
-            best = i;
-        }
-    }
-    *predicted_class = probabilities[kDroneClass] > kDroneProbGate ? kDroneClass : best;
+    *predicted_class = decode_output(s_output, probabilities);
     return ESP_OK;
 }
 
@@ -196,4 +220,80 @@ extern "C" size_t cam_model_take_op_times(cam_model_op_time_t ops[CAM_MODEL_MAX_
                                           uint32_t *invokes)
 {
     return s_op_timer.Take(ops, invokes);
+}
+
+extern "C" size_t cam_model_bytes(void)
+{
+    return static_cast<size_t>(g_model_len);
+}
+
+/* 第一次呼叫時建立保留所有張量的 interpreter；與正式的 interpreter 分開，正式路徑不受影響 */
+static esp_err_t debug_interpreter_init(const tflite::Model *model)
+{
+    if (s_debug_interpreter != nullptr) {
+        return ESP_OK;
+    }
+    if (s_debug_init_attempted) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_debug_init_attempted = true;
+
+    s_debug_arena = static_cast<uint8_t *>(heap_caps_aligned_alloc(
+        16, kDebugArenaSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (s_debug_arena == nullptr) {
+        ESP_LOGE(TAG, "Debug arena allocation failed: %u bytes", static_cast<unsigned>(kDebugArenaSize));
+        return ESP_ERR_NO_MEM;
+    }
+    static CamOpResolver resolver;
+    if (register_ops(resolver) != kTfLiteOk) {
+        ESP_LOGE(TAG, "Debug op resolver setup failed");
+        return ESP_FAIL;
+    }
+    static tflite::MicroInterpreter interpreter(model, resolver, s_debug_arena, kDebugArenaSize,
+                                                nullptr, nullptr, /*preserve_all_tensors=*/true);
+    if (interpreter.AllocateTensors() != kTfLiteOk) {
+        ESP_LOGE(TAG, "Debug AllocateTensors failed (arena %u bytes)", static_cast<unsigned>(kDebugArenaSize));
+        return ESP_FAIL;
+    }
+    s_debug_interpreter = &interpreter;
+    ESP_LOGI(TAG, "Debug interpreter ready (preserve_all_tensors): arena used=%u bytes",
+             static_cast<unsigned>(interpreter.arena_used_bytes()));
+    return ESP_OK;
+}
+
+extern "C" esp_err_t cam_model_debug_run(const uint8_t *roi,
+                                         float probabilities[CAM_MODEL_CLASS_COUNT],
+                                         int *predicted_class,
+                                         size_t *arena_used_bytes,
+                                         debug_tensor_cb_t tensor_cb,
+                                         void *ctx)
+{
+    if (!roi || !probabilities || !predicted_class) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const tflite::Model *model = tflite::GetModel(g_model);
+    const esp_err_t init_err = debug_interpreter_init(model);
+    if (init_err != ESP_OK) {
+        return init_err;
+    }
+
+    TfLiteTensor *input = s_debug_interpreter->input(0);
+    if (input->type != kTfLiteUInt8 || input->bytes != CAM_MODEL_ROI_BYTES) {
+        ESP_LOGE(TAG, "Debug interpreter input mismatch: type=%d bytes=%u", input->type,
+                 static_cast<unsigned>(input->bytes));
+        return ESP_ERR_INVALID_STATE;
+    }
+    std::memcpy(input->data.uint8, roi, CAM_MODEL_ROI_BYTES);
+    if (s_debug_interpreter->Invoke() != kTfLiteOk) {
+        ESP_LOGE(TAG, "Debug Invoke failed");
+        return ESP_FAIL;
+    }
+    *predicted_class = decode_output(s_debug_interpreter->output(0), probabilities);
+    if (arena_used_bytes != nullptr) {
+        *arena_used_bytes = s_debug_interpreter->arena_used_bytes();
+    }
+    if (tensor_cb != nullptr) {
+        debug_tensors_walk(model, *s_debug_interpreter, tensor_cb, ctx);
+    }
+    return ESP_OK;
 }

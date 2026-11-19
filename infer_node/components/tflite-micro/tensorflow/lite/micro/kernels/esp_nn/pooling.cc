@@ -64,7 +64,15 @@ void AverageEvalQuantized(TfLiteContext* context, const TfLiteNode* node,
   const int input_size = input_width * input_height * depth;
   const int output_size = output_width * output_height * depth;
 
-  if (depth % 4 == 0) { // S3 version only supports channels multiple of 4
+  /*
+   * did_node: int8 avg pool 一律走 ANSI C 版 (與 TFLM reference 的捨入相同，bit-exact)。
+   * S3 組語版 esp_nn_avg_pool_s8_esp32s3_asm 在音訊模型的 op07
+   * (1x8x31x48 -> 1x8x1x48，filter 31x1) 輸出錯誤 (max_diff=253，336/384 不符)，
+   * 且同一輸入兩次結果不同；前面的 conv / dw / max pool 都 bit-exact (2026-11-18 dump 比對)。
+   * avg pool 只佔極小計算量，改 C 版幾乎不影響 ESP-NN 的加速。
+   * 2026-11-18 曾暫時改回原版，以 SD 重播重現錯誤結果，之後已恢復為 C 版。
+   */
+  if (false && depth % 4 == 0) { // S3 version only supports channels multiple of 4
     for (int batch = 0; batch < batches; ++batch) {
       esp_nn_avg_pool_s8(input_data, input_width, input_height,
                          output_data, output_width, output_height,

@@ -96,6 +96,12 @@ ROI 一律存 raw。改完要重新 build；SD 上已存的樣本兩種格式都
 原專案：drone 機率 > 0.30 就判 drone，否則取最大值；信賴度 = 該類別的機率，所以
 「drone 0.35」也算低信賴。一幀只要有一個 ROI 低信賴，整幀就存一個樣本。
 
+**非背景也存**（`INFER_SAVE_NON_BACKGROUND`，預設 1，與 ESP32 版相同）：預測不是 `background` 的
+（audio：drone / helicopter；video：drone / bird）不論信賴度都存，video 一幀有一個非背景 ROI 就存整幀。
+背景類別開機時依名稱從模型類別表找出（audio 是 0、video 是 2），開機 log 印 `Saving ...`。
+meta 的 `save_reason` = `low_conf` / `non_background` / `both`。統計的 `low` 只算低信賴，
+所以開啟後 `saved` 會大於 `low`。偵測多時樣本量大增，待上傳達 `INFER_MAX_PENDING_SAMPLES` 就不再存。
+
 **上傳**：滿 `INFER_UPLOAD_AFTER_SAMPLES`（20）才傳，ACK 驗證後才刪。
 上傳時擷取和推論照常進行，所以 32 KB I/O 緩衝切成兩半：cam_writer 和上傳各 16 KB。
 麥克風節點的上傳挑空檔：每次讀 SD（掃目錄、meta、每 16 KB 資料、刪檔）前呼叫 `mic_infer_wait_gap()`，
@@ -109,6 +115,36 @@ ROI 一律存 raw。改完要重新 build；SD 上已存的樣本兩種格式都
 **S3 加速**：預設沒開。TFLM 用 reference kernel（`ESP_NN_KERNEL_SET=none`），FD 和 logmel 是
 純 C。實際用到的硬體只有浮點單元、LCD_CAM + GDMA、Octal PSRAM、雙核心。ESP-NN（S3 的 SIMD）
 要用 `-DESP_NN_KERNEL_SET=all` 打開，開之前後要比對輸出是否合理：原專案在 ESP32 上開了會輸出均分。
+
+**逐層比對 (debug dump)**：一個 ROI / 音訊視窗的模型輸入與 CNN 每一層經 console 輸出，PC 端與 TFLite 逐層比對
+(`debug_dump.c` 共用格式，見 `docs/debug_2026_11_17.md` 第 4、5 項)：
+
+```
+# 即時 dump：音訊 (麥克風角色)
+idf.py -B build_debug -DINFER_AUDIO_DEBUG_DUMP=1 -DESP_NN_KERNEL_SET=all build flash
+python ..\..\TTGO_I2S_Record_Test\tools\receive_infer_node_dump.py --port COM14 --reset
+# 即時 dump：相機 (相機角色；要有 FD 候選才觸發)
+idf.py -B build_cam_debug -DINFER_CAM_DEBUG_DUMP=1 -DESP_NN_KERNEL_SET=all build flash
+python ..\..\TTGO_I2S_Record_Test\tools\receive_infer_node_dump.py --port COM14 --reset -o cam_dump
+# 比對 (相機、音訊都用這支；TensorFlow 在沒有 export.ps1 的 Python)
+& C:\Espressif\tools\idf-python\3.11.2\python.exe ..\tools\compare_debug_dumps.py --dump-dir cam_dump --png
+```
+
+**SD 重播四方比對** (`INFER_DEBUG_REPLAY=1`，`debug_replay.c`，見 `docs/debug_2026_11_17.md` 第 6 項)：
+同一組固定輸入分別在 ESP-NN 與 TFLM reference 兩個 build 上推論，PC 端並排比對
+node ESP-NN / node reference / PC C++ reference / PC Python int8.tflite (音訊另含 Python logmel-CMVN 前處理)：
+
+```
+# 1. 產生輸入檔，複製到 SD 卡的 debug/in/ (相機 cam_<名稱>.gray，麥克風 mic_<名稱>.wav)
+python ..\tools\make_debug_inputs.py --image drone.png --wav heli.wav --from-dump cam_dump -o debug_in
+# 2. 兩種 kernel 各燒一次、各收一次 (N = 輸入檔數，開機 log 的 "Replaying N input(s)")
+idf.py -B build_replay_nn  -DINFER_DEBUG_REPLAY=1 -DESP_NN_KERNEL_SET=all  build flash
+python ..\..\TTGO_I2S_Record_Test\tools\receive_infer_node_dump.py --port COM14 --reset --count N -o replay_dump
+idf.py -B build_replay_ref -DINFER_DEBUG_REPLAY=1 -DESP_NN_KERNEL_SET=none build flash
+python ..\..\TTGO_I2S_Record_Test\tools\receive_infer_node_dump.py --port COM14 --reset --count N -o replay_dump
+# 3. 比對
+& C:\Espressif\tools\idf-python\3.11.2\python.exe ..\tools\compare_debug_dumps.py --dump-dir replay_dump
+```
 
 ## 回傳給 server 的資料
 

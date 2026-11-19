@@ -65,3 +65,11 @@ esp_err_t sample_store_remove(const sample_entry_t *entry);
 esp_err_t sample_store_mark_rejected(const sample_entry_t *entry);
 
 const char *sample_store_media_name(sample_media_t media);
+
+/**
+ * 在類別表中找名稱為 INFER_BACKGROUND_LABEL 的索引；找不到回傳 -1。
+ * INFER_SAVE_NON_BACKGROUND=0 時一律回傳 -1 (不以非背景為存檔條件)。
+ */
+int sample_store_find_background(const char *const *class_names, int class_count);
+/** 樣本 meta 的 save_reason："low_conf" / "non_background" / "both" */
+const char *sample_store_save_reason(bool low_conf, bool non_background);

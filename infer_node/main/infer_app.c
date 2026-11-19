@@ -18,6 +18,7 @@
 #include "nvs_flash.h"
 
 #include "cam_infer.h"
+#include "debug_replay.h"
 #include "device_identity.h"
 #include "infer_config.h"
 #include "infer_health.h"
@@ -233,6 +234,15 @@ void app_main(void)
     }
 
     ESP_ERROR_CHECK(node_storage_init());
+#if INFER_DEBUG_REPLAY
+    /* 重播除錯：模型已在 pipeline init 初始化、SD 已掛載；即時管線不啟動 (debug_replay.h) */
+    const esp_err_t replay_err = debug_replay_run();
+    ESP_LOGW(TAG, "Debug replay finished: %s. Live inference is not started in replay builds; "
+             "flash a normal build to resume.", esp_err_to_name(replay_err));
+    while (true) {
+        vTaskDelay(portMAX_DELAY);
+    }
+#endif
     ESP_ERROR_CHECK(sample_store_init());
     uint8_t *io_buffer = node_storage_io_buffer_acquire("infer");
     if (!io_buffer) {
