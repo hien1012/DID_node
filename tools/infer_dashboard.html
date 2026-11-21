@@ -5,44 +5,54 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>DID 節點推論</title>
 <style>
-/* 伺服器可能在沒有對外網路的 LAN：不依賴任何 CDN，字型用系統字型。 */
+/* 伺服器可能在沒有對外網路的 LAN：不依賴任何 CDN，字型用系統字型。
+ * 配色：中性灰底、深色粗框、低彩度的類別色 (接近儀器 / 繪圖軟體的預設色)，不用帶色調的灰與螢光色。
+ * --frame = 面板、卡片的外框；--line = 表格列線與圖表格線 (較淡，避免搶過資料)。 */
 :root {
-  --bg: #eef1ef; --panel: #ffffff; --ink: #18211e; --muted: #5a6761; --line: #d6ddd9; --track: #e6ebe8;
-  --drone: #c2410c; --helicopter: #7c3aed; --bird: #0369a1; --background: #6b7a73;
-  --low: #b45309; --ok: #15803d; --bad: #b91c1c; --accent: #0f766e;
-  --t-down: #0369a1; --t-fd: #0f766e; --t-track: #a16207; --t-crop: #7c3aed; --t-roi: #c2410c; --t-other: #6b7a73;
+  --bg: #e8e8e5; --panel: #fafaf8; --ink: #1c1c1c; --muted: #575754; --frame: #4a4a47; --line: #c3c3be; --track: #dcdcd8;
+  --drone: #b3392a; --helicopter: #9c6d12; --bird: #2f5d8c; --background: #77776f;
+  --low: #a65a00; --ok: #3b7533; --bad: #ad2222; --accent: #2f4f7a;
+  --t-down: #2f5d8c; --t-fd: #3b7533; --t-track: #9c6d12; --t-crop: #7a5230; --t-roi: #b3392a; --t-other: #8a8a84;
   --mono: ui-monospace, "Cascadia Mono", Consolas, Menlo, monospace;
   --sans: "Segoe UI", "Microsoft JhengHei", "PingFang TC", "Noto Sans TC", system-ui, sans-serif;
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #101513; --panel: #181f1c; --ink: #e4ebe7; --muted: #97a59e; --line: #2a3430; --track: #252e2a;
-    --drone: #fb923c; --helicopter: #a78bfa; --bird: #38bdf8; --background: #8a9a92;
-    --low: #fbbf24; --ok: #4ade80; --bad: #f87171; --accent: #2dd4bf;
-    --t-down: #38bdf8; --t-fd: #2dd4bf; --t-track: #facc15; --t-crop: #a78bfa; --t-roi: #fb923c; --t-other: #8a9a92;
+    --bg: #1a1a1a; --panel: #242424; --ink: #e4e4e0; --muted: #a2a29c; --frame: #8c8c86; --line: #434341; --track: #333331;
+    --drone: #d9705a; --helicopter: #cf9f45; --bird: #6e9ccc; --background: #96968f;
+    --low: #dc9a3c; --ok: #7db471; --bad: #e06464; --accent: #86a6d4;
+    --t-down: #6e9ccc; --t-fd: #7db471; --t-track: #cf9f45; --t-crop: #b08a64; --t-roi: #d9705a; --t-other: #96968f;
   }
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.5 var(--sans); }
 header.top {
   display: flex; flex-wrap: wrap; align-items: center; gap: 8px 18px;
-  padding: 12px 18px; background: var(--panel); border-bottom: 1px solid var(--line);
+  padding: 12px 18px; background: var(--panel); border-bottom: 2px solid var(--frame);
   position: sticky; top: 0; z-index: 5;
 }
 h1 { font-size: 17px; margin: 0; font-weight: 600; }
 h2 { font-size: 13px; margin: 0; font-weight: 600; color: var(--muted); }
 main { display: grid; gap: 14px; padding: 14px 18px 40px; max-width: 1500px; margin: 0 auto; }
 .grid2 { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 440px), 1fr)); }
-.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.panel { background: var(--panel); border: 2px solid var(--frame); border-radius: 3px; padding: 14px; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
 .panel-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
 .panel-head .title { font-size: 15px; font-weight: 600; }
+/* 面板收起：只留標題列 (含最新時間等摘要)，頁籤一起藏；在 .grid2 裡不被旁邊的面板撐高 */
+.panel.folded { align-self: start; }
+.panel.folded > :not(.panel-head), .panel.folded .panel-head .tabs { display: none; }
+button.fold { display: inline-flex; align-items: baseline; gap: 6px; padding: 0; border: 0; background: none; color: var(--ink); text-align: left; }
+button.fold::before { content: "▾"; display: inline-block; width: 1em; font-size: 13px; color: var(--muted); }
+button.fold[aria-expanded="false"]::before { content: "▸"; }
+button.fold:hover .title { text-decoration: underline; }
+.fold-all { display: flex; gap: 6px; }
 .muted { color: var(--muted); }
 .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
-.pill { font: 12px var(--mono); padding: 1px 8px; border-radius: 99px; border: 1px solid currentColor; white-space: nowrap; }
+.pill { font: 12px var(--mono); padding: 1px 7px; border-radius: 2px; border: 1px solid currentColor; white-space: nowrap; }
 .pill.ok { color: var(--ok); } .pill.bad { color: var(--bad); } .pill.low { color: var(--low); } .pill.idle { color: var(--muted); }
-select, button { font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 5px; padding: 3px 9px; }
+select, button { font: inherit; color: var(--ink); background: var(--panel); border: 1px solid var(--frame); border-radius: 2px; padding: 3px 9px; }
 button { cursor: pointer; }
-button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--panel); }
+button[aria-pressed="true"] { background: var(--ink); border-color: var(--ink); color: var(--panel); }
 button:focus-visible, select:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 .now { display: grid; grid-template-columns: minmax(150px, 210px) 1fr; gap: 16px; align-items: center; }
@@ -64,7 +74,7 @@ button:focus-visible, select:focus-visible, a:focus-visible { outline: 2px solid
 .legend span::before { content: ""; display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 5px; background: var(--c); }
 
 .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(96px, 1fr)); gap: 8px; }
-.stat { border: 1px solid var(--line); border-radius: 6px; padding: 6px 9px; min-width: 0; }
+.stat { border: 1px solid var(--frame); border-radius: 2px; padding: 6px 9px; min-width: 0; }
 .stat .k { font-size: 11.5px; color: var(--muted); }
 .stat .v { font: 15px var(--mono); overflow-wrap: anywhere; }
 .stat.warn .v { color: var(--low); } .stat.bad .v { color: var(--bad); }
@@ -79,7 +89,7 @@ canvas.chart { width: 100%; height: 150px; display: block; }
 .scroll { overflow-x: auto; }
 table { border-collapse: collapse; width: 100%; font-size: 13px; }
 th, td { padding: 5px 8px; border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap; }
-th { color: var(--muted); font-weight: 500; font-size: 12px; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; border-bottom: 2px solid var(--frame); }
 td.num, th.num { text-align: right; font-family: var(--mono); }
 tr.sub td:first-child { padding-left: 22px; color: var(--muted); }
 tr.sum td { font-weight: 600; }
@@ -90,9 +100,9 @@ tr.low td:first-child { box-shadow: inset 3px 0 0 var(--low); }
 
 .tabs { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 .gallery { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr)); }
-.card { border: 1px solid var(--line); border-radius: 7px; padding: 10px; display: flex; flex-direction: column; gap: 7px; min-width: 0; }
+.card { border: 2px solid var(--frame); border-radius: 3px; padding: 10px; display: flex; flex-direction: column; gap: 7px; min-width: 0; }
 .card .head { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; flex-wrap: wrap; }
-.frame-wrap { position: relative; line-height: 0; background: #000; border-radius: 4px; overflow: hidden; }
+.frame-wrap { position: relative; line-height: 0; background: #000; border-radius: 2px; overflow: hidden; }
 .frame-wrap img { width: 100%; height: auto; display: block; image-rendering: auto; }
 .frame-wrap svg { position: absolute; inset: 0; width: 100%; height: 100%; }
 .rois { display: flex; flex-wrap: wrap; gap: 6px; }
@@ -101,6 +111,9 @@ tr.low td:first-child { box-shadow: inset 3px 0 0 var(--low); }
 audio { width: 100%; height: 32px; }
 canvas.wave { width: 100%; height: 56px; display: block; background: var(--track); border-radius: 4px; }
 details summary { cursor: pointer; font-size: 12px; color: var(--muted); }
+/* 面板裡的小節 (每階段耗時)：標題本身就是開關，h2 維持原本的樣式 */
+details.sub-fold > summary h2 { display: inline; }
+details.sub-fold > summary:hover h2 { text-decoration: underline; }
 details pre { font: 11.5px/1.45 var(--mono); margin: 6px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .empty { color: var(--muted); padding: 18px 4px; }
 .pager { display: flex; gap: 8px; align-items: center; justify-content: flex-end; font-size: 12.5px; }
@@ -115,11 +128,15 @@ details pre { font: 11.5px/1.45 var(--mono); margin: 6px 0 0; white-space: pre-w
   <span id="link" class="pill idle">連線中…</span>
   <span id="node-state" class="muted"></span>
   <span id="clock" class="muted mono" style="margin-left:auto"></span>
+  <span class="fold-all">
+    <button type="button" id="unfold-all">全部展開</button>
+    <button type="button" id="fold-all">全部收起</button>
+  </span>
 </header>
 
 <main>
   <div class="grid2">
-    <section class="panel" aria-labelledby="mic-title">
+    <section class="panel" aria-labelledby="mic-title" data-fold="mic">
       <div class="panel-head">
         <span class="title" id="mic-title">麥克風</span>
         <span class="muted mono" id="mic-when">尚無資料</span>
@@ -140,7 +157,7 @@ details pre { font: 11.5px/1.45 var(--mono); margin: 6px 0 0; white-space: pre-w
       <div class="progress" id="mic-progress"></div>
     </section>
 
-    <section class="panel" aria-labelledby="cam-title">
+    <section class="panel" aria-labelledby="cam-title" data-fold="cam">
       <div class="panel-head">
         <span class="title" id="cam-title">相機</span>
         <span class="muted mono" id="cam-when">尚無資料</span>
@@ -159,13 +176,13 @@ details pre { font: 11.5px/1.45 var(--mono); margin: 6px 0 0; white-space: pre-w
           <span style="--c:var(--t-down)">下採樣</span><span style="--c:var(--t-fd)">幀差 FD</span><span style="--c:var(--t-track)">追蹤</span><span style="--c:var(--t-crop)">裁切</span><span style="--c:var(--t-roi)">CNN</span><span style="--c:var(--t-other)">回報與其他</span>
         </div>
       </div>
-      <div>
-        <h2 id="stage-title">每階段耗時（每幀平均，沒有 ROI 的幀 CNN 算 0）</h2>
+      <details class="sub-fold" id="stage-fold" data-fold="stages" open>
+        <summary><h2 id="stage-title">每階段耗時（每幀平均，沒有 ROI 的幀 CNN 算 0）</h2></summary>
         <div class="scroll"><table>
           <thead><tr><th>階段</th><th class="num">平均 ms</th><th class="num">最長 ms</th><th>占處理時間</th></tr></thead>
           <tbody id="stage-table"></tbody>
         </table></div>
-      </div>
+      </details>
       <details>
         <summary id="ops-title">CNN 每一層耗時（尚無資料）</summary>
         <div class="scroll"><table>
@@ -178,7 +195,7 @@ details pre { font: 11.5px/1.45 var(--mono); margin: 6px 0 0; white-space: pre-w
     </section>
   </div>
 
-  <section class="panel" aria-labelledby="usage-title">
+  <section class="panel" aria-labelledby="usage-title" data-fold="usage">
     <div class="panel-head">
       <span class="title" id="usage-title">推論一次，每個 task 占用的 CPU</span>
       <span class="muted mono" id="usage-summary">尚無資料</span>
@@ -190,7 +207,7 @@ details pre { font: 11.5px/1.45 var(--mono); margin: 6px 0 0; white-space: pre-w
     </table></div>
   </section>
 
-  <section class="panel" aria-labelledby="sample-title">
+  <section class="panel" aria-labelledby="sample-title" data-fold="samples">
     <div class="panel-head">
       <span class="title" id="sample-title">低信賴度樣本（已回傳）</span>
       <div class="tabs" id="sample-tabs">
@@ -206,7 +223,7 @@ details pre { font: 11.5px/1.45 var(--mono); margin: 6px 0 0; white-space: pre-w
     </div>
   </section>
 
-  <section class="panel" aria-labelledby="log-title">
+  <section class="panel" aria-labelledby="log-title" data-fold="log">
     <div class="panel-head">
       <span class="title" id="log-title">最近的判斷</span>
       <div class="tabs" id="log-tabs">
@@ -582,13 +599,14 @@ function sampleCard(sample) {
 }
 
 async function drawWave(canvas) {
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (!w || !h) return;     /* 面板收起時量不到大小：保留 data-wav，展開時再畫 */
   const url = canvas.dataset.wav;
   delete canvas.dataset.wav;
   try {
     const buffer = await (await fetch(url)).arrayBuffer();
     const pcm = new Int16Array(buffer, 44, Math.floor((buffer.byteLength - 44) / 2));
     const ratio = window.devicePixelRatio || 1;
-    const w = canvas.clientWidth, h = canvas.clientHeight;
     canvas.width = Math.round(w * ratio); canvas.height = Math.round(h * ratio);
     const g = canvas.getContext("2d");
     g.setTransform(ratio, 0, 0, ratio, 0, 0);
@@ -674,6 +692,47 @@ $("log-tabs").addEventListener("click", (e) => {
 $("pager-old").addEventListener("click", () => { state.offset += PAGE; loadSamples(); });
 $("pager-new").addEventListener("click", () => { state.offset = Math.max(0, state.offset - PAGE); loadSamples(); });
 window.addEventListener("resize", () => { if (state.overview) drawFrameChart((state.overview.frames || []).slice().reverse()); });
+
+/* 面板收起 / 展開：點標題切換，狀態存在 localStorage，重新整理後維持 */
+const FOLD_KEY = "did-dashboard-folded";
+function loadFolded() {
+  try { return new Set(JSON.parse(localStorage.getItem(FOLD_KEY) || "[]")); } catch (err) { return new Set(); }
+}
+function saveFolded(folded) {
+  try { localStorage.setItem(FOLD_KEY, JSON.stringify([...folded])); } catch (err) { /* 無痕模式等：只是不記住 */ }
+}
+const folded = loadFolded();
+function setFolded(panel, fold) {
+  panel.classList.toggle("folded", fold);
+  panel.querySelector("button.fold").setAttribute("aria-expanded", String(!fold));
+  if (fold) folded.add(panel.dataset.fold); else folded.delete(panel.dataset.fold);
+  if (!fold) {
+    /* 收起時 canvas 沒有大小，展開後補畫 */
+    if (panel.dataset.fold === "cam" && state.overview) drawFrameChart((state.overview.frames || []).slice().reverse());
+    panel.querySelectorAll("canvas.wave[data-wav]").forEach(drawWave);
+  }
+}
+const panels = [...document.querySelectorAll("section.panel[data-fold]")];
+panels.forEach((panel) => {
+  const title = panel.querySelector(".panel-head .title");
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "fold";
+  title.replaceWith(button);
+  button.append(title);
+  setFolded(panel, folded.has(panel.dataset.fold));
+  button.addEventListener("click", () => { setFolded(panel, !panel.classList.contains("folded")); saveFolded(folded); });
+});
+/* 面板內的小節用原生 <details>，收起狀態記在同一個集合 */
+document.querySelectorAll("details.sub-fold[data-fold]").forEach((details) => {
+  details.open = !folded.has(details.dataset.fold);
+  details.addEventListener("toggle", () => {
+    if (details.open) folded.delete(details.dataset.fold); else folded.add(details.dataset.fold);
+    saveFolded(folded);
+  });
+});
+$("fold-all").addEventListener("click", () => { panels.forEach((p) => setFolded(p, true)); saveFolded(folded); });
+$("unfold-all").addEventListener("click", () => { panels.forEach((p) => setFolded(p, false)); saveFolded(folded); });
 
 refresh().then(loadSamples);
 setInterval(refresh, 1000);
