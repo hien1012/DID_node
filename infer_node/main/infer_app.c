@@ -89,15 +89,34 @@ static esp_err_t init_nvs(void)
     return err;
 }
 
+static unsigned bytes_to_kb(size_t bytes)
+{
+    return (unsigned)(bytes / 1024U);
+}
+
+/*
+ * MALLOC_CAP_INTERNAL 包含只能 32-bit 存取的 IRAM heap，不能當一般 buffer 用，要和 DRAM 分開看。
+ * DRAM = INTERNAL | 8BIT (含 D/IRAM 共用區)；IRAM = INTERNAL − DRAM。
+ * 符合 INTERNAL|8BIT 的 heap 是 INTERNAL 的子集，free / min 都是逐 heap 加總，所以相減是精確的；
+ * 最大連續區塊不能相減，IRAM 不印。
+ */
 static void log_heap(const char *stage)
 {
-    ESP_LOGI(TAG, "HEAP [%s] internal free=%u largest=%u min=%u | PSRAM free=%u largest=%u",
+    const uint32_t dram_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    const size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    const size_t internal_min = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+    const size_t dram_free = heap_caps_get_free_size(dram_caps);
+    const size_t dram_min = heap_caps_get_minimum_free_size(dram_caps);
+    ESP_LOGI(TAG, "HEAP [%s] DRAM free=%u KB largest=%u KB min=%u KB | IRAM free=%u KB min=%u KB"
+             " | PSRAM free=%u KB largest=%u KB",
              stage,
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+             bytes_to_kb(dram_free),
+             bytes_to_kb(heap_caps_get_largest_free_block(dram_caps)),
+             bytes_to_kb(dram_min),
+             bytes_to_kb(internal_free - dram_free),
+             bytes_to_kb(internal_min - dram_min),
+             bytes_to_kb(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+             bytes_to_kb(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)));
 }
 
 /*

@@ -32,6 +32,12 @@
 #define HEARTBEAT_FORMAT_VERSION  1
 #define HEARTBEAT_TASK_STACK      6144U
 #define HEARTBEAT_TASK_PRIORITY   4U
+/* CAM 角色綁 Core 1，不搶 Core 0 的 cam_infer (理由同 result_report.c 的 TASK_CORE)；MIC 角色不綁 */
+#if !CONFIG_FREERTOS_UNICORE && INFER_CAM_ENABLE
+#define HEARTBEAT_TASK_CORE       1
+#else
+#define HEARTBEAT_TASK_CORE       tskNO_AFFINITY
+#endif
 #define HEARTBEAT_TIMEOUT_MS      10000
 
 typedef struct {
@@ -264,8 +270,8 @@ esp_err_t infer_health_start(void)
     if (!s_mutex) {
         return ESP_ERR_NO_MEM;
     }
-    if (xTaskCreate(heartbeat_task, "heartbeat", HEARTBEAT_TASK_STACK, NULL,
-                    HEARTBEAT_TASK_PRIORITY, NULL) != pdPASS) {
+    if (xTaskCreatePinnedToCore(heartbeat_task, "heartbeat", HEARTBEAT_TASK_STACK, NULL,
+                                HEARTBEAT_TASK_PRIORITY, NULL, HEARTBEAT_TASK_CORE) != pdPASS) {
         vSemaphoreDelete(s_mutex);
         s_mutex = NULL;
         return ESP_ERR_NO_MEM;

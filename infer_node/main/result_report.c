@@ -30,6 +30,16 @@
 #define RECORD_MAX_BYTES    1200U   /* 一筆 JSON 的上限，留空間才繼續加；最長的是 cnn_ops */
 #define TASK_STACK_BYTES    6144U
 #define TASK_PRIORITY       2U
+/*
+ * CAM 角色：不綁核心時 Core 1 幾乎一直被 cam_detect (5) 佔著，這個 task 實際上都跑在 Core 0，
+ * 搶占優先權 1 的 cam_infer (連續多個 ROI 時每次推論多 30–50 ms)。綁 Core 1 只在 FD 空檔執行。
+ * MIC 角色 Core 1 是 audio_cnn (3)，維持不綁。
+ */
+#if !CONFIG_FREERTOS_UNICORE && INFER_CAM_ENABLE
+#define TASK_CORE           1
+#else
+#define TASK_CORE           tskNO_AFFINITY
+#endif
 #define HTTP_TIMEOUT_MS     5000
 #define RETRY_DELAY_MS      2000U
 
@@ -276,8 +286,8 @@ esp_err_t result_report_start(void)
     if (!s_queue) {
         return ESP_ERR_NO_MEM;
     }
-    if (xTaskCreate(result_report_task, "result_report", TASK_STACK_BYTES, NULL,
-                    TASK_PRIORITY, NULL) != pdPASS) {
+    if (xTaskCreatePinnedToCore(result_report_task, "result_report", TASK_STACK_BYTES, NULL,
+                                TASK_PRIORITY, NULL, TASK_CORE) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
