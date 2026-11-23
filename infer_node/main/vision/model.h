@@ -28,4 +28,8 @@ limitations under the License.
 extern const unsigned char g_model[];
 extern const int g_model_len;
 
+/* 舊版 cam 模型 (conv → ReLU → BN)，model_old.cc；CAM_MODEL_USE_OLD=1 時才用 */
+extern const unsigned char g_model_old[];
+extern const int g_model_old_len;
+
 #endif  // TENSORFLOW_LITE_MICRO_EXAMPLES_HELLO_WORLD_MODEL_H_

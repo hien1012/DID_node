@@ -21,6 +21,7 @@ idf_component_register(
         "vision/fd_mix.c"
         "vision/stage2.c"
         "vision/model.cc"
+        "vision/model_old.cc"
         "../../main/camera_registers.c"
         "../../main/device_identity.c"
         "../../main/time_sync.c"

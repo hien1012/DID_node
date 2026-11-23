@@ -18,6 +18,19 @@
 namespace {
 
 constexpr char TAG[] = "CAM_MODEL";
+
+/* 模型選擇見 cam_model.h 的 CAM_MODEL_USE_OLD；兩版 op 不同，resolver 也跟著換 */
+#if CAM_MODEL_USE_OLD
+const unsigned char *const kModelData = g_model_old;
+const int &kModelBytes = g_model_old_len;
+constexpr char kModelVariant[] = "old (conv-relu-bn)";
+constexpr int kResolverOps = 9;
+#else
+const unsigned char *const kModelData = g_model;
+const int &kModelBytes = g_model_len;
+constexpr char kModelVariant[] = "current (conv-bn-relu)";
+constexpr int kResolverOps = 10;
+#endif
 /* 原專案保留 1.39 MB；activation 峰值 131 KB，再加 tensor 結構與 kernel scratch。
  * 開機 log 的 used 是實際用量，可依此再調小。 */
 constexpr int kTensorArenaSize = 320 * 1024;
@@ -101,7 +114,7 @@ extern "C" esp_err_t cam_model_init(void)
         return ESP_OK;
     }
 
-    const tflite::Model *model = tflite::GetModel(g_model);
+    const tflite::Model *model = tflite::GetModel(kModelData);
     if (model->version() != TFLITE_SCHEMA_VERSION) {
         ESP_LOGE(TAG, "Model schema %d != supported %d", static_cast<int>(model->version()),
                  TFLITE_SCHEMA_VERSION);
@@ -115,12 +128,21 @@ extern "C" esp_err_t cam_model_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    static tflite::MicroMutableOpResolver<10> resolver;
-    if (resolver.AddConv2D() != kTfLiteOk || resolver.AddDepthwiseConv2D() != kTfLiteOk ||
-        resolver.AddFullyConnected() != kTfLiteOk || resolver.AddSoftmax() != kTfLiteOk ||
-        resolver.AddMaxPool2D() != kTfLiteOk || resolver.AddReshape() != kTfLiteOk ||
-        resolver.AddQuantize() != kTfLiteOk || resolver.AddShape() != kTfLiteOk ||
-        resolver.AddStridedSlice() != kTfLiteOk || resolver.AddPack() != kTfLiteOk) {
+    static tflite::MicroMutableOpResolver<kResolverOps> resolver;
+    bool resolver_ok =
+        resolver.AddConv2D() == kTfLiteOk && resolver.AddDepthwiseConv2D() == kTfLiteOk &&
+        resolver.AddFullyConnected() == kTfLiteOk && resolver.AddSoftmax() == kTfLiteOk &&
+        resolver.AddMaxPool2D() == kTfLiteOk && resolver.AddReshape() == kTfLiteOk &&
+        resolver.AddQuantize() == kTfLiteOk;
+#if CAM_MODEL_USE_OLD
+    /* 舊模型：ReLU 後面的 BN = 逐元素乘 scale、加 shift */
+    resolver_ok = resolver_ok && resolver.AddMul() == kTfLiteOk && resolver.AddAdd() == kTfLiteOk;
+#else
+    /* 新模型：Flatten 在 batch=None 下多出的 SHAPE → STRIDED_SLICE → PACK */
+    resolver_ok = resolver_ok && resolver.AddShape() == kTfLiteOk &&
+                  resolver.AddStridedSlice() == kTfLiteOk && resolver.AddPack() == kTfLiteOk;
+#endif
+    if (!resolver_ok) {
         ESP_LOGE(TAG, "Op resolver setup failed");
         return ESP_FAIL;
     }
@@ -146,8 +168,8 @@ extern "C" esp_err_t cam_model_init(void)
     }
 
     s_interpreter = &interpreter;
-    ESP_LOGI(TAG, "Camera model ready: model=%d bytes arena=%d used=%u bytes",
-             g_model_len, kTensorArenaSize,
+    ESP_LOGI(TAG, "Camera model ready: variant=%s model=%d bytes arena=%d used=%u bytes",
+             kModelVariant, kModelBytes, kTensorArenaSize,
              static_cast<unsigned>(s_interpreter->arena_used_bytes()));
     return ESP_OK;
 }

@@ -16,8 +16,18 @@ extern "C" {
 #define CAM_MODEL_ROI_SIZE     64
 #define CAM_MODEL_ROI_BYTES    (CAM_MODEL_ROI_SIZE * CAM_MODEL_ROI_SIZE)
 #define CAM_MODEL_CLASS_COUNT  3
-/* 計時最多記幾層；目前的模型有 23 層 */
+/* 計時最多記幾層；新模型 20 層、舊模型 23 層 */
 #define CAM_MODEL_MAX_OPS      28U
+
+/*
+ * 選擇 cam 模型 (A/B 測試用)；輸入、輸出、類別順序兩版相同，只有架構不同。
+ *   0：model.cc     (目前版本) DW_CONV → CONV_2D → BN → ReLU，BN 摺進卷積，沒有 MUL / ADD
+ *   1：model_old.cc (9a68ad4)  DW_CONV → CONV_2D → ReLU → BN，BN 留成 MUL / ADD
+ * 放這裡而不是 infer_config.h：cam_model.cc 是 C++，infer_config.h / app_config.h 用 C 的 _Static_assert。
+ */
+#ifndef CAM_MODEL_USE_OLD
+#define CAM_MODEL_USE_OLD      0
+#endif
 
 typedef struct {
     const char *name;   /* TFLite op 名稱，常數字串 */
