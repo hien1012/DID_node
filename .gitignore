@@ -98,3 +98,6 @@ analysis_out/
 did_node_status/
 build_with_ESPNN/
 build_nofc/
+build_ov7/
+build_i2s/
+build_c/
