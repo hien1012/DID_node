@@ -115,12 +115,12 @@ extern "C" esp_err_t cam_model_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    static tflite::MicroMutableOpResolver<9> resolver;
+    static tflite::MicroMutableOpResolver<10> resolver;
     if (resolver.AddConv2D() != kTfLiteOk || resolver.AddDepthwiseConv2D() != kTfLiteOk ||
         resolver.AddFullyConnected() != kTfLiteOk || resolver.AddSoftmax() != kTfLiteOk ||
         resolver.AddMaxPool2D() != kTfLiteOk || resolver.AddReshape() != kTfLiteOk ||
-        resolver.AddQuantize() != kTfLiteOk || resolver.AddMul() != kTfLiteOk ||
-        resolver.AddAdd() != kTfLiteOk) {
+        resolver.AddQuantize() != kTfLiteOk || resolver.AddShape() != kTfLiteOk ||
+        resolver.AddStridedSlice() != kTfLiteOk || resolver.AddPack() != kTfLiteOk) {
         ESP_LOGE(TAG, "Op resolver setup failed");
         return ESP_FAIL;
     }
