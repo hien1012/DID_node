@@ -1,7 +1,7 @@
 /*
  * 推論韌體開機流程與背景迴圈 (由 main/app_main.c 改寫)。
  *
- * 一塊板子只跑一條管線，相機或麥克風 (infer_config.h 的 INFER_NODE_ROLE)，並連續運作。
+ * 依 infer_config.h 的 INFER_NODE_ROLE 跑相機、麥克風或兩者 (INFER_ROLE_BOTH)，並連續運作。
  * 這裡的迴圈只負責把累積滿的低信賴樣本上傳，並定期校時；上傳時擷取與推論照常進行。
  */
 #include <stdbool.h>
@@ -188,6 +188,7 @@ void app_main(void)
     (void)status_led_off();
     ESP_ERROR_CHECK(device_identity_init(APP_DEVICE_ID_PREFIX));
     ESP_LOGI(TAG, "Device ID: %s, role: %s", device_identity_get(),
+             (INFER_CAM_ENABLE && INFER_MIC_ENABLE) ? "camera + microphone" :
              INFER_CAM_ENABLE ? "camera" : "microphone");
     time_sync_configure_timezone();
 

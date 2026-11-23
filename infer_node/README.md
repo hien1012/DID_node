@@ -3,8 +3,8 @@
 獨立的 ESP-IDF 專案，和上層的 did_node（`../main`）平行存在，互不影響。
 Wi-Fi、server 位址等設定沿用 `../main/app_config.h`；推論專屬的設定在 `main/infer_config.h`。
 
-**一塊板子只跑一個功能**：同一份程式碼，燒錄前改 `main/infer_config.h` 的 `INFER_NODE_ROLE`
-（`INFER_ROLE_CAM` 或 `INFER_ROLE_MIC`）再 build。沒選到的管線不會初始化，模型也不會連結進韌體。
+**功能在燒錄前選**：同一份程式碼，改 `main/infer_config.h` 的 `INFER_NODE_ROLE` 再 build：
+`INFER_ROLE_CAM`、`INFER_ROLE_MIC`（只跑一條，另一條不初始化），或 `INFER_ROLE_BOTH`（相機 + 麥克風同時跑，配置見下方）。
 開機 log 的 `Device ID: ..., role: ...` 可確認燒的是哪一種。
 
 ## Build / flash
@@ -59,6 +59,20 @@ FD 每一幀都要處理，不能被 CNN 擋住；CNN 晚一點沒關係。
   heartbeat      不綁核心 prio 4   每分鐘 /heartbeat，兼 Wi-Fi watchdog
   main           Core 0 prio 1    滿 20 個樣本就上傳，定期校時
 ```
+
+**相機 + 麥克風（`INFER_ROLE_BOTH`）**：相機的 task 完全照上表；麥克風改成擷取跟 FD 同核心、推論跟影像 CNN 同核心。
+
+```
+Core 1  cam_task 23 > mic_capture 7 > camera_capture 6 > cam_detect 5
+Core 0  wifi 23 > cam_writer 5 > audio_infer 3 > audio_writer 2 > cam_infer 1 = main 1
+```
+
+- `audio_infer` = logmel + CNN 依序在同一個 task（兩段同核心，分兩個 task 不會重疊，只多一個 stack），每 2 s 約 230 ms。
+- 音訊優先於影像 CNN：音訊有期限（有樣本在寫 SD 時 2 s），影像 CNN 晚一點只會讓候選重送；
+  代價是 `cam_infer` 每 2 s 被搶占一次約 230 ms，`preempt` 會反映。
+- I2S DMA 每 32 ms 一次 EOF 中斷，中斷留在 Core 0（init 在 app_main），喚醒 Core 1 的 `mic_capture` 要跨核心；
+  DMA 8 塊 × 32 ms，最多 224 ms 不讀不會被覆蓋。`mic_capture` 每 64 ms 讀一次、約 0.3 ms。
+- `INFER_TASK_USAGE_ENABLE` 不能和 BOTH 一起開（統計只支援一條管線）；SD 重播只重播相機。
 
 候選多的時候 `cam_infer` 會一直有工作做，所以優先權不能高於綁在同一核心的 `main`，否則上傳會停擺；
 每個工作結束再讓出 1 tick，IDLE0 才餵得到看門狗。

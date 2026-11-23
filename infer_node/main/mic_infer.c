@@ -11,8 +11,18 @@
  *   audio_writer  (Core 1, 優先權 2)：寫 WAV，寫完才還視窗。SD 偶爾一次寫入要幾百 ms 以上，
  *     不能算進推論的 2 s 預算；優先權低於 audio_cnn，新視窗一到就先推論。
  *
+ * INFER_ROLE_BOTH (相機 + 麥克風同時跑) 時改成：
+ *   Core 1：mic_capture (優先權 7) 和相機的 cam_task / camera_capture / cam_detect (FD) 同核心。
+ *     優先權高於 FD，每 64 ms 約 0.3 ms，對 FD 每幀 200 ms 的期限影響約 0.4%。
+ *     I2S DMA 每 32 ms 一次 EOF 中斷，中斷仍在 Core 0 (init 在 app_main)，喚醒 mic_capture 要跨核心；
+ *     DMA 8 塊 × 32 ms，最多 224 ms 不讀不會被覆蓋，跨核心喚醒的延遲遠小於此。
+ *   Core 0：audio_infer (優先權 3) = logmel + CNN 在同一個 task 依序做。兩段同核心，分兩個 task 不會重疊，
+ *     只多一個 stack。優先權高於 cam_infer (1)：音訊有期限 (有樣本在寫 SD 時 2 s)，影像 CNN 晚一點只會讓候選重送。
+ *     代價是 cam_infer 每 2 s 被搶占一次約 230 ms，會反映在 cam_infer log 的 preempt。
+ *   audio_writer (Core 0, 優先權 2)：和 cam_writer 同核心，高於 cam_infer、低於 audio_infer。
+ *
  * 三塊 64 KB 視窗緩衝在 PSRAM (收 1 + 推論 1 + 寫 SD 1)，索引在
- * s_free_windows → s_full_windows → s_feature_jobs → (s_save_jobs) → s_free_windows 間循環。
+ * s_free_windows → s_full_windows → s_feature_jobs (分兩個 task 時) → (s_save_jobs) → s_free_windows 間循環。
  * 特徵緩衝跟著視窗索引走，所以 logmel 可以先算下一個視窗，不會蓋掉 CNN 還在用的特徵。
  * 第一個 2 s 只有收資料；之後每一輪都是「收這一個、推論上一個」。
  * 三塊都在忙時丟掉新資料並計數，不會擋住 I2S。
@@ -92,9 +102,21 @@
 /* 上傳空檔：離下一個視窗收滿至少還有這麼久，才讀下一段 SD 送出 (一段 16 KB 約數十 ms) */
 #define UPLOAD_GAP_MARGIN_US     300000LL
 
+/*
+ * 1：logmel 和 CNN 在同一個 task (audio_infer) 依序做，不建立 audio_cnn。
+ * 相機 + 麥克風同時跑時兩段都在 Core 0，分成兩個 task 不會重疊，只多佔一個 stack。
+ */
+#define AUDIO_SINGLE_INFER_TASK  (INFER_NODE_ROLE == INFER_ROLE_BOTH)
+
 #define CAPTURE_TASK_STACK_BYTES 4096U
-#define FEATURE_TASK_STACK_BYTES 6144U  /* logmel 的大陣列都在 s_feature_workspace (PSRAM) */
 #define CNN_TASK_STACK_BYTES     8192U  /* TFLM Invoke + 浮點 log + result_report_push */
+#if AUDIO_SINGLE_INFER_TASK
+#define FEATURE_TASK_STACK_BYTES CNN_TASK_STACK_BYTES   /* logmel 與 CNN 依序執行，取兩者較大的 */
+#define FEATURE_TASK_NAME        "audio_infer"
+#else
+#define FEATURE_TASK_STACK_BYTES 6144U  /* logmel 的大陣列都在 s_feature_workspace (PSRAM) */
+#define FEATURE_TASK_NAME        "audio_feature"
+#endif
 #define WRITER_TASK_STACK_BYTES  4096U  /* snprintf 浮點 + FATFS (LFN 在 heap) */
 #define CAPTURE_TASK_PRIORITY    7U
 #define FEATURE_TASK_PRIORITY    3U
@@ -104,6 +126,11 @@
 #define CAPTURE_TASK_CORE        0
 #define FEATURE_TASK_CORE        0
 #define CNN_TASK_CORE            0
+#define WRITER_TASK_CORE         0
+#elif INFER_NODE_ROLE == INFER_ROLE_BOTH
+/* 擷取和 FD 同在 Core 1 (避開 Wi-Fi)；推論、寫 SD 和影像 CNN 同在 Core 0。理由見檔案開頭 */
+#define CAPTURE_TASK_CORE        1
+#define FEATURE_TASK_CORE        0
 #define WRITER_TASK_CORE         0
 #else
 /* Core 0 有 Wi-Fi (優先權 23)；擷取每 64 ms 只讀一次、約 0.3 ms，DMA 還有 256 ms 緩衝 */
@@ -173,16 +200,18 @@ static char *s_meta = NULL;                 /* PSRAM */
 
 static StaticQueue_t s_free_queue_control;
 static StaticQueue_t s_full_queue_control;
-static StaticQueue_t s_feature_queue_control;
 static StaticQueue_t s_save_queue_control;
 static uint8_t s_free_queue_storage[WINDOW_COUNT * sizeof(uint8_t)];
 static uint8_t s_full_queue_storage[WINDOW_COUNT * sizeof(full_window_t)];
-static uint8_t s_feature_queue_storage[WINDOW_COUNT * sizeof(feature_job_t)];
 static uint8_t s_save_queue_storage[WINDOW_COUNT * sizeof(save_job_t)];
 static QueueHandle_t s_free_windows = NULL;
 static QueueHandle_t s_full_windows = NULL;
-static QueueHandle_t s_feature_jobs = NULL;  /* 以下深度都 = 視窗數，一定放得下 */
-static QueueHandle_t s_save_jobs = NULL;
+static QueueHandle_t s_save_jobs = NULL;     /* 深度都 = 視窗數，一定放得下 */
+#if !AUDIO_SINGLE_INFER_TASK
+static StaticQueue_t s_feature_queue_control;
+static uint8_t s_feature_queue_storage[WINDOW_COUNT * sizeof(feature_job_t)];
+static QueueHandle_t s_feature_jobs = NULL;  /* audio_feature → audio_cnn */
+#endif
 
 /*
  * task_usage 的推論區間 (logmel + CNN) 跨兩個 task、兩顆核心：audio_feature 開始、audio_cnn 結束。
@@ -206,12 +235,17 @@ static WORD_ALIGNED_ATTR uint8_t s_write_buffer[WRITE_BUFFER_BYTES];   /* 只有
 
 static StaticTask_t s_capture_tcb;
 static StaticTask_t s_feature_tcb;
-static StaticTask_t s_cnn_tcb;
 static StaticTask_t s_writer_tcb;
 static StackType_t s_capture_stack[CAPTURE_TASK_STACK_BYTES];
 static StackType_t s_feature_stack[FEATURE_TASK_STACK_BYTES];
-static StackType_t s_cnn_stack[CNN_TASK_STACK_BYTES];
 static StackType_t s_writer_stack[WRITER_TASK_STACK_BYTES];
+#if !AUDIO_SINGLE_INFER_TASK
+static StaticTask_t s_cnn_tcb;
+static StackType_t s_cnn_stack[CNN_TASK_STACK_BYTES];
+#endif
+
+/* audio_cnn_process() 的推論統計次數：只由做 CNN 的那個 task 使用 */
+static uint32_t s_usage_inferences = 0;
 
 /* 推論或寫 SD 結束：視窗回到空閒佇列 */
 static void release_window(uint8_t buffer)
@@ -547,7 +581,112 @@ static esp_err_t save_sample(const int16_t *pcm, const infer_audio_record_t *rec
 }
 
 /* ==========================================================
- *  audio_feature (Core 0)：logmel，特徵交給 audio_cnn
+ *  CNN 一個視窗：結果立刻回傳，低信賴度交給 audio_writer
+ *  由 audio_cnn (分兩個 task 時) 或 audio_infer (AUDIO_SINGLE_INFER_TASK) 呼叫，只有一個 task 會用
+ * ========================================================== */
+static void audio_cnn_process(const feature_job_t *job)
+{
+    const full_window_t *full = &job->window;
+    const int64_t cnn_start_us = esp_timer_get_time();
+    float probs[AUDIO_MODEL_CLASS_COUNT] = {0};
+    int pred = -1;
+    const esp_err_t model_err = audio_model_predict(s_features[full->buffer], probs, &pred);
+    const int64_t cnn_done_us = esp_timer_get_time();
+    if (model_err != ESP_OK || pred < 0) {
+        ESP_LOGE(TAG, "CNN failed: %s", esp_err_to_name(model_err));
+        if (job->usage_open) {
+            usage_release();
+        }
+        release_window(full->buffer);
+        return;
+    }
+    if (job->usage_open) {
+        task_usage_end();
+    }
+
+    infer_record_t record = {.type = INFER_RECORD_AUDIO};
+    infer_audio_record_t *audio = &record.data.audio;
+    audio->window = full->window;
+    audio->start_epoch_ms = infer_epoch_ms_from_timer(full->start_us);
+    audio->end_epoch_ms = infer_epoch_ms_from_timer(full->end_us);
+    audio->queue_us = (uint32_t)(job->feature_start_us - full->end_us);
+    audio->feature_us = (uint32_t)(job->feature_done_us - job->feature_start_us);
+    audio->invoke_us = (uint32_t)(cnn_done_us - cnn_start_us);
+    audio->overflows = full->overflows;
+    audio->dropped_windows = s_dropped_windows;
+    audio->pred = (uint8_t)pred;
+    audio->label = g_audio_class_names[pred];
+    audio->conf = probs[pred];
+    memcpy(audio->probs, probs, sizeof(audio->probs));
+    audio->low_conf = probs[pred] < INFER_LOW_CONF_THRESHOLD;
+    const bool non_background = s_background_class >= 0 && pred != s_background_class;
+    result_report_push(&record);    /* 不等 SD：判斷結果馬上送出 */
+
+    /* handoff = logmel 結束到 CNN 開始 (分兩個 task 時是跨核心交接 + 等 Core 1；合成一個 task 時約 0) */
+    /* ovf = 這個視窗期間 I2S DMA overflow 次數 (每次 = 丟一塊 32 ms)；dropped = 開機以來因三塊視窗都忙而丟的視窗數 */
+    ESP_LOGI(TAG, "w%u %s %.3f [%.3f %.3f %.3f] logmel=%u ms cnn=%u ms invoke=%.1f ms "
+             "handoff=%.1f ms ovf=%u dropped=%u%s%s",
+             (unsigned)audio->window, audio->label, (double)audio->conf,
+             (double)probs[0], (double)probs[1], (double)probs[2],
+             (unsigned)(audio->feature_us / 1000U), (unsigned)(audio->invoke_us / 1000U),
+             (double)audio_model_last_invoke_us() / 1000.0,
+             (double)(cnn_start_us - job->feature_done_us) / 1000.0,
+             (unsigned)audio->overflows, (unsigned)audio->dropped_windows,
+             audio->low_conf ? " LOW" : "", non_background ? " DET" : "");
+
+#if INFER_AUDIO_DEBUG_DUMP
+    /* 視窗還沒釋放：s_windows / s_features 就是這次正式推論用的資料 */
+    static uint32_t s_debug_dumped = 0;
+    if (s_debug_dumped < INFER_AUDIO_DEBUG_DUMP_WINDOWS) {
+        ++s_debug_dumped;
+        const audio_debug_window_t dump = {
+            .pcm = s_windows[full->buffer],
+            .features = s_features[full->buffer],
+            .probs = probs,
+            .pred = pred,
+            .window = full->window,
+            .start_epoch_ms = audio->start_epoch_ms,
+            .feature_us = audio->feature_us,
+            .invoke_us = audio->invoke_us,
+        };
+        (void)audio_debug_dump_window(&dump);
+    }
+#endif
+
+    ++s_stats.windows;
+    /* 推論統計的 report 也要在通行證內做；正常情況每個視窗都有，等於每 30 個視窗一次 */
+    if (job->usage_open) {
+        if (++s_usage_inferences >= TASK_USAGE_PERIOD_WINDOWS) {
+            task_usage_report("audio");
+            s_usage_inferences = 0;
+        }
+        usage_release();
+    }
+    if ((s_stats.windows % TASK_USAGE_PERIOD_WINDOWS) == 0U) {
+        task_usage_cycle_report("audio cycle");
+    }
+    s_stats.last_feature_us = audio->feature_us;
+    s_stats.last_invoke_us = audio->invoke_us;
+    if (audio->low_conf) {
+        ++s_stats.low_conf;
+    }
+    if (!audio->low_conf && !non_background) {
+        release_window(full->buffer);
+        return;
+    }
+    /* 寫 SD 交給 audio_writer，這裡馬上回去等下一個視窗；視窗由 writer 寫完才還 */
+    const save_job_t save = {
+        .buffer = full->buffer,
+        .non_background = non_background,
+        .handed_over_us = esp_timer_get_time(),
+        .record = *audio,
+    };
+    (void)xQueueSend(s_save_jobs, &save, 0);
+}
+
+/* ==========================================================
+ *  audio_feature：logmel，特徵交給 audio_cnn
+ *  AUDIO_SINGLE_INFER_TASK 時這個 task 叫 audio_infer，logmel 後直接在這裡做 CNN
  * ========================================================== */
 static void audio_feature(void *arg)
 {
@@ -581,116 +720,28 @@ static void audio_feature(void *arg)
             .feature_done_us = feature_done_us,
             .usage_open = usage_open,
         };
+#if AUDIO_SINGLE_INFER_TASK
+        audio_cnn_process(&job);
+#else
         (void)xQueueSend(s_feature_jobs, &job, 0);
+#endif
     }
 }
 
+#if !AUDIO_SINGLE_INFER_TASK
 /* ==========================================================
- *  audio_cnn (Core 1)：CNN，結果立刻回傳，低信賴度交給 audio_writer
+ *  audio_cnn (Core 1)：從 audio_feature 收特徵做 CNN
  * ========================================================== */
 static void audio_cnn(void *arg)
 {
     (void)arg;
     feature_job_t job;
-    uint32_t usage_inferences = 0;
     while (true) {
         (void)xQueueReceive(s_feature_jobs, &job, portMAX_DELAY);
-        const full_window_t *full = &job.window;
-        const int64_t cnn_start_us = esp_timer_get_time();
-        float probs[AUDIO_MODEL_CLASS_COUNT] = {0};
-        int pred = -1;
-        const esp_err_t model_err = audio_model_predict(s_features[full->buffer], probs, &pred);
-        const int64_t cnn_done_us = esp_timer_get_time();
-        if (model_err != ESP_OK || pred < 0) {
-            ESP_LOGE(TAG, "CNN failed: %s", esp_err_to_name(model_err));
-            if (job.usage_open) {
-                usage_release();
-            }
-            release_window(full->buffer);
-            continue;
-        }
-        if (job.usage_open) {
-            task_usage_end();
-        }
-
-        infer_record_t record = {.type = INFER_RECORD_AUDIO};
-        infer_audio_record_t *audio = &record.data.audio;
-        audio->window = full->window;
-        audio->start_epoch_ms = infer_epoch_ms_from_timer(full->start_us);
-        audio->end_epoch_ms = infer_epoch_ms_from_timer(full->end_us);
-        audio->queue_us = (uint32_t)(job.feature_start_us - full->end_us);
-        audio->feature_us = (uint32_t)(job.feature_done_us - job.feature_start_us);
-        audio->invoke_us = (uint32_t)(cnn_done_us - cnn_start_us);
-        audio->overflows = full->overflows;
-        audio->dropped_windows = s_dropped_windows;
-        audio->pred = (uint8_t)pred;
-        audio->label = g_audio_class_names[pred];
-        audio->conf = probs[pred];
-        memcpy(audio->probs, probs, sizeof(audio->probs));
-        audio->low_conf = probs[pred] < INFER_LOW_CONF_THRESHOLD;
-        const bool non_background = s_background_class >= 0 && pred != s_background_class;
-        result_report_push(&record);    /* 不等 SD：判斷結果馬上送出 */
-
-        /* handoff = logmel 結束到 CNN 開始 (跨核心交接 + 等 Core 1) */
-        ESP_LOGI(TAG, "w%u %s %.3f [%.3f %.3f %.3f] logmel=%u ms cnn=%u ms invoke=%.1f ms "
-                 "handoff=%.1f ms%s%s",
-                 (unsigned)audio->window, audio->label, (double)audio->conf,
-                 (double)probs[0], (double)probs[1], (double)probs[2],
-                 (unsigned)(audio->feature_us / 1000U), (unsigned)(audio->invoke_us / 1000U),
-                 (double)audio_model_last_invoke_us() / 1000.0,
-                 (double)(cnn_start_us - job.feature_done_us) / 1000.0,
-                 audio->low_conf ? " LOW" : "", non_background ? " DET" : "");
-
-#if INFER_AUDIO_DEBUG_DUMP
-        /* 視窗還沒釋放：s_windows / s_features 就是這次正式推論用的資料 */
-        static uint32_t s_debug_dumped = 0;
-        if (s_debug_dumped < INFER_AUDIO_DEBUG_DUMP_WINDOWS) {
-            ++s_debug_dumped;
-            const audio_debug_window_t dump = {
-                .pcm = s_windows[full->buffer],
-                .features = s_features[full->buffer],
-                .probs = probs,
-                .pred = pred,
-                .window = full->window,
-                .start_epoch_ms = audio->start_epoch_ms,
-                .feature_us = audio->feature_us,
-                .invoke_us = audio->invoke_us,
-            };
-            (void)audio_debug_dump_window(&dump);
-        }
-#endif
-
-        ++s_stats.windows;
-        /* 推論統計的 report 也要在通行證內做；正常情況每個視窗都有，等於每 30 個視窗一次 */
-        if (job.usage_open) {
-            if (++usage_inferences >= TASK_USAGE_PERIOD_WINDOWS) {
-                task_usage_report("audio");
-                usage_inferences = 0;
-            }
-            usage_release();
-        }
-        if ((s_stats.windows % TASK_USAGE_PERIOD_WINDOWS) == 0U) {
-            task_usage_cycle_report("audio cycle");
-        }
-        s_stats.last_feature_us = audio->feature_us;
-        s_stats.last_invoke_us = audio->invoke_us;
-        if (audio->low_conf) {
-            ++s_stats.low_conf;
-        }
-        if (!audio->low_conf && !non_background) {
-            release_window(full->buffer);
-            continue;
-        }
-        /* 寫 SD 交給 audio_writer，這裡馬上回去等下一個視窗；視窗由 writer 寫完才還 */
-        const save_job_t save = {
-            .buffer = full->buffer,
-            .non_background = non_background,
-            .handed_over_us = esp_timer_get_time(),
-            .record = *audio,
-        };
-        (void)xQueueSend(s_save_jobs, &save, 0);
+        audio_cnn_process(&job);
     }
 }
+#endif
 
 static void audio_writer(void *arg)
 {
@@ -716,13 +767,18 @@ esp_err_t mic_infer_init(void)
                                         s_free_queue_storage, &s_free_queue_control);
     s_full_windows = xQueueCreateStatic(WINDOW_COUNT, sizeof(full_window_t),
                                         s_full_queue_storage, &s_full_queue_control);
-    s_feature_jobs = xQueueCreateStatic(WINDOW_COUNT, sizeof(feature_job_t),
-                                        s_feature_queue_storage, &s_feature_queue_control);
     s_save_jobs = xQueueCreateStatic(WINDOW_COUNT, sizeof(save_job_t),
                                      s_save_queue_storage, &s_save_queue_control);
-    if (!s_free_windows || !s_full_windows || !s_feature_jobs || !s_save_jobs) {
+    if (!s_free_windows || !s_full_windows || !s_save_jobs) {
         return ESP_ERR_NO_MEM;
     }
+#if !AUDIO_SINGLE_INFER_TASK
+    s_feature_jobs = xQueueCreateStatic(WINDOW_COUNT, sizeof(feature_job_t),
+                                        s_feature_queue_storage, &s_feature_queue_control);
+    if (!s_feature_jobs) {
+        return ESP_ERR_NO_MEM;
+    }
+#endif
 
     const uint32_t caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
     for (uint8_t i = 0; i < WINDOW_COUNT; ++i) {
@@ -762,11 +818,17 @@ esp_err_t mic_infer_start(void)
     /* 常駐 task，static：不佔用動態 heap，也不會每輪造成碎片。下游先建，上游送出時一定有人收 */
     if (!xTaskCreateStaticPinnedToCore(audio_writer, "audio_writer", WRITER_TASK_STACK_BYTES, NULL,
                                        WRITER_TASK_PRIORITY, s_writer_stack, &s_writer_tcb,
-                                       WRITER_TASK_CORE) ||
-        !xTaskCreateStaticPinnedToCore(audio_cnn, "audio_cnn", CNN_TASK_STACK_BYTES, NULL,
+                                       WRITER_TASK_CORE)) {
+        return ESP_ERR_NO_MEM;
+    }
+#if !AUDIO_SINGLE_INFER_TASK
+    if (!xTaskCreateStaticPinnedToCore(audio_cnn, "audio_cnn", CNN_TASK_STACK_BYTES, NULL,
                                        CNN_TASK_PRIORITY, s_cnn_stack, &s_cnn_tcb,
-                                       CNN_TASK_CORE) ||
-        !xTaskCreateStaticPinnedToCore(audio_feature, "audio_feature", FEATURE_TASK_STACK_BYTES,
+                                       CNN_TASK_CORE)) {
+        return ESP_ERR_NO_MEM;
+    }
+#endif
+    if (!xTaskCreateStaticPinnedToCore(audio_feature, FEATURE_TASK_NAME, FEATURE_TASK_STACK_BYTES,
                                        NULL, FEATURE_TASK_PRIORITY, s_feature_stack,
                                        &s_feature_tcb, FEATURE_TASK_CORE) ||
         !xTaskCreateStaticPinnedToCore(mic_capture, "mic_capture", CAPTURE_TASK_STACK_BYTES, NULL,

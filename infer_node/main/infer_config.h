@@ -7,19 +7,24 @@
 #include "app_config.h"
 
 /*
- * 這塊板子的功能：一個節點只跑一種，燒錄前在這裡選。
- * 另一條管線完全不初始化 (不啟動 I2S 時脈 / 相機)，模型也不會被連結進韌體。
+ * 這塊板子的功能，燒錄前在這裡選：
+ *   INFER_ROLE_CAM / INFER_ROLE_MIC：只跑一條管線，另一條完全不初始化 (不啟動 I2S 時脈 / 相機)。
+ *   INFER_ROLE_BOTH：相機與麥克風同時跑。影像的 task 配置與單相機相同；麥克風改成
+ *     mic_capture 和 FD 同在 Core 1，logmel + CNN 合成一個 audio_infer，和影像 CNN 同在 Core 0，
+ *     優先權高於 cam_infer (音訊有 2 s 視窗的期限，影像 CNN 晚一點沒關係)。見 mic_infer.c 開頭。
  */
 #define INFER_ROLE_CAM                1
 #define INFER_ROLE_MIC                2
-#define INFER_NODE_ROLE               INFER_ROLE_CAM
+#define INFER_ROLE_BOTH               3
+#define INFER_NODE_ROLE               INFER_ROLE_BOTH
 
-#if INFER_NODE_ROLE != INFER_ROLE_CAM && INFER_NODE_ROLE != INFER_ROLE_MIC
-#error "INFER_NODE_ROLE must be INFER_ROLE_CAM or INFER_ROLE_MIC"
+#if INFER_NODE_ROLE != INFER_ROLE_CAM && INFER_NODE_ROLE != INFER_ROLE_MIC && \
+    INFER_NODE_ROLE != INFER_ROLE_BOTH
+#error "INFER_NODE_ROLE must be INFER_ROLE_CAM, INFER_ROLE_MIC or INFER_ROLE_BOTH"
 #endif
 
-#define INFER_CAM_ENABLE              (INFER_NODE_ROLE == INFER_ROLE_CAM)
-#define INFER_MIC_ENABLE              (INFER_NODE_ROLE == INFER_ROLE_MIC)
+#define INFER_CAM_ENABLE              (INFER_NODE_ROLE == INFER_ROLE_CAM || INFER_NODE_ROLE == INFER_ROLE_BOTH)
+#define INFER_MIC_ENABLE              (INFER_NODE_ROLE == INFER_ROLE_MIC || INFER_NODE_ROLE == INFER_ROLE_BOTH)
 
 /* 預測類別的機率低於此值 = 低信賴度，原始資料存 SD。 */
 #define INFER_LOW_CONF_THRESHOLD      0.6f
@@ -73,6 +78,10 @@
  */
 #ifndef INFER_TASK_USAGE_ENABLE
 #define INFER_TASK_USAGE_ENABLE       0
+#endif
+/* task_usage 的推論區間與一輪標記都假設只有一條管線在用 (task_usage.h 的呼叫規則)，兩條同時跑會互相覆蓋 */
+#if INFER_TASK_USAGE_ENABLE && INFER_NODE_ROLE == INFER_ROLE_BOTH
+#error "INFER_TASK_USAGE_ENABLE is not supported with INFER_ROLE_BOTH"
 #endif
 
 /* 每幀最多送幾個 ROI 進 CNN，避免一張雜訊幀佔住 fb 太久；超過的留到該 track 下一次配對。 */
@@ -129,7 +138,7 @@
  *      PC 端：TTGO_I2S_Record_Test/tools/receive_infer_node_dump.py -o cam_dump 接收，
  *            DID_NODE/tools/compare_debug_dumps.py --dump-dir cam_dump 比對。
  * 也可以不改這裡：idf.py -B build_cam_debug -DINFER_CAM_DEBUG_DUMP=1 -DESP_NN_KERNEL_SET=all build flash
- * (INFER_NODE_ROLE 要是 INFER_ROLE_CAM；ESP_NN_KERNEL_SET 是要驗證的 kernel 組合)。
+ * (INFER_NODE_ROLE 要是 INFER_ROLE_CAM 或 INFER_ROLE_BOTH；ESP_NN_KERNEL_SET 是要驗證的 kernel 組合)。
  */
 #ifndef INFER_CAM_DEBUG_DUMP
 #define INFER_CAM_DEBUG_DUMP          0
@@ -145,6 +154,7 @@
  *      相機節點讀 cam_<名稱>.gray (64x64 uint8)，麥克風節點讀 mic_<名稱>.wav (16 kHz mono PCM16, ≥2 s)，
  *      逐一用正式 interpreter 推論後，以與上面相同的格式從 console 輸出每一層；dump 名稱為
  *      <檔名>_<ESP_NN_KERNEL_SET>。重播完板子停住 (不回到即時推論)。
+ *      INFER_ROLE_BOTH 只重播相機 (debug_replay.c 以 INFER_CAM_ENABLE 優先)；要重播音訊請用 INFER_ROLE_MIC。
  *      同一組輸入用 ESP_NN_KERNEL_SET=all 與 none 各燒一次、各收一次，放進同一個資料夾後執行
  *      DID_NODE/tools/compare_debug_dumps.py，即可四方比對 (node ESP-NN / node reference / PC reference /
  *      PC Python)。輸入檔可用 DID_NODE/tools/make_debug_inputs.py 產生。
