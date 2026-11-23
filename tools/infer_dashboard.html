@@ -234,7 +234,8 @@ details pre { font: 11.5px/1.45 var(--mono); margin: 6px 0 0; white-space: pre-w
       </div>
     </div>
     <div class="scroll"><table>
-      <thead><tr><th>時間</th><th>來源</th><th>判斷</th><th class="num">信賴度</th><th class="num">處理 ms</th><th>細節</th></tr></thead>
+      <thead><tr><th>時間</th><th>來源</th><th>判斷</th><th class="num">信賴度</th><th class="num">處理 ms</th>
+        <th class="num" title="節點判斷（影像從拍攝、音訊從視窗結束起算）+ 傳到 server（跨時鐘，含校時誤差）">延遲 判斷 + 傳送</th><th>細節</th></tr></thead>
       <tbody id="log"></tbody>
     </table></div>
   </section>
@@ -272,6 +273,24 @@ function agoText(ms, now) {
   return `${Math.round(s / 3600)} 小時前`;
 }
 function msText(us) { return us == null ? "—" : (us / 1000).toFixed(us < 10000 ? 1 : 0); }
+/* 毫秒 → 「85 ms」「1.4 s」「12 分」 */
+function durText(ms) {
+  if (ms == null) return "—";
+  const a = Math.abs(ms);
+  if (a < 1000) return `${Math.round(ms)} ms`;
+  if (a < 120000) return `${(ms / 1000).toFixed(1)} s`;
+  return `${Math.round(ms / 60000)} 分`;
+}
+/*
+ * server 算好的延遲 (server_mix.py result_latency)：節點判斷 (同一個時鐘，準) + 傳到 server (跨時鐘，含校時誤差)。
+ * 起點：影像 = 該幀 VSYNC，音訊 = 2 s 視窗結束。舊韌體的 ROI 沒有 result_us，只有合計。
+ */
+function latencyText(lat) {
+  if (!lat) return "—";
+  if (lat.node_ms == null) return lat.total_ms == null ? "—" : `合計 ${durText(lat.total_ms)}`;
+  if (lat.server_ms == null) return `判斷 ${durText(lat.node_ms)}`;
+  return `${durText(lat.node_ms)} + ${durText(lat.server_ms)} = ${durText(lat.total_ms)}`;
+}
 function escapeHtml(text) {
   return String(text).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
@@ -349,6 +368,8 @@ function renderMic(ov, threshold, target) {
     stat("logmel", last ? `${msText(last.feature_us)} ms` : "—") +
     stat("CNN", last ? `${msText(last.invoke_us)} ms` : "—") +
     stat("等待推論", last ? `${msText(last.queue_us)} ms` : "—") +
+    stat("判斷延遲（視窗結束起）", last && last.latency ? durText(last.latency.node_ms) : "—") +
+    stat("傳到 server", last && last.latency ? durText(last.latency.server_ms) : "—") +
     stat("24 h 視窗", total) +
     stat("24 h 低信賴", total ? `${low} (${Math.round((low / total) * 100)}%)` : "0") +
     stat("丟棄", dropped, dropped ? "warn" : "") +
@@ -389,6 +410,8 @@ function renderCam(ov, threshold, target) {
     stat("FD 平均", avg("fd_us") == null ? "—" : `${msText(avg("fd_us"))} ms`) +
     stat("偵測最長", frames.length ? `${msText(maxDetect)} ms` : "—", maxDetect > 200000 ? "warn" : "") +
     stat("CNN", last ? `${msText(last.invoke_us)} ms` : "—") +
+    stat("判斷延遲（拍攝起）", last && last.latency ? durText(last.latency.node_ms) : "—") +
+    stat("傳到 server", last && last.latency ? durText(last.latency.server_ms) : "—") +
     stat("24 h ROI", total) +
     stat("24 h 低信賴", total ? `${low} (${Math.round((low / total) * 100)}%)` : "0") +
     stat("已回傳樣本", (ov.samples_received || {}).video || 0);
@@ -533,12 +556,12 @@ function renderLog(ov) {
   const merged = [];
   (ov.audio || []).forEach((r) => merged.push({
     ts: r.end_ms, src: "音訊", kind: "audio", label: r.label, conf: r.conf, low: r.low,
-    cost: (r.feature_us + r.invoke_us),
+    cost: (r.feature_us + r.invoke_us), latency: r.latency,
     detail: `視窗 #${r.window}`,
   }));
   (ov.rois || []).forEach((r) => merged.push({
     ts: r.ts_ms, src: "影像", kind: "roi", label: r.label, conf: r.conf, low: r.low,
-    cost: r.invoke_us,
+    cost: r.invoke_us, latency: r.latency,
     detail: `幀 #${r.frame} track ${r.track} [${(r.bbox || []).join(", ")}]`,
   }));
   merged.sort((a, b) => b.ts - a.ts);
@@ -548,8 +571,9 @@ function renderLog(ov) {
       <td class="mono">${timeText(r.ts)}</td><td>${r.src}</td>
       <td class="tag" style="color:${colorOf(r.label)}">${nameOf(r.label)}</td>
       <td class="num">${(r.conf * 100).toFixed(1)}%</td><td class="num">${msText(r.cost)}</td>
+      <td class="num mono">${latencyText(r.latency)}</td>
       <td class="muted">${escapeHtml(r.detail)}</td></tr>`).join("")
-    : '<tr><td colspan="6" class="empty">沒有符合的紀錄</td></tr>';
+    : '<tr><td colspan="7" class="empty">沒有符合的紀錄</td></tr>';
 }
 
 function roiOverlay(meta) {
@@ -574,12 +598,29 @@ function timingLine(meta) {
   return parts.join(" · ");
 }
 
+/* 樣本的判斷延遲：節點判斷 + 傳到 server；樣本檔本身是批次回傳，另外列 */
+function sampleLatencyLine(sample) {
+  const lat = sample.latency;
+  if (!lat) return "";
+  let judged;
+  if (sample.media === "audio") {
+    judged = `判斷延遲（視窗結束起）${latencyText(lat.audio)}`;
+  } else {
+    const rois = lat.rois || [];
+    judged = "判斷延遲（拍攝起）" + (rois.length
+      ? rois.map((r, i) => (rois.length > 1 ? `ROI ${i + 1} ` : "") + latencyText(r)).join(" · ")
+      : "—");
+  }
+  return `<div style="font-size:12px" title="節點判斷 + 傳到 server（跨時鐘，含校時誤差）；樣本檔累積滿才批次回傳">
+    ${judged}<br><span class="muted">樣本回傳：拍攝後 ${durText(lat.upload_ms)}</span></div>`;
+}
+
 function sampleCard(sample) {
   const meta = sample.meta;
   const id = encodeURIComponent(sample.sample_id);
   const head = `<div class="head"><span class="tag" style="color:${colorOf(sample.label)}">${nameOf(sample.label)} ${sample.conf != null ? (sample.conf * 100).toFixed(1) + "%" : ""}</span>
     <span class="muted mono">${dateTimeText(sample.ts_ms)}</span></div>`;
-  const foot = `<div class="muted" style="font-size:12px">${timingLine(meta)}</div>
+  const foot = `${sampleLatencyLine(sample)}<div class="muted" style="font-size:12px">${timingLine(meta)}</div>
     <details><summary>原始記錄</summary><pre>${escapeHtml(JSON.stringify(meta, null, 1))}</pre></details>
     <a href="/api/infer/sample/${id}/data" download style="font-size:12px;color:var(--accent)">下載原始資料（${(sample.data_bytes / 1024).toFixed(0)} KB）</a>`;
   if (sample.media === "video") {

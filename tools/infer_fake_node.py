@@ -92,7 +92,7 @@ def send_sample(base: str, device: str, media: str, index: int) -> None:
             "threshold": 0.5, "queue_us": 300, "downscale_us": 4000, "fd_us": 21000,
             "track_us": 80, "write_us": 96000, "labels": VIDEO_LABELS,
             "rois": [{
-                "track": index, "bbox": box, "invoke_us": 98000, "pred": pred,
+                "track": index, "bbox": box, "invoke_us": 98000, "result_us": 310000, "pred": pred,
                 "label": VIDEO_LABELS[pred], "conf": probs[pred], "low": True, "probs": probs,
             }],
         }
@@ -151,6 +151,7 @@ def camera_session(session: int, frames: int) -> list[dict]:
             records.append({
                 "t": "roi", "session": session, "frame": frame, "ts_ms": ts_ms, "track": frame,
                 "bbox": [100, 80, 171, 151], "invoke_us": random.randint(85000, 120000),
+                "result_us": random.randint(280000, 420000),
                 "pred": pred, "label": VIDEO_LABELS[pred], "conf": probs[pred],
                 "low": probs[pred] < 0.5, "probs": probs,
             })

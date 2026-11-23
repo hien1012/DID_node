@@ -943,12 +943,102 @@ def prune_frame_records() -> None:
         time.sleep(PRUNE_PERIOD_S)
 
 
+def _number(value) -> float | None:
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def result_latency(kind: str, record: dict, received_ms: int | None) -> dict | None:
+    """How late one judgement was, split at the moment the node finished it.
+
+    node_ms:   start -> judgement done, measured on the node's own clock (exact).
+    server_ms: judgement done -> this server received the result record; crosses the
+               node and server clocks, so it carries the clock sync error (can be < 0).
+    total_ms:  start -> server received (node_ms + server_ms).
+    Start is the frame's VSYNC for a ROI and the end of the 2 s window for audio
+    (the sound cannot be judged before the window is complete). Records from older
+    firmware have no ROI result_us: node_ms / server_ms are None, total_ms remains.
+    """
+    if kind == "audio":
+        start = _number(record.get("end_ms"))
+        parts = [_number(record.get(key)) for key in ("queue_us", "feature_us", "invoke_us")]
+        node_us = sum(parts) if all(part is not None for part in parts) else None
+    else:
+        start = _number(record.get("ts_ms"))
+        node_us = _number(record.get("result_us"))
+    if start is None:
+        return None
+    node_ms = node_us / 1000 if node_us is not None else None
+    total_ms = received_ms - start if received_ms is not None else None
+    server_ms = total_ms - node_ms if total_ms is not None and node_ms is not None else None
+    if node_ms is None and total_ms is None:
+        return None
+
+    def rounded(value):
+        return round(value, 1) if value is not None else None
+
+    return {"node_ms": rounded(node_ms), "server_ms": rounded(server_ms), "total_ms": rounded(total_ms)}
+
+
 def infer_payloads(rows) -> list[dict]:
-    return [{**json.loads(row["payload_json"]), "id": row["id"]} for row in rows]
+    payloads = []
+    for row in rows:
+        payload = {**json.loads(row["payload_json"]), "id": row["id"]}
+        if "received_ms" in row.keys():
+            payload["received_ms"] = row["received_ms"]
+            if payload.get("t") in ("audio", "roi"):
+                payload["latency"] = result_latency(payload["t"], payload, row["received_ms"])
+        payloads.append(payload)
+    return payloads
 
 
-def sample_row_to_json(row) -> dict:
-    return {
+def result_received_ms(connection, device_id: str, key: str) -> int | None:
+    """When the server received the result record with this dedupe_key (see infer_record_columns)."""
+    row = connection.execute(
+        "SELECT received_ms FROM infer_results WHERE device_id = ? AND dedupe_key = ?",
+        (device_id, key),
+    ).fetchone()
+    return row["received_ms"] if row else None
+
+
+def sample_latency(connection, row, meta: dict) -> dict:
+    """Latency of the judgement(s) in a sample, matched to the result records.
+
+    The sample file itself is uploaded in batches (every INFER_UPLOAD_AFTER_SAMPLES), so
+    its own arrival time says nothing about how fast the judgement was; it is returned
+    separately as upload_ms. A video sample gets one entry per ROI, aligned with meta.rois.
+    """
+    device_id = row["device_id"]
+    result: dict = {"upload_ms": row["received_ms"] - row["ts_ms"]}
+    try:
+        if row["media"] == "audio":
+            key = f"a:{int(meta['start_ms'])}:{int(meta['window'])}"
+            result["audio"] = result_latency(
+                "audio", meta, result_received_ms(connection, device_id, key)
+            )
+        else:
+            session, frame = int(meta["session"]), int(meta["frame"])
+            rois = []
+            for roi in meta.get("rois", []):
+                if not isinstance(roi, dict):
+                    rois.append(None)
+                    continue
+                key = f"r:{session}:{frame}:{int(roi['track'])}"
+                rois.append(
+                    result_latency(
+                        "roi",
+                        {"ts_ms": meta.get("ts_ms"), "result_us": roi.get("result_us")},
+                        result_received_ms(connection, device_id, key),
+                    )
+                )
+            result["rois"] = rois
+    except (KeyError, TypeError, ValueError):
+        pass
+    return result
+
+
+def sample_row_to_json(row, connection=None) -> dict:
+    meta = json.loads(row["meta_json"])
+    sample = {
         "sample_id": row["sample_id"],
         "device_id": row["device_id"],
         "media": row["media"],
@@ -957,8 +1047,11 @@ def sample_row_to_json(row) -> dict:
         "data_bytes": row["data_bytes"],
         "label": row["label"],
         "conf": row["conf"],
-        "meta": json.loads(row["meta_json"]),
+        "meta": meta,
     }
+    if connection is not None:
+        sample["latency"] = sample_latency(connection, row, meta)
+    return sample
 
 
 @app.get("/")
@@ -992,7 +1085,7 @@ def infer_overview():
             return infer_payloads(
                 connection.execute(
                     """
-                    SELECT id, payload_json FROM infer_results
+                    SELECT id, received_ms, payload_json FROM infer_results
                     WHERE device_id = ? AND kind = ? ORDER BY id DESC LIMIT ?
                     """,
                     (device_id, kind, limit),
@@ -1232,7 +1325,8 @@ def infer_samples_list():
         total = connection.execute(
             f"SELECT COUNT(*) AS total FROM infer_samples {where}", values
         ).fetchone()["total"]
-    return jsonify({"total": total, "samples": [sample_row_to_json(row) for row in rows]})
+        samples = [sample_row_to_json(row, connection) for row in rows]
+    return jsonify({"total": total, "samples": samples})
 
 
 def load_sample(sample_id: str):
