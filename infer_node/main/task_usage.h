@@ -13,6 +13,11 @@
  * cycle_mark 只能由同一個 task 呼叫，可以和推論是不同 task；cycle_report 可以在任何 task 呼叫 (內部有鎖)。
  */
 
+#include "infer_config.h"
+
+/* INFER_TASK_USAGE_ENABLE=0 時全部是空函式 (理由見 infer_config.h) */
+#if INFER_TASK_USAGE_ENABLE
+
 /** 推論開始前呼叫。 */
 void task_usage_begin(void);
 
@@ -34,3 +39,13 @@ void task_usage_cycle_mark(void);
  * @param label log 上的名稱，例如 "audio cycle"
  */
 void task_usage_cycle_report(const char *label);
+
+#else
+
+static inline void task_usage_begin(void) {}
+static inline void task_usage_end(void) {}
+static inline void task_usage_report(const char *media) { (void)media; }
+static inline void task_usage_cycle_mark(void) {}
+static inline void task_usage_cycle_report(const char *label) { (void)label; }
+
+#endif

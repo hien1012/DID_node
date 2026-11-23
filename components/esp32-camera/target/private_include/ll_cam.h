@@ -47,7 +47,15 @@
 #define CAMERA_ISR_IRAM_ATTR IRAM_ATTR
 #else
 #define CAMERA_ISR_IRAM_FLAG 0
-#define CAMERA_ISR_IRAM_ATTR 
+#define CAMERA_ISR_IRAM_ATTR
+#endif
+
+/* 本地修改：cam_task 與每個 VSYNC 都會走到的函式 (見 Kconfig CAMERA_TASK_IRAM) */
+#include "esp_attr.h"
+#if CONFIG_CAMERA_TASK_IRAM
+#define CAM_TASK_IRAM_ATTR IRAM_ATTR
+#else
+#define CAM_TASK_IRAM_ATTR
 #endif
 
 #define CAMERA_DBG_PIN_ENABLE 0

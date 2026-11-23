@@ -223,7 +223,14 @@ static int cam_verify_jpeg_eoi(const uint8_t *inbuf, uint32_t length, bool searc
     return -1;
 }
 
-static bool cam_get_next_frame(int * frame_pos)
+/*
+ * 本地修改：CAM_TASK_IRAM_ATTR (Kconfig CAMERA_TASK_IRAM) 把 cam_task 與 VSYNC 時呼叫的
+ * cam_get_next_frame / cam_start_frame / ll_cam_start / ll_cam_do_vsync 放進 IRAM。
+ * VSYNC 到第一行之間只有幾 ms，從 flash 執行時的 cache miss 會讓 DMA 晚啟動而漏收開頭幾行。
+ * 其餘呼叫 (FreeRTOS 佇列、esp_timer_get_time、ll_cam_memcpy、ll_cam_stop、ROM 的 ets_printf)
+ * 本來就在 IRAM / ROM。複製像素到 PSRAM fb 仍受 PSRAM 匯流排影響，這裡無法避免。
+ */
+static CAM_TASK_IRAM_ATTR bool cam_get_next_frame(int * frame_pos)
 {
     if(!cam_obj->frames[*frame_pos].en){
         for (int x = 0; x < cam_obj->frame_cnt; x++) {
@@ -238,7 +245,7 @@ static bool cam_get_next_frame(int * frame_pos)
     return false;
 }
 
-static bool cam_start_frame(int * frame_pos)
+static CAM_TASK_IRAM_ATTR bool cam_start_frame(int * frame_pos)
 {
     if (cam_get_next_frame(frame_pos)) {
         if(ll_cam_start(cam_obj, *frame_pos)){
@@ -269,7 +276,7 @@ void IRAM_ATTR ll_cam_send_event(cam_obj_t *cam, cam_event_t cam_event, BaseType
 }
 
 //Copy frame from DMA dma_buffer to frame dma_buffer
-static void cam_task(void *arg)
+static CAM_TASK_IRAM_ATTR void cam_task(void *arg)
 {
     int cnt = 0;
     int frame_pos = 0;
@@ -851,7 +858,8 @@ skip_eoi_check:
     }
 }
 
-void cam_give(camera_fb_t *dma_buffer)
+/* cam_task 在 fb 佇列滿和暫停時也會呼叫 */
+CAM_TASK_IRAM_ATTR void cam_give(camera_fb_t *dma_buffer)
 {
     for (int x = 0; x < cam_obj->frame_cnt; x++) {
         if (&cam_obj->frames[x].fb == dma_buffer) {

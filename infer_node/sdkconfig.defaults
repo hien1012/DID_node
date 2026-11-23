@@ -47,6 +47,10 @@ CONFIG_FATFS_MAX_LFN=64
 # cam_task on Core 1 with camera_capture / cam_detect; Core 0 has Wi-Fi, CNN, SD writes.
 CONFIG_CAMERA_CORE1=y
 CONFIG_CAMERA_TASK_STACK_SIZE=4096
+# cam_task's VSYNC handling (finish frame, restart DMA) runs from IRAM (local driver option):
+# from flash, cache misses caused by FD on the same core and the CNN on the shared
+# flash/PSRAM bus delay the DMA restart and the first lines are lost (incomplete frames).
+CONFIG_CAMERA_TASK_IRAM=y
 # Same DMA buffer size as the recording firmware (verified without FB-SIZE drops).
 CONFIG_CAMERA_DMA_BUFFER_SIZE_MAX=32768
 

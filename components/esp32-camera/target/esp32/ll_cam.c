@@ -274,7 +274,8 @@ esp_err_t ll_cam_deinit(cam_obj_t *cam)
     return ESP_OK;
 }
 
-bool ll_cam_start(cam_obj_t *cam, int frame_pos)
+/* 本地修改：每個 VSYNC 都由 cam_task 呼叫，見 cam_hal.c 的 CAM_TASK_IRAM_ATTR 說明 */
+CAM_TASK_IRAM_ATTR bool ll_cam_start(cam_obj_t *cam, int frame_pos)
 {
     I2S0.conf.rx_start = 0;
 
@@ -415,7 +416,7 @@ esp_err_t ll_cam_init_isr(cam_obj_t *cam)
     return esp_intr_alloc(ETS_I2S0_INTR_SOURCE, ESP_INTR_FLAG_LOWMED | ESP_INTR_FLAG_IRAM, ll_cam_dma_isr, cam, &cam->cam_intr_handle);
 }
 
-void ll_cam_do_vsync(cam_obj_t *cam)
+CAM_TASK_IRAM_ATTR void ll_cam_do_vsync(cam_obj_t *cam)
 {
 }
 

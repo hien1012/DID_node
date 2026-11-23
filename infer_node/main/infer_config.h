@@ -37,7 +37,7 @@
 _Static_assert(sizeof(INFER_DEVICE_ID_PREFIX) - 1U <= 10U, "Device ID prefix is too long");
 
 /* 預測類別的機率低於此值 = 低信賴度，原始資料存 SD。 */
-#define INFER_LOW_CONF_THRESHOLD      0.5f
+#define INFER_LOW_CONF_THRESHOLD      0.0f
 
 /*
  * 除了低信賴度，預測為「非背景」的也存 SD 並上傳 (audio：drone / helicopter；video：drone / bird)。
@@ -49,7 +49,7 @@ _Static_assert(sizeof(INFER_DEVICE_ID_PREFIX) - 1U <= 10U, "Device ID prefix is 
  * 樣本 meta 的 save_reason 記錄為什麼存："low_conf" / "non_background" / "both"。
  */
 #ifndef INFER_SAVE_NON_BACKGROUND
-#define INFER_SAVE_NON_BACKGROUND     1
+#define INFER_SAVE_NON_BACKGROUND     0
 #endif
 #define INFER_BACKGROUND_LABEL        "background"
 
@@ -74,6 +74,21 @@ _Static_assert(sizeof(INFER_DEVICE_ID_PREFIX) - 1U <= 10U, "Device ID prefix is 
 #define INFER_CAM_SAMPLE_JPEG         0
 #define INFER_CAM_JPEG_QUALITY        80U   /* 1..100，越大越清晰 */
 
+/*
+ * 每個 task 的 CPU 占比統計 (task_usage.c：TASK_USAGE log 與回傳 server 的 task_usage 記錄)。
+ *   1：開啟。每次推論前後、相機每 10 幀各呼叫一次 uxTaskGetSystemState()。
+ *   0：關閉，上面的函式都變成空的，不印 TASK_USAGE、不回傳 task_usage 記錄。
+ * uxTaskGetSystemState() 在 IDF 5.1 雙核心下會關閉呼叫端核心的中斷並拿住 kernel lock，
+ * 再逐 byte 掃描所有 task 的剩餘 stack (約 1–2 ms)。相機 DMA 只有 2 個半區 (各 3 行、約 1.2 ms)，
+ * 中斷被擋住時兩次 EOF 會合併成一次，那幀就少了 3 行而被丟掉 (Camera: incomplete)。
+ * cam_infer 每次推論的 run / preempt / fd_overlap 不受影響 (只讀自己的計數器，不掃 stack)。
+ */
+#ifndef INFER_TASK_USAGE_ENABLE
+#define INFER_TASK_USAGE_ENABLE       0
+#endif
+
+/* cam 模型新舊版切換 (A/B 測試)：vision/cam_model.h 的 CAM_MODEL_USE_OLD (cam_model.cc 是 C++，不 include 這個檔) */
+
 /* 每幀最多送幾個 ROI 進 CNN，避免一張雜訊幀佔住 fb 太久；超過的留到該 track 下一次配對。 */
 #define INFER_CAM_MAX_ROI_PER_FRAME   4U
 
@@ -96,6 +111,6 @@ _Static_assert(sizeof(INFER_DEVICE_ID_PREFIX) - 1U <= 10U, "Device ID prefix is 
  * I2S 麥克風兩種設定相同 (32-bit >> 16，不濾波)。
  */
 #ifndef MIC_PDM_16BIT_HPF
-#define MIC_PDM_16BIT_HPF             0
+#define MIC_PDM_16BIT_HPF             1
 #endif
 #define MIC_PDM_HPF_CUTOFF_HZ         24.0f /* 對齊 ICS-43434 內建高通 (DS-000069 p.14) */

@@ -222,6 +222,17 @@ menu "Camera configuration"
 
     endchoice
 
+    config CAMERA_TASK_IRAM
+        bool "Place cam_task frame handling in IRAM"
+        default n
+        help
+            Place cam_task and the functions it calls on every VSYNC (finish the
+            previous frame, restart the DMA) in IRAM. The DMA must be restarted in
+            the short gap between VSYNC and the first line; when this code runs from
+            flash, cache misses (other tasks on the same core evicting the cache,
+            the other core using the flash/PSRAM bus) can delay the restart and the
+            first lines are lost (short frame). Costs about 1-2 KB of IRAM.
+
     config CAMERA_DMA_BUFFER_SIZE_MAX
         int "DMA buffer size"
         range 8192 32768
