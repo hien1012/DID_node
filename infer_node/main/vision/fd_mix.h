@@ -37,6 +37,12 @@ typedef struct {
     int roi_refine_sobel_thresh;   /**< Sobel magnitude 二值化閾值 */
     int roi_refine_min_cc_area;    /**< ROI 內最小連通區面積閾值 */
     bool roi_refine_keep_largest_only; /**< true：只取最大連通區；false：所有候選的最小外接矩形 */
+    /**
+     * true：refine 前先丟掉被其他框完全包含的框 (規則同 NMS 的 contained 步驟)，不對它們做 Sobel。
+     * 與原專案 / PC Python 的結果可能不同 (原本是 refine 後才去 contained)，見 fd_process_frames_gray()。
+     * false (零初始化的預設)：與原專案相同。
+     */
+    bool roi_refine_drop_contained;
 } FD_Parameters;
 
 typedef struct {
@@ -60,13 +66,14 @@ typedef struct {
 
 /**
  * @brief 兩張灰階圖的幀差偵測
- * @param gray1 上一幀，會被覆蓋 (當二值遮罩)
+ * @param gray1 上一幀，不改動 (原專案會被覆蓋成二值遮罩，這裡改寫進 temp)
  * @param gray2 當前幀，不改動
- * @param temp  與 gray1 同大小的暫存
+ * @param temp  與 gray1 同大小；回傳後內容是被 flood fill 標記過的遮罩，呼叫端不要再用
  * @param timing 寫入各步驟耗時，不可為 NULL
  * @return 結果 (用 fd_free_detection_result 釋放)；沒有框時回傳 NULL
+ * 只能由同一個 task 呼叫 (flood fill stack 與 morphology 行緩衝是檔內 static)。
  */
-FD_DetectionResult* fd_process_frames_gray(uint8_t* gray1, uint8_t* gray2, uint8_t* temp,
+FD_DetectionResult* fd_process_frames_gray(const uint8_t* gray1, const uint8_t* gray2, uint8_t* temp,
                                            FD_Parameters* params, int* num_boxes,
                                            int width, int height, FD_StageTiming* timing);
 void fd_free_detection_result(FD_DetectionResult* result);

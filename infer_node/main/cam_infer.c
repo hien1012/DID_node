@@ -1738,7 +1738,7 @@ static void detect_frame(const ready_frame_t *ready, bool *has_prev)
         timing.candidates = (uint16_t)candidates.num_candidates;
     }
 
-    /* 這一幀變成下一輪的 prev；舊的 prev 已被 FD 當暫存覆蓋 */
+    /* 這一幀變成下一輪的 prev；FD 不會改 prev / curr (mask 寫在 s_fd_temp)，舊的 prev 下一幀直接覆寫 */
     uint8_t *swap = s_ds_prev;
     s_ds_prev = s_ds_curr;
     s_ds_curr = swap;
@@ -2250,6 +2250,8 @@ static esp_err_t init_pipeline(void)
         .roi_refine_sobel_thresh = 100,
         .roi_refine_min_cc_area = 0,
         .roi_refine_keep_largest_only = false,
+        /* 與原專案 / PC Python 不同：被包含的框 refine 前就丟掉，不做 Sobel (fd_mix.h) */
+        .roi_refine_drop_contained = true,
     };
     Stage2_Params track_params;
     stage2_default_params(&track_params);

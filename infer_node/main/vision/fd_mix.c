@@ -5,6 +5,13 @@
  *    會讓這裡每幀的小型 malloc (flood fill stack 8 KB、bbox 2 KB...) 全進內部 RAM，
  *    那是錄影期間最緊的資源，還會造成碎片。
  *  - 拿掉 SD 測試、JPEG 解碼、RGB 轉換等相機管線用不到的程式；輸入固定是 GRAY8。
+ *
+ * 2026-11-20 為減少 PSRAM 存取改寫 (除了 roi_refine_drop_contained，輸出與原版逐位元相同)：
+ *  - 幀差 + 二值化合成一趟，直接寫進 temp；gray1 (上一幀) 不再被覆蓋。
+ *  - morphology 用內部 RAM 的行緩衝，水平 + 垂直一趟完成、就地寫回。
+ *  - flood fill stack 配置一次重複使用，不再每個連通區 malloc / free。
+ *  - 選用：refine 前先去掉被包含的框 (roi_refine_drop_contained)。
+ * 這些 static 狀態讓 FD 只能由同一個 task (cam_detect) 呼叫。
  */
 #include "fd_mix.h"
 
@@ -126,24 +133,105 @@ static void fd_erosion_vertical(uint8_t* src, uint8_t* dst, int width, int heigh
     }
 }
 
-static void fd_apply_morphology(uint8_t* src, uint8_t* dst, uint8_t* temp, int width, int height, FD_Parameters* params) {
-    switch (params->morph_mode) {
-        case FD_MORPH_ERODE:
-            fd_erosion_horizontal(src, temp, width, height, params->morph_kernel_size);
-            fd_erosion_vertical(temp, dst, width, height, params->morph_kernel_size);
-            break;
-        case FD_MORPH_DILATE:
-        default:
-            fd_dilation_horizontal(src, temp, width, height, params->morph_kernel_size);
-            fd_dilation_vertical(temp, dst, width, height, params->morph_kernel_size);
-            break;
+/*
+ * morphology 行緩衝 (內部 RAM，.bss)：kernel ≤ 5、寬 ≤ 320 (FD 在 320x240 上跑) 時用。
+ * 原本兩趟：水平 src→temp、垂直 temp→dst，整張圖在 PSRAM 讀 2 次、寫 2 次 (各 77 KB)。
+ * 現在每一行只從 PSRAM 讀一次、寫一次：水平結果放在這裡的環形行緩衝，垂直方向只讀內部 RAM。
+ * 超過這個大小就退回原本的兩趟寫法 (結果相同)。
+ */
+#define FD_MORPH_RING_ROWS   5
+#define FD_MORPH_RING_WIDTH  (FD_WIDTH / 2)
+static uint8_t s_morph_ring[FD_MORPH_RING_ROWS][FD_MORPH_RING_WIDTH];
+
+/* 一行的水平 max / min，邊界複製；與 fd_dilation_horizontal / fd_erosion_horizontal 的一行相同 */
+static void fd_morph_row_horizontal(const uint8_t* src, uint8_t* dst, int width, int offset, bool dilate) {
+    for (int x = 0; x < width; x++) {
+        uint8_t v = dilate ? 0 : 255;
+        for (int kx = -offset; kx <= offset; kx++) {
+            int px = x + kx;
+            if (px < 0) px = 0;
+            if (px >= width) px = width - 1;
+            const uint8_t s = src[px];
+            if (dilate ? (s > v) : (s < v)) v = s;
+        }
+        dst[x] = v;
     }
 }
 
-static void get_absdiff(uint8_t* frame1, uint8_t* frame2, uint8_t* diff, int width, int height) {
-    for (int i = 0; i < width * height; i++) {
-        int d = (int)frame2[i] - (int)frame1[i];  // 計算差值
-        diff[i] = (d < 0) ? -d : d;               // 取絕對值，與Python cv2.absdiff一致
+/*
+ * 水平 + 垂直一趟，就地 (buf 同時是輸入與輸出)。
+ * 輸出第 y 行需要第 [y-off, y+off] 行 (超出邊界的複製最外一行，取 max / min 時等於不算) 的水平結果；
+ * 這些都已經在環形緩衝裡，而原圖第 y+off 行之後還沒被寫回，所以可以就地。
+ */
+static void fd_morph_line_buffered(uint8_t* buf, int width, int height, int kernel_size, bool dilate) {
+    const int offset = kernel_size / 2;
+    const int ring_rows = 2 * offset + 1;
+    int next_row = 0;   /* 下一個要做水平的原圖行 */
+    for (int y = 0; y < height; y++) {
+        const int lo = (y - offset < 0) ? 0 : y - offset;
+        const int hi = (y + offset > height - 1) ? height - 1 : y + offset;
+        while (next_row <= hi) {
+            fd_morph_row_horizontal(buf + (size_t)next_row * (size_t)width,
+                                    s_morph_ring[next_row % ring_rows], width, offset, dilate);
+            next_row++;
+        }
+        uint8_t* out = buf + (size_t)y * (size_t)width;
+        for (int x = 0; x < width; x++) {
+            uint8_t v = s_morph_ring[lo % ring_rows][x];
+            for (int r = lo + 1; r <= hi; r++) {
+                const uint8_t s = s_morph_ring[r % ring_rows][x];
+                if (dilate ? (s > v) : (s < v)) v = s;
+            }
+            out[x] = v;
+        }
+    }
+}
+
+/*
+ * mask 就地做 morphology。行緩衝放不下時 (kernel > 5 或寬 > 320；目前參數 kernel=3、寬 320 不會)
+ * 退回原本的兩趟寫法，需要另一塊整張圖的暫存，第一次用到時才配置。
+ */
+static bool fd_apply_morphology(uint8_t* mask, int width, int height, const FD_Parameters* params) {
+    const bool dilate = params->morph_mode != FD_MORPH_ERODE;   /* 與原本 switch 的 default 相同 */
+    const int kernel_size = params->morph_kernel_size;
+    if (kernel_size >= 1 && (kernel_size / 2) * 2 + 1 <= FD_MORPH_RING_ROWS &&
+        width <= FD_MORPH_RING_WIDTH) {
+        fd_morph_line_buffered(mask, width, height, kernel_size, dilate);
+        return true;
+    }
+    static uint8_t* s_temp = NULL;
+    static size_t s_temp_bytes = 0;
+    const size_t bytes = (size_t)width * (size_t)height;
+    if (s_temp_bytes < bytes) {
+        free(s_temp);
+        s_temp = (uint8_t*)FD_MALLOC(bytes);
+        s_temp_bytes = s_temp ? bytes : 0;
+        if (!s_temp) {
+            ESP_LOGE(FD_TAG, "fd_apply_morphology(): temp allocation failed (%u bytes)", (unsigned)bytes);
+            return false;
+        }
+    }
+    uint8_t* temp = s_temp;
+    if (dilate) {
+        fd_dilation_horizontal(mask, temp, width, height, kernel_size);
+        fd_dilation_vertical(temp, mask, width, height, kernel_size);
+    } else {
+        fd_erosion_horizontal(mask, temp, width, height, kernel_size);
+        fd_erosion_vertical(temp, mask, width, height, kernel_size);
+    }
+    return true;
+}
+
+/*
+ * 幀差 + 二值化一趟：mask = |curr - prev| > threshold ? 255 : 0。
+ * 與原本 get_absdiff() → fd_binary_threshold() 兩趟逐位元相同 (差值本來就存成 0..255 的 uint8)，
+ * 但少寫一次、少讀一次整張 77 KB 的中間結果。
+ */
+static void fd_absdiff_threshold(const uint8_t* prev, const uint8_t* curr, uint8_t* mask, int pixels, int threshold) {
+    for (int i = 0; i < pixels; i++) {
+        int d = (int)curr[i] - (int)prev[i];
+        if (d < 0) d = -d;                        /* 與 Python cv2.absdiff 一致 */
+        mask[i] = (d > threshold) ? 255 : 0;
     }
 }
 
@@ -391,30 +479,39 @@ void fd_roi_refine(
     *inout_num_boxes = write_idx;
 }
 
-static void fd_binary_threshold(uint8_t* src, uint8_t* dst, int width, int height, int threshold) {
-    for (int i = 0; i < width * height; i++) {
-        dst[i] = (src[i] > threshold) ? 255 : 0;  // 二值化：大於閾值為白，否則為黑
-    }
-}
+/*
+ * flood fill 的 stack：第一次用時配置，之後所有連通區 (contour 與 ROI refine) 共用、只會變大。
+ * 原本每個連通區都 malloc 8 KB、用完 free：雜訊多的幀一幀就有上百次 PSRAM heap 操作 (要拿 heap 鎖)，
+ * 每次拿到的位址不同、cache 都是冷的，大物體還要從 8 KB 一路 realloc 搬資料。
+ * 代價：stack 停在用過的最大容量，最壞 = 320x240 個點 × 4 B ≈ 300 KB PSRAM 不還。
+ */
+static FD_Point* s_ff_stack = NULL;
+static int s_ff_capacity = 0;
 
-static bool fd_flood_fill_optimized(uint8_t* mask, int width, int height, int start_x, int start_y, 
+static bool fd_flood_fill_optimized(uint8_t* mask, int width, int height, int start_x, int start_y,
                               int* min_x, int* max_x, int* min_y, int* max_y, int* area) {
-    
+
     // 初始 stack 容量 (約 8KB)
     const int INIT_CAPACITY = 2048;
     // 最大容量 = 整張圖片 (640×480 = 307,200) 最大可以到 307,200* sizeof(FD_Point) = 1.2MB
     const int MAX_CAPACITY = width * height;
-    
-    // 分配初始 stack 
-    FD_Point* stack = (FD_Point*)FD_MALLOC(INIT_CAPACITY * sizeof(FD_Point));
-    
-    if (!stack) {
-        ESP_LOGE(FD_TAG, "fd_flood_fill_optimized() 初始記憶體分配失敗: stack (%d bytes)", 
-                 INIT_CAPACITY * (int)sizeof(FD_Point));
-        return false;  // 分配失敗
+    /*
+     * 原版的上限：容量從 INIT 開始翻倍、最多到 MAX，滿了就停 (保留部分結果)。
+     * 共用的 stack 可能已經比這個連通區的上限大，所以另外記上限，停下來的時機才和原版相同。
+     */
+    const int limit = (MAX_CAPACITY > INIT_CAPACITY) ? MAX_CAPACITY : INIT_CAPACITY;
+
+    if (!s_ff_stack) {
+        s_ff_stack = (FD_Point*)FD_MALLOC(INIT_CAPACITY * sizeof(FD_Point));
+        if (!s_ff_stack) {
+            ESP_LOGE(FD_TAG, "fd_flood_fill_optimized() 初始記憶體分配失敗: stack (%d bytes)",
+                     INIT_CAPACITY * (int)sizeof(FD_Point));
+            return false;  // 分配失敗
+        }
+        s_ff_capacity = INIT_CAPACITY;
     }
-    
-    int capacity = INIT_CAPACITY;
+    FD_Point* stack = s_ff_stack;
+    int capacity = s_ff_capacity;
     int stack_size = 0;
     bool is_complete = true;  // 標記是否完整處理
     
@@ -444,9 +541,10 @@ static bool fd_flood_fill_optimized(uint8_t* mask, int width, int height, int st
         
         // 檢查是否需要擴展 stack
         // 因為每次可能同時加入4個鄰居到stack，若stack剩餘空間不足4個，下一步就可能溢出，所以要提前擴展容量
-        if (stack_size + 4 >= capacity) {
+        // 先看原版的上限 (limit)；沒到上限但共用 stack 不夠時才擴展
+        if (stack_size + 4 >= limit || stack_size + 4 >= capacity) {
             //(最終實驗精簡log)//memory_print_info("fd_flood_fill_optimized() Stack擴展前" );
-            if (capacity >= MAX_CAPACITY) {
+            if (stack_size + 4 >= limit) {
                 // Stack 已經到達最大容量，無法再擴展
                 // 保留已經找到的部分結果，停止處理
                 //(最終實驗精簡log)//memory_print_info("fd_flood_fill_optimized() Stack 達到最大容量，物體太大");
@@ -457,10 +555,10 @@ static bool fd_flood_fill_optimized(uint8_t* mask, int width, int height, int st
                 break;  // 跳出循環，保留已找到的結果
             }
             
-            // 擴展策略：容量翻倍，最多擴展到MAX_CAPACITY
+            // 擴展策略：容量翻倍，最多擴展到上限 (走到這裡時 capacity < limit = MAX_CAPACITY)
             int new_capacity = capacity * 2;
-            if (new_capacity > MAX_CAPACITY) {
-                new_capacity = MAX_CAPACITY;
+            if (new_capacity > limit) {
+                new_capacity = limit;
             }
             
             // 使用 realloc 擴展記憶體
@@ -483,16 +581,18 @@ static bool fd_flood_fill_optimized(uint8_t* mask, int width, int height, int st
             
             stack = new_stack;
             capacity = new_capacity;
+            s_ff_stack = new_stack;       /* 共用 stack 留著給下一個連通區 */
+            s_ff_capacity = new_capacity;
         }
-        
+
         // 加入四個鄰居到堆疊 (四連通) - 加入邊界檢查避免 uint16_t 下溢
         if (p.x + 1 < width)  stack[stack_size++] = (FD_Point){p.x + 1, p.y};
         if (p.x > 0)          stack[stack_size++] = (FD_Point){p.x - 1, p.y};
         if (p.y + 1 < height) stack[stack_size++] = (FD_Point){p.x, p.y + 1};
         if (p.y > 0)          stack[stack_size++] = (FD_Point){p.x, p.y - 1};
     }
-    
-    free(stack);
+
+    /* 不 free：s_ff_stack 給下一個連通區重複使用 */
     return is_complete;  // 返回是否完整處理
 }
 
@@ -863,8 +963,24 @@ static uint32_t fd_lap_us(int64_t* mark) {
     return elapsed;
 }
 
-// gray2 不改動；gray1、temp 輪流當中間暫存
-FD_DetectionResult* fd_process_frames_gray(uint8_t* gray1, uint8_t* gray2, uint8_t* temp, FD_Parameters* params, int* num_boxes, int width, int height, FD_StageTiming* timing) {
+/*
+ * refine 前去掉被包含的框，順序不變 (roi_refine_drop_contained)。
+ * 包含規則與 NMS 的 fd_remove_contained_bboxes() 相同 (同大小的框只留索引小的)。
+ */
+static void fd_drop_contained_before_refine(FD_BoundingBox* boxes, int* inout_num_boxes) {
+    static int keep[FD_MAX_BBOXES];   /* 只有 cam_detect 用；不佔它的 stack */
+    const int n = *inout_num_boxes;
+    if (n < 2 || n > FD_MAX_BBOXES) return;
+    int keep_count = 0;
+    fd_remove_contained_bboxes(boxes, n, keep, &keep_count);
+    for (int i = 0; i < keep_count; i++) {
+        boxes[i] = boxes[keep[i]];    /* keep[] 遞增且 keep[i] >= i，往前搬不會蓋到還沒搬的 */
+    }
+    *inout_num_boxes = keep_count;
+}
+
+// gray1、gray2 都不改動；temp 放二值遮罩
+FD_DetectionResult* fd_process_frames_gray(const uint8_t* gray1, const uint8_t* gray2, uint8_t* temp, FD_Parameters* params, int* num_boxes, int width, int height, FD_StageTiming* timing) {
     *num_boxes = 0;
     *timing = (FD_StageTiming){0};
     if (!temp) {
@@ -873,20 +989,26 @@ FD_DetectionResult* fd_process_frames_gray(uint8_t* gray1, uint8_t* gray2, uint8
     }
     int64_t mark = esp_timer_get_time();
 
-    // 幀差 → 二值化 → morphology
-    get_absdiff(gray1, gray2, temp, width, height);                   // temp <- |gray2-gray1|
-    fd_binary_threshold(temp, gray1, width, height, params->thresh);  // gray1 <- binary(temp)
+    // 幀差 + 二值化 (一趟) → morphology (一趟，就地)
+    fd_absdiff_threshold(gray1, gray2, temp, width * height, params->thresh);   // temp <- |gray2-gray1| > thresh
     timing->diff_us = fd_lap_us(&mark);
-    fd_apply_morphology(gray1, gray1, temp, width, height, params);   // gray1 <- morph(gray1)
+    if (!fd_apply_morphology(temp, width, height, params)) {                    // temp <- morph(temp)
+        return NULL;
+    }
     timing->morph_us = fd_lap_us(&mark);
 
     // 輪廓
     int initial_box_num = 0;
-    FD_BoundingBox* initial_boxes = fd_get_contour_detections(gray1, width, height, params, &initial_box_num);
+    FD_BoundingBox* initial_boxes = fd_get_contour_detections(temp, width, height, params, &initial_box_num);
     timing->contour_us = fd_lap_us(&mark);
     if (initial_box_num == 0 || !initial_boxes) {
         free(initial_boxes);
         return NULL;
+    }
+
+    // 選用：被包含的框不做 refine (與原專案結果可能不同，見 fd_mix.h)；時間算進 refine
+    if (params->roi_refine_enable && params->roi_refine_drop_contained) {
+        fd_drop_contained_before_refine(initial_boxes, &initial_box_num);
     }
 
     // ROI refine (Sobel 3x3)；結果就地寫回 initial_boxes
