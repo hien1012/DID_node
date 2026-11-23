@@ -1,0 +1,9 @@
+# Cache experiment C: 32 KB instruction cache (default build: 16 KB). Used together with
+# sdkconfig.dcache64, see the cache experiment section in README.md:
+#   -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.dcache64;sdkconfig.icache32"
+# Costs another 16 KB of internal RAM. Code for TFLM, ESP-NN, FD and logmel runs from flash
+# through this cache on both cores.
+# Keep this file ASCII only: kconfgen reads it with the Windows code page (cp950).
+CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
+CONFIG_ESP32S3_INSTRUCTION_CACHE_8WAYS=y
+CONFIG_ESP32S3_INSTRUCTION_CACHE_LINE_32B=y

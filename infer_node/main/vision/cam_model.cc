@@ -84,6 +84,36 @@ class OpTimer : public tflite::MicroProfilerInterface {
 
 OpTimer s_op_timer;
 uint32_t s_last_invoke_us = 0;
+
+/*
+ * INFER_MODEL_IN_PSRAM=1 (idf.py -DINFER_MODEL_IN_PSRAM=1)：開機時把模型 (權重 281 KB，其中 FC 262 KB)
+ * 從 flash 複製到 PSRAM 再交給 TFLM。flash 是 QIO 80 MHz (約 40 MB/s)，Octal PSRAM 80 MHz DDR (約 160 MB/s)，
+ * FC 每次推論要整個讀一遍權重，cache miss 時從 PSRAM 補比較快。代價：PSRAM 多用一份模型大小。
+ * 0 (預設)：模型留在 flash (rodata，經 cache 讀)。複製失敗時也退回 flash。
+ */
+#ifndef INFER_MODEL_IN_PSRAM
+#define INFER_MODEL_IN_PSRAM 0
+#endif
+const unsigned char *s_model_data = nullptr;
+
+const unsigned char *model_data()
+{
+    if (s_model_data != nullptr) {
+        return s_model_data;
+    }
+    s_model_data = g_model;
+#if INFER_MODEL_IN_PSRAM
+    auto *copy = static_cast<unsigned char *>(heap_caps_aligned_alloc(
+        16, static_cast<size_t>(g_model_len), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (copy != nullptr) {
+        std::memcpy(copy, g_model, static_cast<size_t>(g_model_len));
+        s_model_data = copy;
+    } else {
+        ESP_LOGW(TAG, "Copying the model to PSRAM failed; using it from flash");
+    }
+#endif
+    return s_model_data;
+}
 uint8_t *s_tensor_arena = nullptr;
 tflite::MicroInterpreter *s_interpreter = nullptr;
 TfLiteTensor *s_input = nullptr;
@@ -139,7 +169,7 @@ extern "C" esp_err_t cam_model_init(void)
         return ESP_OK;
     }
 
-    const tflite::Model *model = tflite::GetModel(g_model);
+    const tflite::Model *model = tflite::GetModel(model_data());
     if (model->version() != TFLITE_SCHEMA_VERSION) {
         ESP_LOGE(TAG, "Model schema %d != supported %d", static_cast<int>(model->version()),
                  TFLITE_SCHEMA_VERSION);
@@ -180,8 +210,8 @@ extern "C" esp_err_t cam_model_init(void)
     }
 
     s_interpreter = &interpreter;
-    ESP_LOGI(TAG, "Camera model ready: model=%d bytes arena=%d used=%u bytes",
-             g_model_len, kTensorArenaSize,
+    ESP_LOGI(TAG, "Camera model ready: model=%d bytes (%s) arena=%d used=%u bytes",
+             g_model_len, s_model_data == g_model ? "flash" : "PSRAM", kTensorArenaSize,
              static_cast<unsigned>(s_interpreter->arena_used_bytes()));
     return ESP_OK;
 }
@@ -271,7 +301,7 @@ extern "C" esp_err_t cam_model_debug_run(const uint8_t *roi,
     if (!roi || !probabilities || !predicted_class) {
         return ESP_ERR_INVALID_ARG;
     }
-    const tflite::Model *model = tflite::GetModel(g_model);
+    const tflite::Model *model = tflite::GetModel(model_data());
     const esp_err_t init_err = debug_interpreter_init(model);
     if (init_err != ESP_OK) {
         return init_err;

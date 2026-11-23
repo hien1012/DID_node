@@ -30,6 +30,33 @@ tflite-micro 不能整個用 `-O2`：GCC 12.2 編 `reference/portable_tensor_uti
 改 defaults 後要同步改 `sdkconfig`（或刪掉讓它重新產生）。
 要試 ESP-NN：`idf.py -B build -DESP_NN_KERNEL_SET=all build`（預設 `none` = 全部 reference kernel）。
 
+### Cache 實驗（A / B / C / D）
+
+每個版本用自己的 build 目錄與 sdkconfig（`-DSDKCONFIG=<目錄>/sdkconfig`），互不覆蓋，根目錄的 `sdkconfig` 也不動。
+片段檔疊在 `sdkconfig.defaults` 上；改了片段要刪掉該目錄的 `sdkconfig` 才會套用。
+
+| 版本 | 內容 | 內部 RAM 代價 |
+|---|---|---|
+| A | 現況：ICache 16 KB、DCache 32 KB / 32 B line、模型在 flash | — |
+| B | DCache 64 KB / 64 B line（`sdkconfig.dcache64`） | −32 KB |
+| C | B + ICache 32 KB（`sdkconfig.icache32`） | −48 KB |
+| D | B + 兩個模型開機複製到 PSRAM（`-DINFER_MODEL_IN_PSRAM=1`，多用 PSRAM 約 295 KB） | −32 KB |
+
+```powershell
+idf.py -B build_cache_a -DSDKCONFIG=build_cache_a/sdkconfig -DESP_NN_KERNEL_SET=all build
+idf.py -B build_cache_b -DSDKCONFIG=build_cache_b/sdkconfig -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.dcache64" -DESP_NN_KERNEL_SET=all build
+idf.py -B build_cache_c -DSDKCONFIG=build_cache_c/sdkconfig -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.dcache64;sdkconfig.icache32" -DESP_NN_KERNEL_SET=all build
+idf.py -B build_cache_d -DSDKCONFIG=build_cache_d/sdkconfig -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.dcache64" -DINFER_MODEL_IN_PSRAM=1 -DESP_NN_KERNEL_SET=all build
+idf.py -B build_cache_b -p COM16 flash monitor    # 燒哪個版本就用哪個目錄
+```
+
+開機 log 自己標明版本：`INFER_APP: Cache: instruction .. KB, data .. KB with ..-byte lines`，
+`CAM_MODEL` / `AUDIO_MODEL` 的 ready log 寫 `(flash)` 或 `(PSRAM)`。
+
+要比的數字（同一支影片、同樣次數，與 FD/CNN 拖慢實驗相同做法）：cam_infer 的 `invoke / run / preempt / fd_overlap`
+（看 run 對 fd_overlap 的斜率有沒有變小）、`Detect stage avg/max ms`、`MIC_INFER logmel= cnn=`、`CNN op avg us`（FC 層看 D），
+以及 `HEAP [running]` 與 heartbeat 的 `heap_min_kb`（C 只剩約 43 KB，上傳時的最低值要確認）。
+
 Server：在上層執行 `python server_mix.py`，瀏覽器開 `http://localhost:5000/`。
 沒有板子也能看畫面：另開一個終端機跑 `python tools/infer_fake_node.py`（資料都是假的）。
 

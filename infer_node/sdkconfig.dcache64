@@ -1,0 +1,9 @@
+# Cache experiment B/C/D: 64 KB data cache with 64-byte lines (default build: 32 KB, 32-byte lines).
+# Used on top of sdkconfig.defaults, see the cache experiment section in README.md:
+#   -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.dcache64"
+# Costs 32 KB of internal RAM (the 32 KiB DRAM block at 0x3FCF0000 in the boot log becomes cache).
+# The data cache is shared by both cores, so FD on Core 1 evicts less of the CNN's data on Core 0.
+# Keep this file ASCII only: kconfgen reads it with the Windows code page (cp950).
+CONFIG_ESP32S3_DATA_CACHE_64KB=y
+CONFIG_ESP32S3_DATA_CACHE_8WAYS=y
+CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y

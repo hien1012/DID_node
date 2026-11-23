@@ -16,6 +16,7 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "nvs_flash.h"
+#include "sdkconfig.h"
 
 #include "cam_infer.h"
 #include "debug_replay.h"
@@ -190,6 +191,13 @@ void app_main(void)
     ESP_LOGI(TAG, "Device ID: %s, role: %s", device_identity_get(),
              (INFER_CAM_ENABLE && INFER_MIC_ENABLE) ? "camera + microphone" :
              INFER_CAM_ENABLE ? "camera" : "microphone");
+#ifdef CONFIG_ESP32S3_DATA_CACHE_SIZE
+    /* cache 實驗 (README)：log 自己標明是哪個版本；模型放 flash 或 PSRAM 由 *_MODEL 的 ready log 標明 */
+    ESP_LOGI(TAG, "Cache: instruction %u KB, data %u KB with %u-byte lines",
+             (unsigned)(CONFIG_ESP32S3_INSTRUCTION_CACHE_SIZE / 1024),
+             (unsigned)(CONFIG_ESP32S3_DATA_CACHE_SIZE / 1024),
+             (unsigned)CONFIG_ESP32S3_DATA_CACHE_LINE_SIZE);
+#endif
     time_sync_configure_timezone();
 
     log_heap("app start");

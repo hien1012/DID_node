@@ -79,6 +79,12 @@ if(DEFINED INFER_MIC_HPF_ENABLE)
     endif()
 endif()
 
+# Model weights copied from flash to PSRAM at boot (vision/cam_model.cc, audio/audio_model.cc):
+#   idf.py -B build_cache_d -DINFER_MODEL_IN_PSRAM=1 ... build
+if(INFER_MODEL_IN_PSRAM)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE INFER_MODEL_IN_PSRAM=1)
+endif()
+
 # The dump meta records which kernels this build uses (the ESP_NN define itself is
 # private to the tflite-micro component).
 if(DEFINED ESP_NN_KERNEL_SET)
