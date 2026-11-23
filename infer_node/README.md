@@ -153,7 +153,7 @@ python ..\..\TTGO_I2S_Record_Test\tools\receive_infer_node_dump.py --port COM14 
 | `t` | 內容 |
 |---|---|
 | `audio` | 視窗序號、開始 / 結束時間、等待 / logmel / CNN 耗時、overflow、預測、機率 |
-| `roi` | session、幀序號、時間、track、bbox、CNN 耗時、預測、機率 |
+| `roi` | session、幀序號、時間、track、bbox、CNN 耗時、`result_us`（幀開始 VSYNC → 這個 ROI 的 CNN 做完）、預測、機率 |
 | `frame` | session、幀序號、時間、每階段耗時（見下表）、框數、候選數 |
 | `session` | 每 300 幀一次的累計統計：幀數、丟幀、斷層、驅動丟棄幀、ROI 數、過期候選數、低信賴數、存檔數、幀間隔 min/max、逾時次數（`error` 欄位）、等待寫 SD 與寫 SD 的平均 / 最長 |
 | `cnn_ops` | 每分鐘一次（期間有推論才送）：CNN 每一層的平均耗時（依執行順序） |
@@ -193,6 +193,16 @@ python ..\..\TTGO_I2S_Record_Test\tools\receive_infer_node_dump.py --port COM14 
 兩顆核心加總約 200%，最後一行 `busy: core 0 / core 1` = 100% − 該核心 IDLE 的占比，就是一輪的忙碌程度。
 相機的表包含 `cam_infer` 自己印表的時間（Core 0、優先權最低）。
 中斷時間算在被打斷的 task 上；`sum` 少個 1–2% 是快照當下另一核心正在跑的 task 還沒更新計數器。
+
+**判斷延遲**（儀表板「最近的判斷」、即時卡片、樣本卡片；`server_mix.py` 的 `result_latency()`）分兩段：
+
+| 段 | 影像 | 音訊 | 時鐘 |
+|---|---|---|---|
+| 節點判斷 | `result_us`（從該幀 VSYNC 起） | `queue_us + feature_us + invoke_us`（從 2 s 視窗結束起） | 節點同一個時鐘，準 |
+| 傳到 server | server 收到該筆記錄的時間 − (起點 + 節點判斷) | 同左 | 跨時鐘，含校時誤差（可能 < 0） |
+
+樣本卡片另列「樣本回傳：拍攝後多久」，那是樣本檔累積滿 20 個才批次上傳的時間，不是判斷延遲。
+樣本靠 `session + frame + track`（音訊 `start_ms + window`）對到結果記錄；舊韌體的 ROI 沒有 `result_us`，只顯示合計。
 
 `POST /infer/sample`：body = meta JSON（`X-Meta-Length` bytes）+ 原始資料（`X-File-Size` bytes）。
 

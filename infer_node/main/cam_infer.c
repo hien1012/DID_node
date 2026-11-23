@@ -366,6 +366,7 @@ typedef struct {
     uint32_t invoke_only_us;    /* 其中 Invoke() 本身 (只印 log) */
     uint32_t run_us;            /* 同一段期間 cam_infer 自己佔用 CPU 的時間 (含等 cache miss 的停頓) */
     uint32_t fd_overlap_us;     /* 同一段期間另一顆核心的 cam_detect 在處理幀的時間 */
+    uint32_t result_us;         /* 幀開始 VSYNC → 這個 ROI 的 CNN 做完 (節點內的判斷延遲，同一個時鐘) */
     uint8_t pred;
     float conf;
     float probs[CAM_MODEL_CLASS_COUNT];
@@ -424,6 +425,7 @@ typedef struct {
  */
 typedef struct {
     camera_fb_t *frame;
+    int64_t frame_timestamp_us;         /* 幀開始 VSYNC (esp_timer)，算每個 ROI 的 result_us */
     int64_t handed_over_us;             /* 交給下一棒的時間 */
     infer_cam_frame_record_t timing;    /* cam_detect 填到 detect_us，cam_infer 填完後回報 */
     size_t candidate_count;
@@ -1654,6 +1656,7 @@ static void report_roi(const frame_job_t *job, const roi_result_t *roi)
     out->track_id = roi->track_id;
     memcpy(out->bbox, roi->bbox, sizeof(out->bbox));
     out->invoke_us = roi->invoke_us;
+    out->result_us = roi->result_us;
     out->pred = roi->pred;
     out->label = cam_model_class_name(roi->pred);
     out->conf = roi->conf;
@@ -1766,6 +1769,7 @@ static void detect_frame(const ready_frame_t *ready, bool *has_prev)
     if (timing.candidates > 0U) {
         /* 這幀的記錄等 CNN 做完才回報 */
         job->frame = ready->frame;
+        job->frame_timestamp_us = ready->timestamp_us;
         job->timing = timing;
         job->candidate_count = timing.candidates;
         job->handed_over_us = esp_timer_get_time();
@@ -1840,6 +1844,8 @@ static void run_cnn_job(frame_job_t *job)
                      candidate->track_id);
             continue;
         }
+        /* 含 capture、等偵測、FD、追蹤、等 CNN、這幀前面幾個 ROI 與這個 ROI 的 crop + CNN */
+        roi->result_us = (uint32_t)(esp_timer_get_time() - job->frame_timestamp_us);
         ++job->roi_count;
         timing->crop_us += roi->crop_us;
         timing->cnn_us += roi->invoke_us;
@@ -1961,10 +1967,12 @@ static bool build_sample_meta(frame_job_t *job, size_t image_bytes, int64_t enco
         const roi_result_t *roi = &job->rois[i];
         written = snprintf(job->meta + used, SAMPLE_META_BYTES - used,
                            "%s{\"track\":%" PRId32 ",\"bbox\":[%" PRId32 ",%" PRId32 ",%" PRId32
-                           ",%" PRId32 "],\"invoke_us\":%" PRIu32 ",\"pred\":%u,\"label\":\"%s\""
+                           ",%" PRId32 "],\"invoke_us\":%" PRIu32 ",\"result_us\":%" PRIu32
+                           ",\"pred\":%u,\"label\":\"%s\""
                            ",\"conf\":%.4f,\"low\":%s,\"probs\":[%.4f,%.4f,%.4f]}",
                            i > 0U ? "," : "", roi->track_id, roi->bbox[0], roi->bbox[1],
-                           roi->bbox[2], roi->bbox[3], roi->invoke_us, (unsigned)roi->pred,
+                           roi->bbox[2], roi->bbox[3], roi->invoke_us, roi->result_us,
+                           (unsigned)roi->pred,
                            cam_model_class_name(roi->pred), (double)roi->conf,
                            roi->low_conf ? "true" : "false", (double)roi->probs[0],
                            (double)roi->probs[1], (double)roi->probs[2]);

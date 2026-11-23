@@ -104,9 +104,10 @@ static bool append_record(size_t *used, const infer_record_t *record)
         return append(used,
                       "{\"t\":\"roi\",\"session\":%" PRId64 ",\"frame\":%" PRIu32 ",\"ts_ms\":%" PRId64
                       ",\"track\":%" PRId32 ",\"bbox\":[%" PRId32 ",%" PRId32 ",%" PRId32 ",%" PRId32
-                      "],\"invoke_us\":%" PRIu32 ",\"pred\":%u,\"label\":\"%s\",\"conf\":%.4f,\"low\":%s,",
+                      "],\"invoke_us\":%" PRIu32 ",\"result_us\":%" PRIu32
+                      ",\"pred\":%u,\"label\":\"%s\",\"conf\":%.4f,\"low\":%s,",
                       r->session, r->frame, r->ts_epoch_ms, r->track_id, r->bbox[0], r->bbox[1],
-                      r->bbox[2], r->bbox[3], r->invoke_us, (unsigned)r->pred, r->label,
+                      r->bbox[2], r->bbox[3], r->invoke_us, r->result_us, (unsigned)r->pred, r->label,
                       (double)r->conf, r->low_conf ? "true" : "false") &&
                append_probs(used, r->probs) && append(used, "}");
     }
