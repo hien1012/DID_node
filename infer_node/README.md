@@ -47,8 +47,8 @@ Server：跑 `DID_NODE/server_mix.py`（有 `/infer/*` 與儀表板），這個 
   cam_writer     Core 0 prio 5  低信賴的幀：全幀 + ROI + meta 寫 SD
 
 兩種節點都有
-  result_report  不綁核心 prio 2  批次 POST /infer/results
-  heartbeat      不綁核心 prio 4  每分鐘 /heartbeat，兼 Wi-Fi watchdog
+  result_report  prio 2  批次 POST /infer/results（相機節點綁 Core 1，麥克風節點不綁核心）
+  heartbeat      prio 4  每分鐘 /heartbeat，兼 Wi-Fi watchdog（同上）
   main           Core 0 prio 1   滿 20 個樣本就上傳，定期校時
 ```
 

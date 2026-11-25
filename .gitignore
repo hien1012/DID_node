@@ -101,3 +101,5 @@ build_nofc/
 build_ov7/
 build_i2s/
 build_c/
+build_old*/
+build*/
