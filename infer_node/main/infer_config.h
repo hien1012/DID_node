@@ -58,6 +58,16 @@ _Static_assert(sizeof(INFER_DEVICE_ID_PREFIX) - 1U <= 10U, "Device ID prefix is 
 /* SD 上待上傳樣本的上限，超過就不再存新的 (例如長期連不到 server)。 */
 #define INFER_MAX_PENDING_SAMPLES     500U
 
+/*
+ * SDMMC 匯流排寬度 (4 或 1)：
+ * TTGO T8 V1.7 板載卡槽接滿 SDMMC slot 1 的 D0..D3 (GPIO 2/4/12/13)，與相機、麥克風腳位皆不衝突，
+ * 4-bit @ 40 MHz 理論線速 20 MB/s (1-bit 的 4 倍)。掛載失敗時 node_storage_init() 會自動退回 1-bit。
+ * 若個別板子或記憶卡在 4-bit 下出現 CRC 錯誤 (0x108)，可改回 1U。
+ */
+#ifndef INFER_SD_BUS_WIDTH
+#define INFER_SD_BUS_WIDTH            4U
+#endif
+
 /* 重新校時的週期。 */
 #define INFER_CLOCK_RESYNC_SEC        (5U * 60U)
 

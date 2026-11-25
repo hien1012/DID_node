@@ -1,7 +1,7 @@
 /*
  * 推論韌體的 SD 掛載與共用 I/O 緩衝 (DID_NODE/main/node_storage.c 只留推論用到的部分)。
- * 掛載參數與錄影韌體的 main/cam_storage.c 相同：TTGO T8 板上 microSD 走 SDMMC slot 1
- * (CLK 14 / CMD 15 / D0 2，IO MUX 固定腳位)，1-bit、40 MHz。
+ * TTGO T8 V1.7 板上 microSD 走 SDMMC slot 1 (CLK 14 / CMD 15 / D0..D3 = 2, 4, 12, 13)，
+ * 預設以 4-bit、40 MHz 掛載；若板子未接滿 D1..D3 則自動退回 1-bit、40 MHz。
  */
 #include "node_storage.h"
 
@@ -15,6 +15,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "sdmmc_cmd.h"
+
+#include "infer_config.h"
 
 /* 樣本寫入 (資料 + meta) 與上傳讀取 (資料 + meta) 可能同時開著 */
 #define STORAGE_MAX_OPEN_FILES   8
@@ -71,22 +73,32 @@ esp_err_t node_storage_init(void)
         .allocation_unit_size = 16U * 1024U,
     };
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-    host.flags = SDMMC_HOST_FLAG_1BIT;
     host.max_freq_khz = STORAGE_SD_FREQ_KHZ;
     sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
-    slot.width = 1;
     slot.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
 
-    const esp_err_t err = esp_vfs_fat_sdmmc_mount(NODE_STORAGE_MOUNT_POINT, &host, &slot,
-                                                  &mount_config, &s_sd_card);
+    uint8_t width = (INFER_SD_BUS_WIDTH == 4U) ? 4U : 1U;
+    host.flags = (width == 4U) ? SDMMC_HOST_FLAG_4BIT : SDMMC_HOST_FLAG_1BIT;
+    slot.width = width;
+
+    esp_err_t err = esp_vfs_fat_sdmmc_mount(NODE_STORAGE_MOUNT_POINT, &host, &slot,
+                                            &mount_config, &s_sd_card);
+    if (err != ESP_OK && width == 4U) {
+        ESP_LOGW(TAG, "4-bit SD mount failed (%s); falling back to 1-bit", esp_err_to_name(err));
+        width = 1U;
+        host.flags = SDMMC_HOST_FLAG_1BIT;
+        slot.width = 1U;
+        err = esp_vfs_fat_sdmmc_mount(NODE_STORAGE_MOUNT_POINT, &host, &slot,
+                                      &mount_config, &s_sd_card);
+    }
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "SD mount failed: %s", esp_err_to_name(err));
         return err;
     }
     sdmmc_card_print_info(stdout, s_sd_card);
     s_mounted = true;
-    ESP_LOGI(TAG, "SD mounted at %s (1-bit, %u kHz)", NODE_STORAGE_MOUNT_POINT,
-             (unsigned)STORAGE_SD_FREQ_KHZ);
+    ESP_LOGI(TAG, "SD mounted at %s (%u-bit, %u kHz)", NODE_STORAGE_MOUNT_POINT,
+             (unsigned)width, (unsigned)STORAGE_SD_FREQ_KHZ);
     return ESP_OK;
 }
 

@@ -51,8 +51,11 @@ CONFIG_CAMERA_TASK_STACK_SIZE=4096
 # from flash, cache misses caused by FD on the same core and the CNN on the shared
 # flash/PSRAM bus delay the DMA restart and the first lines are lost (incomplete frames).
 CONFIG_CAMERA_TASK_IRAM=y
-# Same DMA buffer size as the recording firmware (verified without FB-SIZE drops).
-CONFIG_CAMERA_DMA_BUFFER_SIZE_MAX=32768
+# DMA buffer doubled from 32768 (recording firmware) to 65536: VGA YUV422 gets 6 lines per
+# half buffer instead of 3, so cam_task may be late ~2.4 ms instead of ~1.2 ms (at 5 fps)
+# before lines are lost. Costs about +30 KB of internal DMA RAM (30720 -> 61440 bytes);
+# the Kconfig range was raised locally (components/esp32-camera/Kconfig).
+CONFIG_CAMERA_DMA_BUFFER_SIZE_MAX=65536
 
 # Upload-oriented network profile. Dynamic Wi-Fi TX buffers are unavailable with
 # SPIRAM_USE_MALLOC in IDF 5.1. With TRY_ALLOCATE_WIFI_LWIP the TX buffers prefer PSRAM;

@@ -11,7 +11,7 @@
 
 #define NODE_STORAGE_MOUNT_POINT "/sdcard"
 
-/** 掛載 SD (SDMMC slot 1，1-bit，/sdcard)。 */
+/** 掛載 SD (SDMMC slot 1，預設 4-bit 40 MHz，失敗自動退回 1-bit，掛載於 /sdcard)。 */
 esp_err_t node_storage_init(void);
 
 esp_err_t node_storage_get_free_bytes(uint64_t *free_bytes_out);

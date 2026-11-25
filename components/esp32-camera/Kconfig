@@ -235,11 +235,13 @@ menu "Camera configuration"
 
     config CAMERA_DMA_BUFFER_SIZE_MAX
         int "DMA buffer size"
-        range 8192 32768
+        range 8192 65536
         default 32768
         help
             Maximum value of DMA buffer
             Larger values may fail to allocate due to insufficient contiguous memory blocks, and smaller value may cause DMA interrupt to be too frequent.
+            Local change: upper limit raised from 32768 to 65536 (default unchanged) so the
+            ESP32 infer_node can use 6 lines per DMA half buffer at VGA YUV422.
 
     config CAMERA_PSRAM_DMA
         bool "Enable PSRAM DMA mode by default"
