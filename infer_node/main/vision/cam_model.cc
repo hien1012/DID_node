@@ -19,21 +19,22 @@ namespace {
 
 constexpr char TAG[] = "CAM_MODEL";
 
-/* 模型選擇見 cam_model.h 的 CAM_MODEL_USE_OLD；兩版 op 不同，resolver 也跟著換 */
+/* 模型選擇見 cam_model.h 的 CAM_MODEL_USE_OLD；兩版 op 不同，resolver 與實測 arena 用量也跟著換：
+ *   old     (conv-relu-bn) ：實測 used = 136,428 B (約 133.2 KB) → 留 144 KB
+ *   current (conv-bn-relu) ：實測 used =  86,860 B (約  84.8 KB) → 留  96 KB */
 #if CAM_MODEL_USE_OLD
 const unsigned char *const kModelData = g_model_old;
 const int &kModelBytes = g_model_old_len;
 constexpr char kModelVariant[] = "old (conv-relu-bn)";
 constexpr int kResolverOps = 9;
+constexpr int kTensorArenaSize = 144 * 1024;
 #else
 const unsigned char *const kModelData = g_model;
 const int &kModelBytes = g_model_len;
 constexpr char kModelVariant[] = "current (conv-bn-relu)";
 constexpr int kResolverOps = 10;
+constexpr int kTensorArenaSize = 96 * 1024;
 #endif
-/* 原專案保留 1.39 MB；activation 峰值 131 KB，再加 tensor 結構與 kernel scratch。
- * 開機 log 的 used 是實際用量，可依此再調小。 */
-constexpr int kTensorArenaSize = 320 * 1024;
 
 /* 訓練標籤：0=無人機、1=鳥、2=背景 */
 constexpr int kDroneClass = 0;

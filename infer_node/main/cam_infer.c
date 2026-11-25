@@ -93,8 +93,8 @@
 #endif
 
 /* --- 錄影與影格率驗證參數 --- */
-#define CAMERA_WARMUP_FRAMES    100U                         /* 開機暖機幀數：丟棄前 10 幀，讓感測器自動曝光/白平衡穩定 */
-#define CAMERA_FRAME_BUFFERS    8U                          /* 配置於外部 PSRAM 的影格緩衝區數量 (總計 8 * 300KB ≈ 2.4MB；ESP32 只映射 4 MB PSRAM，不用錄影韌體的 10 個) */
+#define CAMERA_WARMUP_FRAMES    100U                         /* 開機暖機幀數：丟棄前 100 幀，讓感測器自動曝光/白平衡穩定 */
+#define CAMERA_FRAME_BUFFERS    9U                          /* 配置於外部 PSRAM 的影格緩衝區數量 (9 * 300KB ≈ 2.7MB；縮減 TFLM arena 後多留 1 個給管線/寫檔佇列) */
 #define TEST_DURATION_SECONDS   5U                          /* 開機硬體資格測試時間：5 秒 (同 cam_record.c) */
 #define TARGET_FPS              CAM_TARGET_FPS              /* 目標影格率：每秒 5 幀 */
 #define EXPECTED_FRAME_COUNT     (TEST_DURATION_SECONDS * TARGET_FPS) /* 5 秒預期應收到的影格數：25 幀 */
@@ -109,12 +109,12 @@
 
 /*
  * --- 佇列容量 ---
- * 8 個 fb：1 個 DMA 正在收、1 個下一個 VSYNC 備用、1 個 cam_detect 正在處理，
- * 其餘 5 個分給排隊：等偵測 2 個、frame_job_t 3 個 (等 CNN、CNN 中或等寫入都佔一個 fb)。
+ * 9 個 fb：1 個 DMA 正在收、1 個下一個 VSYNC 備用、1 個 cam_detect 正在處理，
+ * 其餘 6 個分給排隊：等偵測 2 個、frame_job_t 4 個 (等 CNN、CNN 中或 s_save_queue 等寫入都佔一個 fb)。
  * 等偵測的佇列滿才丟幀 (不擋硬體)；工作用完時候選留在追蹤器，不丟幀。
  */
 #define READY_QUEUE_CAPACITY          2U
-#define FRAME_JOB_COUNT               3U
+#define FRAME_JOB_COUNT               4U
 /* 恢復相機後丟掉這段時間的幀：任務就緒前留在驅動裡的舊幀 */
 #define START_MARGIN_US               300000LL
 /* 每隔這麼多幀回報一次累計統計 (5 fps = 60 s) */

@@ -51,8 +51,8 @@ typedef struct {
 
 /** FD 各步驟耗時；中途就沒有框時，後面的步驟維持 0 */
 typedef struct {
-    uint32_t diff_us;     /**< 幀差 + 二值化 */
-    uint32_t morph_us;    /**< 形態學 */
+    uint32_t diff_us;     /**< 幀差 + 二值化；走融合版時也包含形態學 */
+    uint32_t morph_us;    /**< 形態學；走融合版時為 0 */
     uint32_t contour_us;  /**< flood fill 找框 */
     uint32_t refine_us;   /**< Sobel ROI refine */
     uint32_t nms_us;

@@ -140,6 +140,72 @@ static void fd_apply_morphology(uint8_t* src, uint8_t* dst, uint8_t* temp, int w
     }
 }
 
+/*
+ * 融合版：absdiff → 二值化 → 形態學 (可分離 k×k) 一次逐行掃完，結果與
+ * get_absdiff + fd_binary_threshold + fd_apply_morphology 逐位元相同：
+ *  - 二值圖只有 0 / 255，max = OR、min = AND。
+ *  - 原版邊界是複製邊緣像素；複製的值本來就在有效範圍內，所以只取有效範圍的 max / min 結果相同。
+ * 原版三張 320x240 緩衝在 PSRAM 上來回讀寫 5 遍 (absdiff 讀 2 寫 1、二值化讀 1 寫 1、
+ * 水平讀 1 寫 1、垂直讀 1 寫 1)；這裡每個像素只從 PSRAM 讀 prev / curr 各一次、寫一次，
+ * 中間結果放內部 RAM 的 k 行環狀緩衝。
+ * 結果就地寫回 prev_mask：輸出第 y 行時，第 y 行的 prev 已經用完，之後只會讀 y+r 行以後。
+ * 只由 cam_detect 呼叫 (static 緩衝，不可重入)；kernel 或寬度超出上限時回傳 false，呼叫端改走原版。
+ */
+#define FD_FUSED_MAX_KERNEL 5
+#define FD_FUSED_MAX_WIDTH  320
+
+static uint8_t s_fused_row[FD_FUSED_MAX_WIDTH];                       /* 二值化的一行；輸出時當累加器 */
+static uint8_t s_fused_hrows[FD_FUSED_MAX_KERNEL][FD_FUSED_MAX_WIDTH]; /* 水平形態學後的 k 行 */
+
+static bool fd_diff_threshold_morph_fused(uint8_t* prev_mask, const uint8_t* curr, int width,
+                                          int height, const FD_Parameters* params) {
+    const int k = params->morph_kernel_size;
+    if (k < 1 || (k % 2) == 0 || k > FD_FUSED_MAX_KERNEL ||
+        width <= 0 || width > FD_FUSED_MAX_WIDTH || height <= 0) {
+        return false;
+    }
+    const int r = k / 2;
+    const bool dilate = params->morph_mode != FD_MORPH_ERODE;   /* 與 fd_apply_morphology 的 default 一致 */
+    const int thresh = params->thresh;
+    int next_row = 0;   /* 下一個要算水平形態學的行 */
+
+    for (int y = 0; y < height; y++) {
+        const int last = (y + r < height) ? y + r : height - 1;
+        while (next_row <= last) {
+            const uint8_t* p = prev_mask + (size_t)next_row * (size_t)width;
+            const uint8_t* c = curr + (size_t)next_row * (size_t)width;
+            for (int x = 0; x < width; x++) {
+                int d = (int)c[x] - (int)p[x];
+                if (d < 0) d = -d;
+                s_fused_row[x] = (d > thresh) ? 255U : 0U;
+            }
+            uint8_t* h = s_fused_hrows[next_row % k];
+            for (int x = 0; x < width; x++) {
+                const int x0 = (x - r < 0) ? 0 : x - r;
+                const int x1 = (x + r > width - 1) ? width - 1 : x + r;
+                uint8_t v = s_fused_row[x0];
+                for (int i = x0 + 1; i <= x1; i++) {
+                    v = dilate ? (uint8_t)(v | s_fused_row[i]) : (uint8_t)(v & s_fused_row[i]);
+                }
+                h[x] = v;
+            }
+            next_row++;
+        }
+        /* 垂直：有效範圍 [y0, last] 的 k 行合併 (s_fused_row 此時已用完，借來當累加器) */
+        const int y0 = (y - r < 0) ? 0 : y - r;
+        memcpy(s_fused_row, s_fused_hrows[y0 % k], (size_t)width);
+        for (int j = y0 + 1; j <= last; j++) {
+            const uint8_t* h = s_fused_hrows[j % k];
+            for (int x = 0; x < width; x++) {
+                s_fused_row[x] = dilate ? (uint8_t)(s_fused_row[x] | h[x])
+                                        : (uint8_t)(s_fused_row[x] & h[x]);
+            }
+        }
+        memcpy(prev_mask + (size_t)y * (size_t)width, s_fused_row, (size_t)width);
+    }
+    return true;
+}
+
 static void get_absdiff(uint8_t* frame1, uint8_t* frame2, uint8_t* diff, int width, int height) {
     for (int i = 0; i < width * height; i++) {
         int d = (int)frame2[i] - (int)frame1[i];  // 計算差值
@@ -874,11 +940,15 @@ FD_DetectionResult* fd_process_frames_gray(uint8_t* gray1, uint8_t* gray2, uint8
     int64_t mark = esp_timer_get_time();
 
     // 幀差 → 二值化 → morphology
-    get_absdiff(gray1, gray2, temp, width, height);                   // temp <- |gray2-gray1|
-    fd_binary_threshold(temp, gray1, width, height, params->thresh);  // gray1 <- binary(temp)
-    timing->diff_us = fd_lap_us(&mark);
-    fd_apply_morphology(gray1, gray1, temp, width, height, params);   // gray1 <- morph(gray1)
-    timing->morph_us = fd_lap_us(&mark);
+    if (fd_diff_threshold_morph_fused(gray1, gray2, width, height, params)) {
+        timing->diff_us = fd_lap_us(&mark);   // 融合版：diff_us 含形態學，morph_us 維持 0
+    } else {
+        get_absdiff(gray1, gray2, temp, width, height);                   // temp <- |gray2-gray1|
+        fd_binary_threshold(temp, gray1, width, height, params->thresh);  // gray1 <- binary(temp)
+        timing->diff_us = fd_lap_us(&mark);
+        fd_apply_morphology(gray1, gray1, temp, width, height, params);   // gray1 <- morph(gray1)
+        timing->morph_us = fd_lap_us(&mark);
+    }
 
     // 輪廓
     int initial_box_num = 0;
