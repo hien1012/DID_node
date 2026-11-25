@@ -42,6 +42,7 @@ typedef struct {
     int32_t track_id;
     int32_t bbox[4];            /* 全解析度、送進 CNN 的正方形 ROI (inclusive) */
     uint32_t invoke_us;
+    uint32_t result_us;         /* 幀開始 VSYNC → 這個 ROI 的 CNN 做完 (節點內，同一個時鐘) */
     uint8_t pred;
     const char *label;
     float conf;

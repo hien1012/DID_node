@@ -87,6 +87,15 @@ _Static_assert(sizeof(INFER_DEVICE_ID_PREFIX) - 1U <= 10U, "Device ID prefix is 
 #define INFER_TASK_USAGE_ENABLE       0
 #endif
 
+/*
+ * 測試用：1 = CNN 推論期間 cam_detect 不跑 FD (先等 FD 做完手上那幀，推論完才處理下一幀)。
+ * 用來直接量「沒有 FD 搶 PSRAM 匯流排」時的推論時間。推論期間幀會在佇列滿後被丟掉
+ * (Camera: dropped 增加)，FD 也會漏看那段時間，正式運作要設 0。
+ */
+#ifndef INFER_CAM_FD_HOLD_DURING_CNN
+#define INFER_CAM_FD_HOLD_DURING_CNN  0
+#endif
+
 /* cam 模型新舊版切換 (A/B 測試)：vision/cam_model.h 的 CAM_MODEL_USE_OLD (cam_model.cc 是 C++，不 include 這個檔) */
 
 /* 每幀最多送幾個 ROI 進 CNN，避免一張雜訊幀佔住 fb 太久；超過的留到該 track 下一次配對。 */

@@ -123,6 +123,8 @@
 #define USAGE_CYCLE_FRAMES            10U
 /* cam_infer 回報 CNN 分層與 task 占比的週期；一直沒有候選時它也要醒來看一下 */
 #define CNN_REPORT_PERIOD_MS          60000U
+/* 同一個 job 內連續推論超過這麼久就讓出 1 tick 給 IDLE0 (看門狗 5 s)；見 run_cnn_job() */
+#define CNN_YIELD_PERIOD_MS           1000U
 
 /* --- FD / ROI 參數 (FD_did_cam_v4 相機模式) --- */
 #define FD_DOWNSCALE_FACTOR           2
@@ -369,6 +371,7 @@ typedef struct {
     uint32_t invoke_only_us;    /* 其中 Invoke() 本身 (只印 log) */
     uint32_t run_us;            /* 同一段期間 cam_infer 自己佔用 CPU 的時間 (含等 cache miss 的停頓) */
     uint32_t fd_overlap_us;     /* 同一段期間 Core 1 的 cam_detect 在處理幀的時間 */
+    uint32_t result_us;         /* 幀開始 VSYNC → 這個 ROI 的 CNN 做完 (節點內的判斷延遲，同一個時鐘) */
     uint8_t pred;
     float conf;
     float probs[CAM_MODEL_CLASS_COUNT];
@@ -427,6 +430,7 @@ typedef struct {
  */
 typedef struct {
     camera_fb_t *frame;
+    int64_t frame_timestamp_us;         /* 幀開始 VSYNC (esp_timer)，算每個 ROI 的 result_us */
     int64_t handed_over_us;             /* 交給下一棒的時間 */
     infer_cam_frame_record_t timing;    /* cam_detect 填到 detect_us，cam_infer 填完後回報 */
     size_t candidate_count;
@@ -546,6 +550,9 @@ static int s_background_class = -1;
 static portMUX_TYPE s_fd_busy_lock = portMUX_INITIALIZER_UNLOCKED;
 static int64_t s_fd_busy_since_us = 0;      /* 0 = cam_detect 目前沒在處理幀 */
 static uint64_t s_fd_busy_total_us = 0;
+#if INFER_CAM_FD_HOLD_DURING_CNN
+static bool s_cnn_running = false;          /* 受 s_fd_busy_lock 保護 */
+#endif
 static overlap_stats_t s_overlap;           /* 只有 cam_infer 存取 */
 
 static esp_err_t cam_infer_resume(void);
@@ -1541,9 +1548,26 @@ static int run_frame_difference(FD_StageTiming *timing)
     return count;
 }
 
-/* cam_detect 呼叫：開始 / 結束處理一幀 */
+/*
+ * cam_detect 呼叫：開始 / 結束處理一幀。
+ * INFER_CAM_FD_HOLD_DURING_CNN=1 時，開始前先等 CNN 推論結束 (檢查和標記在同一個鎖內，不會和 cnn_hold_begin 交錯)。
+ */
 static void fd_busy_mark(bool busy)
 {
+#if INFER_CAM_FD_HOLD_DURING_CNN
+    while (busy) {
+        portENTER_CRITICAL(&s_fd_busy_lock);
+        const bool cnn_running = s_cnn_running;
+        if (!cnn_running) {
+            s_fd_busy_since_us = esp_timer_get_time();
+        }
+        portEXIT_CRITICAL(&s_fd_busy_lock);
+        if (!cnn_running) {
+            return;
+        }
+        vTaskDelay(1);
+    }
+#endif
     const int64_t now_us = esp_timer_get_time();
     portENTER_CRITICAL(&s_fd_busy_lock);
     if (busy) {
@@ -1553,6 +1577,37 @@ static void fd_busy_mark(bool busy)
         s_fd_busy_since_us = 0;
     }
     portEXIT_CRITICAL(&s_fd_busy_lock);
+}
+
+/*
+ * cam_infer 呼叫：INFER_CAM_FD_HOLD_DURING_CNN=1 時，等 cam_detect 做完手上這一幀，
+ * 並擋住下一幀，讓整次推論都不和 FD 重疊。關閉時是空函式。
+ */
+static void cnn_hold_begin(void)
+{
+#if INFER_CAM_FD_HOLD_DURING_CNN
+    while (true) {
+        portENTER_CRITICAL(&s_fd_busy_lock);
+        const bool fd_idle = s_fd_busy_since_us == 0;
+        if (fd_idle) {
+            s_cnn_running = true;
+        }
+        portEXIT_CRITICAL(&s_fd_busy_lock);
+        if (fd_idle) {
+            return;
+        }
+        vTaskDelay(1);
+    }
+#endif
+}
+
+static void cnn_hold_end(void)
+{
+#if INFER_CAM_FD_HOLD_DURING_CNN
+    portENTER_CRITICAL(&s_fd_busy_lock);
+    s_cnn_running = false;
+    portEXIT_CRITICAL(&s_fd_busy_lock);
+#endif
 }
 
 /* cam_infer 呼叫：開機以來 cam_detect 處理幀的累計時間，含正在處理的這一幀 */
@@ -1636,9 +1691,12 @@ static void overlap_report(void)
              (unsigned)s_overlap.n, s_overlap.sum_wall / n, s_overlap.sum_run / n,
              (s_overlap.sum_wall - s_overlap.sum_run) / n, s_overlap.sum_x / n);
     if (wall_ok && run_ok) {
+        /* 截距 = 外插到 FD 完全沒重疊時的推論時間，可直接和不跑 FD 的版本 (例如 FD_did_cam_v4) 比 */
+        const double run_at_zero = (s_overlap.sum_run - slope_run * s_overlap.sum_x) / n;
         ESP_LOGI(TAG,
-                 "CNN vs Core 1 FD fit: run r=%.2f slope=%.2f ms/ms | invoke r=%.2f slope=%.2f ms/ms",
-                 r_run, slope_run, r_wall, slope_wall);
+                 "CNN vs Core 1 FD fit: run r=%.2f slope=%.2f ms/ms run@0=%.1f ms"
+                 " | invoke r=%.2f slope=%.2f ms/ms",
+                 r_run, slope_run, run_at_zero, r_wall, slope_wall);
     } else {
         ESP_LOGI(TAG, "CNN vs Core 1 FD fit: not enough spread in the data");
     }
@@ -1661,11 +1719,14 @@ static bool classify_candidate(const uint8_t *full_frame, const Stage2_CnnCandid
     int pred = -1;
     out->crop_us = (uint32_t)(esp_timer_get_time() - crop_start_us);
     /* 推論一次 = 一個 64x64 ROI 的 CNN。統計本身的時間不算進 invoke_us */
+    cnn_hold_begin();   /* 等 FD 的時間不算進下面的計時 */
     task_usage_begin();
     const uint32_t run_start_us = self_run_time_us();
     const uint64_t fd_start_us = fd_busy_now_us();
     const int64_t invoke_start_us = esp_timer_get_time();
-    if (cam_model_predict(roi, out->probs, &pred) != ESP_OK || pred < 0) {
+    const esp_err_t predict_err = cam_model_predict(roi, out->probs, &pred);
+    cnn_hold_end();
+    if (predict_err != ESP_OK || pred < 0) {
         return false;
     }
     out->invoke_us = (uint32_t)(esp_timer_get_time() - invoke_start_us);
@@ -1696,6 +1757,7 @@ static void report_roi(const frame_job_t *job, const roi_result_t *roi)
     out->track_id = roi->track_id;
     memcpy(out->bbox, roi->bbox, sizeof(out->bbox));
     out->invoke_us = roi->invoke_us;
+    out->result_us = roi->result_us;
     out->pred = roi->pred;
     out->label = cam_model_class_name(roi->pred);
     out->conf = roi->conf;
@@ -1808,6 +1870,7 @@ static void detect_frame(const ready_frame_t *ready, bool *has_prev)
     if (timing.candidates > 0U) {
         /* 這幀的記錄等 CNN 做完才回報 */
         job->frame = ready->frame;
+        job->frame_timestamp_us = ready->timestamp_us;
         job->timing = timing;
         job->candidate_count = timing.candidates;
         job->handed_over_us = esp_timer_get_time();
@@ -1869,11 +1932,21 @@ static void run_cnn_job(frame_job_t *job)
 
     bool any_low = false;
     bool any_non_background = false;
+    int64_t last_yield_us = started_us;
     job->roi_count = 0;
     for (size_t k = 0; k < job->candidate_count; ++k) {
         const Stage2_CnnCandidate *candidate = &job->candidates[k];
         if (!candidate->valid) {
             continue;
+        }
+        /*
+         * cam_infer 只在每個 job 結束後讓出 CPU。一個 job 最多 INFER_CAM_MAX_ROI_PER_FRAME 個 ROI，
+         * 推論慢時 (舊模型 + 不開 ESP-NN 約 1.5 s/ROI) 整個 job 會超過 5 s，IDLE0 排不到而觸發看門狗。
+         * 連續推論超過 CNN_YIELD_PERIOD_MS 才讓出 1 tick，推論快時不多花時間。
+         */
+        if (esp_timer_get_time() - last_yield_us >= (int64_t)CNN_YIELD_PERIOD_MS * 1000LL) {
+            vTaskDelay(1);
+            last_yield_us = esp_timer_get_time();
         }
         roi_result_t *roi = &job->rois[job->roi_count];
         if (!classify_candidate(job->frame->buf, candidate, job->roi_pixels[job->roi_count], roi)) {
@@ -1881,6 +1954,8 @@ static void run_cnn_job(frame_job_t *job)
                      candidate->track_id);
             continue;
         }
+        /* 含 capture、等偵測、FD、追蹤、等 CNN、這幀前面幾個 ROI 與這個 ROI 的 crop + CNN */
+        roi->result_us = (uint32_t)(esp_timer_get_time() - job->frame_timestamp_us);
         ++job->roi_count;
         timing->crop_us += roi->crop_us;
         timing->cnn_us += roi->invoke_us;
@@ -1983,10 +2058,12 @@ static bool build_sample_meta(frame_job_t *job, size_t image_bytes, int64_t enco
         const roi_result_t *roi = &job->rois[i];
         written = snprintf(job->meta + used, SAMPLE_META_BYTES - used,
                            "%s{\"track\":%" PRId32 ",\"bbox\":[%" PRId32 ",%" PRId32 ",%" PRId32
-                           ",%" PRId32 "],\"invoke_us\":%" PRIu32 ",\"pred\":%u,\"label\":\"%s\""
+                           ",%" PRId32 "],\"invoke_us\":%" PRIu32 ",\"result_us\":%" PRIu32
+                           ",\"pred\":%u,\"label\":\"%s\""
                            ",\"conf\":%.4f,\"low\":%s,\"probs\":[%.4f,%.4f,%.4f]}",
                            i > 0U ? "," : "", roi->track_id, roi->bbox[0], roi->bbox[1],
-                           roi->bbox[2], roi->bbox[3], roi->invoke_us, (unsigned)roi->pred,
+                           roi->bbox[2], roi->bbox[3], roi->invoke_us, roi->result_us,
+                           (unsigned)roi->pred,
                            cam_model_class_name(roi->pred), (double)roi->conf,
                            roi->low_conf ? "true" : "false", (double)roi->probs[0],
                            (double)roi->probs[1], (double)roi->probs[2]);

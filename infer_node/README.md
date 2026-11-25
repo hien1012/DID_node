@@ -94,6 +94,17 @@ Server：跑 `DID_NODE/server_mix.py`（有 `/infer/*` 與儀表板），這個 
 | `components/tflite-micro`、`esp-nn` | DID_NODE/infer_node/components | 原樣 |
 | `../main/camera_registers.c`、`device_identity.c`、`time_sync.c`、`app_config.h`、`camera_pinout.h` | 錄影韌體 | 直接編譯，不複製 |
 
+## 判斷延遲
+
+與 S3 版相同（`DID_NODE` commit 64a3e899；server 端的 `result_latency()` 在 671694c）。
+`/infer/results` 的 `roi` 記錄與低信賴樣本 meta 的每個 ROI 都帶 `result_us`：
+從該幀 VSYNC 到這個 ROI 的 CNN 做完，包含擷取、等偵測、FD、追蹤、等 CNN、同幀前面的 ROI 與本身的 crop + CNN。
+
+| 段 | 影像 | 音訊 | 時鐘 |
+|---|---|---|---|
+| 節點判斷 | `result_us`（從該幀 VSYNC 起） | `queue_us + feature_us + invoke_us`（從 2 s 視窗結束起） | 節點同一個時鐘，準 |
+| 傳到 server | server 收到該筆記錄的時間 − (起點 + 節點判斷) | 同左 | 跨時鐘，含校時誤差（可能 < 0） |
+
 ## 上板要確認的 log
 
 - `HEAP [...]`：內部 RAM 的 free / min（ESP32 比 S3 少很多，最要注意）。
